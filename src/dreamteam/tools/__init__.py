@@ -8,10 +8,11 @@ import itertools
 import json
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable
 
-from ..models import USER, ToolError
+from .. import prompts
+from ..models import USER, ReadRefusal, ToolError
 
 if TYPE_CHECKING:
     from ..agent import AgentRuntime
@@ -21,12 +22,14 @@ log = logging.getLogger(__name__)
 
 AUDIENCES = ("llm", "external", "user")
 _AUDIENCE_NAMES = {"llm": "swarm agents", "external": "external members", "user": "the user"}
+# the session modes (docs/SPEC.md §22): a tool belongs to one of them or to both
+MODES = ("board", "thread")
 
 # Presentation order of the tool modules. The registry is sorted by (module, definition order) once
 # everything is loaded, so the tool list never depends on which module happened to be imported first
 # (a reordered tool list would invalidate the LLM prompt cache).
 _MODULE_ORDER = ("board_tools", "comm_tools", "file_tools", "job_tools", "mcp_tools", "swarm_tools", "trigger_tools",
-                 "trace_tools", "skill_tools")
+                 "trace_tools", "skill_tools", "forum_tools")
 _seq = itertools.count()
 
 
@@ -52,16 +55,22 @@ class ToolContext:
     def is_user(self) -> bool:
         return self.actor == USER
 
+    @property
+    def mode(self) -> str:
+        """The session's mode, "board" | "thread" (docs/SPEC.md §22.1); a test double without one is a board."""
+        return getattr(self.swarm, "mode", "board")
+
     def has_tool(self, name: str) -> bool:
         """Whether the caller has the tool `name`: an LLM agent has its own frozen tool set (tools/frozen.py),
-        which may be older than the registry; other callers see the live registry of their kind. Results that
-        point at a tool are tailored with it, so an agent is never told to call a tool it lacks."""
+        which may be older than the registry; other callers see the live registry of their kind and of the
+        session's mode. Results that point at a tool are tailored with it, so an agent is never told to call a
+        tool it lacks."""
         own = getattr(self.runtime, "tool_names", None)
         if own is not None:
             return name in own
         _load()
         spec = REGISTRY.get(name)
-        return spec is not None and self.kind in spec.audience
+        return spec is not None and self.kind in spec.audience and self.mode in spec.modes
 
     @property
     def output_cap(self) -> int:
@@ -80,6 +89,13 @@ Handler = Callable[[ToolContext, dict[str, Any]], Awaitable[str]]
 
 
 @dataclass
+class ToolVariant:
+    """A tool's texts and schema in one mode; None: the base one."""
+    description: dict[str, str] | None = None     # {"en", "ru"}
+    parameters: dict[str, Any] | None = None      # a whole JSON schema {"type": "object", "properties", "required"}
+
+
+@dataclass
 class ToolSpec:
     name: str
     description: dict[str, str]
@@ -88,9 +104,19 @@ class ToolSpec:
     audience: frozenset[str]
     allow_empty: frozenset[str] = frozenset()   # required string args that may be "" (e.g. file content)
     order: tuple[int, int] = (len(_MODULE_ORDER), 0)
+    modes: frozenset[str] = frozenset(MODES)    # the session modes that have the tool
+    variants: dict[str, ToolVariant] = field(default_factory=dict)   # per mode; only "thread" is used
 
-    def describe(self, language: str) -> str:
-        return self.description.get(language) or self.description["en"]
+    def describe(self, language: str, mode: str = "board") -> str:
+        """The tool's text in `language` for a session of `mode`: the mode's variant, else the base one."""
+        variant = self.variants.get(mode)
+        texts = variant.description if variant is not None and variant.description else self.description
+        return texts.get(language) or texts["en"]
+
+    def parameters_for(self, mode: str) -> dict[str, Any]:
+        """The tool's schema in a session of `mode`: the mode's variant, else `parameters`."""
+        variant = self.variants.get(mode)
+        return variant.parameters if variant is not None and variant.parameters is not None else self.parameters
 
 
 REGISTRY: dict[str, ToolSpec] = {}
@@ -101,14 +127,49 @@ def _module_rank(module: str) -> int:
     return _MODULE_ORDER.index(leaf) if leaf in _MODULE_ORDER else len(_MODULE_ORDER)
 
 
+def _variant(name: str, thread: dict[str, Any], required: list[str]) -> ToolVariant:
+    """The thread variant of a tool from `thread` {"en", "ru", "properties", "required"} (each optional)."""
+    assert set(thread) <= {"en", "ru", "properties", "required"}, (name, set(thread))
+    description = None
+    if "en" in thread or "ru" in thread:
+        assert "en" in thread and "ru" in thread, name
+        description = {"en": thread["en"].strip(), "ru": thread["ru"].strip()}
+    parameters = None
+    if "properties" in thread:
+        props = thread["properties"]
+        wanted = list(thread.get("required", required))
+        assert set(wanted) <= set(props), (name, wanted)
+        parameters = {"type": "object", "properties": props, "required": wanted}
+    else:
+        assert "required" not in thread, name
+    return ToolVariant(description=description, parameters=parameters)
+
+
+def swapped(text: str, *pairs: tuple[str, str], plain_e: bool = False) -> str:
+    """`text` with each (old, new) replaced, every old occurring exactly once: a thread variant of a board text.
+    `plain_e`: also writes the dotted letter as the plain one (the thread mode's Russian texts, docs/SPEC.md §22.5)."""
+    for old, new in pairs:
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    return text.replace("\u0451", "\u0435") if plain_e else text
+
+
 def tool(name: str, en: str, ru: str, properties: dict[str, Any] | None = None,
          required: Iterable[str] = (), audience: Iterable[str] = AUDIENCES,
-         allow_empty: Iterable[str] = ()):
-    """Register an async handler `(ctx, args) -> str` as a tool."""
+         allow_empty: Iterable[str] = (), modes: Iterable[str] = MODES, thread: dict[str, Any] | None = None):
+    """Register an async handler `(ctx, args) -> str` as a tool. `modes`: the session modes that have it;
+    `thread`: its texts and/or properties in a thread session ({"en", "ru", "properties", "required"}, each
+    optional; `required` defaults to the base one)."""
     audience = frozenset(audience)
     assert audience <= set(AUDIENCES), audience
+    modes = frozenset(modes)
+    assert modes and modes <= set(MODES), (name, modes)
     required = list(required)
     assert set(required) <= set(properties or {}), (name, required)
+    variants = {}
+    if thread is not None:
+        assert "thread" in modes, name
+        variants["thread"] = _variant(name, thread, required)
 
     def decorator(fn: Handler) -> Handler:
         if name in REGISTRY:
@@ -121,23 +182,28 @@ def tool(name: str, en: str, ru: str, properties: dict[str, Any] | None = None,
             audience=audience,
             allow_empty=frozenset(allow_empty),
             order=(_module_rank(fn.__module__), next(_seq)),
+            modes=modes,
+            variants=variants,
         )
         return fn
 
     return decorator
 
 
-def tools_for(kind: str) -> list[ToolSpec]:
+def tools_for(kind: str, mode: str | None = None) -> list[ToolSpec]:
+    """The tools of an actor kind in a session of `mode`; None: of both modes."""
     _load()
-    return [spec for spec in REGISTRY.values() if kind in spec.audience]
+    return [spec for spec in REGISTRY.values()
+            if kind in spec.audience and (mode is None or mode in spec.modes)]
 
 
-def schemas_for(kind: str, language: str) -> list[dict[str, Any]]:
-    """Deterministic tool list for an actor kind (kept constant for prompt caching). The schemas are
-    copies: callers may adapt them for a provider without touching the registry."""
+def schemas_for(kind: str, language: str, mode: str = "board") -> list[dict[str, Any]]:
+    """Deterministic tool list for an actor kind in a session of `mode` (kept constant for prompt caching). The
+    schemas are copies: callers may adapt them for a provider without touching the registry."""
     return [
-        {"name": s.name, "description": s.describe(language), "parameters": copy.deepcopy(s.parameters)}
-        for s in tools_for(kind)
+        {"name": s.name, "description": s.describe(language, mode),
+         "parameters": copy.deepcopy(s.parameters_for(mode))}
+        for s in tools_for(kind, mode)
     ]
 
 
@@ -271,11 +337,13 @@ def _signature(spec: ToolSpec, parameters: dict[str, Any] | None = None) -> str:
 
 
 def prepare_args(spec: ToolSpec, args: dict[str, Any] | None,
-                 usage: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Validated and lightly coerced copy of `args`; unknown keys are dropped (see `unknown_args`). `usage`:
-    the parameters the caller knows the tool by (an agent's frozen schema), for the usage line of errors."""
+                 usage: dict[str, Any] | None = None, mode: str = "board") -> dict[str, Any]:
+    """Validated and lightly coerced copy of `args` against the tool's schema in a session of `mode`; unknown keys
+    are dropped (see `unknown_args`). `usage`: the parameters the caller knows the tool by (an agent's frozen
+    schema), for the usage line of errors."""
     args = dict(args or {})
-    props = spec.parameters.get("properties", {})
+    parameters = spec.parameters_for(mode)
+    props = parameters.get("properties", {})
     for key in [k for k in args if k not in props]:
         args.pop(key)
     for key, schema in props.items():
@@ -283,13 +351,13 @@ def prepare_args(spec: ToolSpec, args: dict[str, Any] | None,
             args[key] = _coerce(args[key], schema)
             _check_type(key, args[key], schema)
     missing = []
-    for key in spec.parameters.get("required", []):
+    for key in parameters.get("required", []):
         value = args.get(key)
         if value is None or (isinstance(value, str) and not value.strip() and key not in spec.allow_empty):
             missing.append(key)
     if missing:
         raise ToolError(f"Missing required argument(s) for {spec.name}: {', '.join(missing)}. "
-                        f"Usage: {_signature(spec, usage)} (? = optional).")
+                        f"Usage: {_signature(spec, usage or parameters)} (? = optional).")
     return args
 
 
@@ -302,11 +370,12 @@ def unknown_args(spec: ToolSpec, args: dict[str, Any] | None,
 
 # --- calling ----------------------------------------------------------------------------------------
 
-def _unknown_tool(name: str, kind: str, names: list[str] | None = None) -> str:
-    """`names`: the tools the caller has (an LLM agent's frozen set); default: the registry for its kind. Only
-    those are suggested, so an agent is never pointed at a tool its tool set lacks."""
+def _unknown_tool(name: str, kind: str, names: list[str] | None = None, mode: str | None = None) -> str:
+    """`names`: the tools the caller has (an LLM agent's frozen set); default: the registry for its kind in a
+    session of `mode` (None: both modes). Only those are suggested, so an agent is never pointed at a tool its
+    tool set lacks."""
     if names is None:
-        names = [s.name for s in tools_for(kind)]
+        names = [s.name for s in tools_for(kind, mode)]
     close = difflib.get_close_matches(str(name), names, n=3, cutoff=0.5)
     hint = f" Did you mean: {', '.join(close)}?" if close else ""
     return f"Unknown tool '{name}'.{hint} Available tools: {', '.join(names)}."
@@ -319,6 +388,57 @@ def _not_available(spec: ToolSpec, kind: str) -> str:
     elif kind == "external" and "user" in spec.audience:
         text += "; it is for the user: omit as_agent"
     return text + "."
+
+
+# the refusal of a tool of the other mode (docs/SPEC.md §22.5): the caller's language, it reaches the user's surfaces
+_OTHER_MODE = {
+    "en": {
+        "board": "Tool '{name}' is for board-mode sessions; this session works in the thread mode (no tasks): {hint}",
+        "thread": "Tool '{name}' is for thread-mode sessions; this session uses the task board: {hint}.",
+        "post": "post to the feed with post_create.",
+        "goal": "the goal is decided by the votes on #1 (vote target=#1 value=like), and the user may complete it "
+                "with swarm_control complete_goal=true.",
+    },
+    "ru": {
+        "board": "Инструмент '{name}' — для сессий с доской задач; эта сессия работает в режиме треда (задач нет): "
+                 "{hint}",
+        "thread": "Инструмент '{name}' — для сессий в режиме треда; эта сессия работает с доской задач: {hint}.",
+        "post": "публикуй в ленту через post_create.",
+        "goal": "о цели решают голоса на #1 (vote target=#1 value=like), а пользователь может завершить ее через "
+                "swarm_control complete_goal=true.",
+    },
+}
+# the board tool nearest to a forum tool, named by the refusal in a board session
+_NEAREST_BOARD = {"post_create": "task_create", "post_update": "task_create", "comment": "task_comment"}
+
+
+def _other_mode(spec: ToolSpec, ctx: ToolContext) -> str:
+    """A tool of the other mode than the session's: what to use instead."""
+    texts = _OTHER_MODE.get(ctx.lang) or _OTHER_MODE["en"]
+    if "board" in spec.modes:
+        hint = texts["goal" if spec.name == "goal_complete" else "post"]
+        return texts["board"].format(name=spec.name, hint=hint)
+    return texts["thread"].format(name=spec.name, hint=_NEAREST_BOARD.get(spec.name, "board"))
+
+
+def _fit_note(ctx: ToolContext, text: str, note: str, ignored: list[str]) -> str:
+    """The ignored-arguments note of a result that went through. An LLM agent's runtime cuts every result to
+    agents.tool_output_chars in its middle; a note that pushed the result past that would cut out of it what the
+    tool already counted as shown (the lines of `read_file`, the comments of `post_read`, the posts of `feed`:
+    their read marks, docs/SPEC.md §7.3, §22.11). So for a result within that limit the note gets shorter, without
+    `Usage:` and then without the names, and is left out when even that does not fit. A result over the limit is
+    cut anyway and keeps the note at its end; other callers receive the result whole."""
+    if not note or ctx.runtime is None:
+        return note
+    limit = int(ctx.swarm.config.agents.tool_output_chars)
+    if len(text) > limit:
+        return note
+    room = limit - len(text)
+    for candidate in (note, f"\n[Ignored unknown argument(s): {', '.join(ignored)}]",
+                      "\n[Ignored unknown argument(s)]"):
+        if len(candidate) <= room:
+            return candidate
+    return ""
 
 
 async def call_tool(ctx: ToolContext, name: str, args: dict[str, Any] | None) -> tuple[str, bool]:
@@ -336,12 +456,15 @@ async def call_tool(ctx: ToolContext, name: str, args: dict[str, Any] | None) ->
     if lookup is not None and frozen_params is None:
         own = [t.get("name") for t in getattr(ctx.runtime, "tools", None) or []]
         return _unknown_tool(name, kind, names=own), True
+    mode = ctx.mode
     spec = REGISTRY.get(name)
     if spec is None:
-        return _unknown_tool(name, kind), True
+        return _unknown_tool(name, kind, mode=mode), True
+    if mode not in spec.modes:
+        return _other_mode(spec, ctx), True
     if kind not in spec.audience:
         return _not_available(spec, kind), True
-    params = frozen_params or spec.parameters
+    params = frozen_params or spec.parameters_for(mode)
     if args is not None and not isinstance(args, dict):
         return (f"Error: the arguments of {name} must be a JSON object, got {type(args).__name__}. "
                 f"Usage: {_signature(spec, params)}."), True
@@ -351,9 +474,14 @@ async def call_tool(ctx: ToolContext, name: str, args: dict[str, Any] | None) ->
         note = (f"\n[Ignored unknown argument(s): {', '.join(ignored)}. Usage: {_signature(spec, params)}]")
         args = {k: v for k, v in args.items() if k not in ignored}  # also those only a later revision has
     try:
-        prepared = prepare_args(spec, args, usage=params)
+        prepared = prepare_args(spec, args, usage=params, mode=mode)
         result = await spec.handler(ctx, prepared)
-        return (result if isinstance(result, str) else str(result)) + note, False
+        text = result if isinstance(result, str) else str(result)
+        return text + _fit_note(ctx, text, note, ignored), False
+    except ReadRefusal as exc:  # flag it for the rest of an LLM agent's response (docs/SPEC.md §7.3)
+        if ctx.runtime is not None and hasattr(ctx.runtime, "read_refused"):
+            ctx.runtime.read_refused = name
+        return f"Error: {exc}{note}", True
     except ToolError as exc:
         return f"Error: {exc}{note}", True
     except UnicodeEncodeError as exc:  # e.g. "\ud800" in a text stored by sqlite3 (UTF-8 only)
@@ -364,6 +492,16 @@ async def call_tool(ctx: ToolContext, name: str, args: dict[str, Any] | None) ->
         return f"Internal error in {name}: {type(exc).__name__}: {exc}", True
 
 
+def hold_after_refusal(ctx: ToolContext, key: str) -> None:
+    """Hold a call that a read-before-write refusal earlier in the same LLM response makes unsafe (docs/SPEC.md §7.3
+    "A `wait` after a refusal"): raises the ToolError of `prompts.TEXTS[key]` in the caller's language, with the
+    refused tool as `{tool}`, while `ctx.runtime.read_refused` is set (AgentRuntime._run_tools clears it at the start
+    of every response); does nothing otherwise, also for callers with no runtime (the hub, /api/act)."""
+    refused = getattr(ctx.runtime, "read_refused", None)
+    if refused:
+        raise ToolError(prompts.t(ctx.lang, key, tool=refused))
+
+
 _loaded = False
 
 
@@ -371,8 +509,8 @@ def _load() -> None:
     global _loaded
     if _loaded:
         return
-    from . import (board_tools, comm_tools, file_tools, job_tools, mcp_tools, skill_tools, swarm_tools,  # noqa: F401
-                   trace_tools, trigger_tools)
+    from . import (board_tools, comm_tools, file_tools, forum_tools, job_tools, mcp_tools,  # noqa: F401
+                   skill_tools, swarm_tools, trace_tools, trigger_tools)
 
     ordered = sorted(REGISTRY.values(), key=lambda s: s.order)
     REGISTRY.clear()

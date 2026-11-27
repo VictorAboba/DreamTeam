@@ -1,7 +1,8 @@
 """Frozen LLM tool sets (tools/frozen.py, docs/SPEC.md §6.1): the shipped revisions never change and stay
 served by the registry, every agent sends exactly the array it was given, and it moves to the current revision
 only inside a compaction. Agents run on ScriptedLLM; a later revision is simulated by patching
-TOOLSET_REVISION and `frozen.current` and registering a `probe` tool."""
+TOOLSET_REVISIONS["board"] and `frozen.current` and registering a `probe` tool. Each revision belongs to one session
+mode (docs/SPEC.md §22.5): the board's 5, the thread's 6."""
 
 from __future__ import annotations
 
@@ -26,16 +27,20 @@ from dreamteam.llm import anthropic_llm, openai_llm
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentKind, AgentStatus, Status
 from dreamteam.swarm import Swarm
-from dreamteam.tools import REGISTRY, ToolContext, ToolSpec, call_tool, frozen, schemas_for
+from dreamteam.tools import REGISTRY, ToolContext, ToolSpec, call_tool, frozen, schemas_for, tools_for
 
 # exact-order digests (sha256 of db.dumps) of every shipped revision: what agents send, byte for byte
 RELEASED = {
     # crew tasks: task_create and task_update gain crew and directions
     5: {"en": "06d7f3ebc6d94f9e450256633804a57619bae3859d9e4aa9c21a50b7da9d2187",
         "ru": "d0a9bbe1dc690b54ac30474843e8b53ec8c321997ef11afecfbbbfaf194656fa"},
+    # the thread mode's first tool set (docs/SPEC.md §22.5)
+    6: {"en": "a90a8caef7ca0727e5c4e48f038c48e5af763e0e3c0437b907221577464e4202",
+        "ru": "a341ee9d51bfa9644014fd5e748e472117dfe3f9cbd57549f75d896d26839195"},
 }
 LANGS = ("en", "ru")
-LATER = 99  # the simulated later revision
+MODES = ("board", "thread")
+LATER = frozen.NEWEST_REVISION + 1  # the simulated later revision of the board
 OLD = frozen.OLDEST_OPEN_REVISION  # what a simulated later revision upgrades from
 
 
@@ -139,9 +144,9 @@ def later_revision(monkeypatch):
                     parameters={"type": "object", "properties": {}, "required": []}, handler=probe_tool,
                     audience=frozenset({"llm"}))
     monkeypatch.setitem(REGISTRY, "probe", spec)
-    monkeypatch.setattr(frozen, "TOOLSET_REVISION", LATER)
+    monkeypatch.setitem(frozen.TOOLSET_REVISIONS, "board", LATER)
 
-    def current(language):
+    def current(language, mode="board"):
         return frozen.snapshot(OLD, language) + [{"name": "probe", "description": spec.describe(language or "en"),
                                                   "parameters": copy.deepcopy(spec.parameters)}]
 
@@ -156,36 +161,151 @@ def fast_scheduler(monkeypatch):
 
 # ------------------------------------------------------------------------------ released revisions
 def test_released_tool_sets_never_change():
-    # exactly the revisions a session this version opens can hold: OLD..TOOLSET_REVISION
-    assert frozen.revisions() == list(range(OLD, frozen.TOOLSET_REVISION + 1)) == sorted(RELEASED)
+    # exactly the revisions a session this version opens can hold: OLD..NEWEST_REVISION, one numbering for both modes
+    assert frozen.revisions() == list(range(OLD, frozen.NEWEST_REVISION + 1)) == sorted(RELEASED)
+    assert frozen.revisions("board") == [5] and frozen.revisions("thread") == [6]
+    assert frozen.NEWEST_REVISION == max(frozen.TOOLSET_REVISIONS.values()) == 6
     for rev, digests in RELEASED.items():
         for lang in LANGS:
             assert sha(dumps(frozen.snapshot(rev, lang))) == digests[lang], (rev, lang)
     # a language without texts gets the English array, like schemas_for
     assert frozen.snapshot(OLD, "de") == frozen.snapshot(OLD, None) == frozen.snapshot(OLD, "en")
+    assert frozen.snapshot(6, "de") == frozen.snapshot(6, "en")
+
+
+def test_each_snapshot_file_names_its_mode():
+    """A board file is llm_r<N>.json without "mode" (as 0.4.x wrote it), a thread file llm_thread_r<N>.json with
+    "mode": "thread"; no number is in two files."""
+    seen: dict[int, str] = {}
+    for path in sorted(frozen.SNAPSHOT_DIR.glob("llm_*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        rev, mode = data["revision"], data.get("mode", "board")
+        assert rev not in seen, (path.name, seen.get(rev))
+        seen[rev] = path.name
+        assert path.name == (f"llm_r{rev}.json" if mode == "board" else f"llm_{mode}_r{rev}.json")
+        assert ("mode" in data) == (mode != "board") and mode in MODES
+        assert frozen.mode_of(rev) == mode
+    assert sorted(seen) == frozen.revisions()
+    with pytest.raises(ValueError, match="not shipped"):
+        frozen.mode_of(LATER)
 
 
 def test_the_oldest_revision_opened_is_a_fixed_5(later_revision):
-    """OLDEST_OPEN_REVISION is a literal: a later revision (here 99) still opens sessions of revision 5."""
-    assert frozen.TOOLSET_REVISION == LATER
+    """OLDEST_OPEN_REVISION is a literal: a later revision still opens sessions of revision 5."""
+    assert frozen.TOOLSET_REVISIONS["board"] == LATER
     assert frozen.OLDEST_OPEN_REVISION == 5 and 5 in frozen.revisions()
 
 
 def test_valid_rejects_unusable_records():
     assert frozen.valid(frozen.record(OLD, "en", frozen.snapshot(OLD, "en")))
     assert frozen.valid(frozen.current_record("ru")) and frozen.valid({"rev": 5, "tools": []})
+    assert frozen.valid(frozen.current_record("en", "thread"))
+    assert frozen.valid({"rev": 6, "tools": [], "mode": "thread"})
     for bad in ({"rev": "1", "tools": []}, {"rev": True, "tools": []}, {"rev": 1, "tools": [{"name": "board"}]},
-                {"rev": 1, "tools": "board"}, ["board"], None, "(not JSON)"):
+                {"rev": 1, "tools": "board"}, ["board"], None, "(not JSON)", {"rev": 5, "tools": [], "mode": "chat"}):
         assert not frozen.valid(bad), bad
 
 
-def test_the_code_builds_the_current_revision():
+def test_records_carry_their_mode():
+    assert frozen.current_record("en") == {"rev": 5, "language": "en", "tools": frozen.current("en"), "mode": "board"}
+    thread = frozen.current_record("ru", "thread")
+    assert thread["rev"] == 6 and thread["mode"] == "thread" and thread["language"] == "ru"
+    assert dumps(thread["tools"]) == dumps(frozen.snapshot(6, "ru"))
+    # a record without "mode" (0.4.x) states the board mode, whatever its revision
+    assert frozen.record_mode({"rev": 5, "tools": []}) == "board"
+    assert frozen.record_mode({"rev": 6, "tools": []}) == "board"
+    assert frozen.record_mode({"rev": 6, "tools": [], "mode": "thread"}) == "thread"
+
+
+def test_read_ignores_a_record_of_the_other_mode(tmp_path, caplog):
+    from dreamteam.db import Database
+
+    db = Database(tmp_path / "swarm.db")
+    try:
+        frozen.write(db, "Anna", frozen.current_record("en"))
+        assert frozen.read(db, "Anna") == frozen.read(db, "Anna", "board") == frozen.current_record("en")
+        assert frozen.read(db, "Anna", "thread") is None and "not of the session's thread mode" in caplog.text
+        # no "mode" (missing = board) on a thread revision: unusable in both modes
+        frozen.write(db, "Bob", {"rev": 6, "language": "en", "tools": []})
+        assert frozen.read(db, "Bob", "board") is None and frozen.read(db, "Bob", "thread") is None
+        frozen.write(db, "Old", {"rev": 5, "language": "en", "tools": []})  # as 0.4.x wrote it
+        assert frozen.read(db, "Old", "board") is not None and frozen.read(db, "Old", "thread") is None
+        # a stated mode that its revision's does not match: unusable
+        frozen.write(db, "Eve", {"rev": 5, "language": "en", "tools": [], "mode": "thread"})
+        assert frozen.read(db, "Eve", "thread") is None and frozen.read(db, "Eve", "board") is None
+        frozen.write(db, "Max", {"rev": 6, "language": "en", "tools": [], "mode": "board"})
+        assert frozen.read(db, "Max", "board") is None and frozen.read(db, "Max", "thread") is None
+        frozen.write(db, "Liz", {"rev": 6, "language": "en", "tools": [], "mode": "thread"})
+        assert frozen.read(db, "Liz", "thread") is not None and frozen.read(db, "Liz", "board") is None
+        # a revision this code does not ship: its record's word
+        frozen.write(db, "New", {"rev": 99, "language": "en", "tools": []})
+        assert frozen.read(db, "New", "board") is not None and frozen.read(db, "New", "thread") is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_the_code_builds_the_current_revision(mode):
+    rev = frozen.TOOLSET_REVISIONS[mode]
+    assert frozen.mode_of(rev) == mode
     for lang in LANGS:
-        assert dumps(frozen.current(lang)) == dumps(frozen.snapshot(frozen.TOOLSET_REVISION, lang)), (
-            f"The LLM tool schemas ({lang}) differ from revision {frozen.TOOLSET_REVISION}. A schema change is a new "
-            "revision: bump TOOLSET_REVISION in tools/frozen.py, run `python -m dreamteam.tools.frozen --write`, "
-            "and pin its digests in RELEASED.")
+        assert dumps(frozen.current(lang, mode)) == dumps(frozen.snapshot(rev, lang)), (
+            f"The LLM tool schemas ({lang}, {mode}) differ from revision {rev}. A schema change is a new revision: "
+            f'set TOOLSET_REVISIONS["{mode}"] to NEWEST_REVISION + 1 in tools/frozen.py, run `python -m '
+            "dreamteam.tools.frozen --write`, and pin its digests in RELEASED.")
+    assert frozen.main(["--check", "--mode", mode]) == 0
     assert frozen.main(["--check"]) == 0
+
+
+def test_the_board_array_is_revision_5_without_a_mode():
+    """schemas_for without a mode builds the board array, byte for byte revision 5."""
+    for lang in LANGS:
+        assert dumps(frozen.normalize(schemas_for("llm", lang))) == dumps(frozen.snapshot(5, lang))
+        assert dumps(frozen.current(lang)) == dumps(frozen.snapshot(5, lang))
+
+
+_THREAD_VARIANTS = {"send_message", "wait", "agents", "retire_agent", "mcp_create", "trigger_create"}
+_FORUM_TOOLS = ["feed", "post_read", "post_create", "post_update", "comment", "vote", "subscriptions", "subscribe",
+                "unsubscribe"]
+_BOARD_WORDS = ("task", "board", "todo", "assign", "task_comment", "задач",
+                "доск", "назнач")
+
+
+def _texts(schema: Any) -> list[str]:
+    """Every description in a tool or schema, nested ones too."""
+    found = []
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "description" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(_texts(value))
+    elif isinstance(schema, list):
+        for value in schema:
+            found.extend(_texts(value))
+    return found
+
+
+def test_revision_6_is_the_shared_tools_then_the_forum():
+    for lang in LANGS:
+        board = {t["name"]: t for t in frozen.snapshot(5, lang)}
+        thread = frozen.snapshot(6, lang)
+        names = frozen.names(thread)
+        shared = [n for n in board if n in names]
+        assert names == shared + _FORUM_TOOLS and len(shared) == 23 and len(names) == 32
+        assert set(board) - set(names) == {"board", "task_get", "task_create", "task_claim", "task_update",
+                                           "task_complete", "task_review", "task_comment", "task_discussion",
+                                           "goal_complete"}
+        for tool in thread:
+            if tool["name"] in board and tool["name"] not in _THREAD_VARIANTS:
+                assert dumps(tool) == dumps(board[tool["name"]]), (lang, tool["name"])  # byte for byte
+            elif tool["name"] in board:
+                assert dumps(tool) != dumps(board[tool["name"]]), (lang, tool["name"])
+            for text in [tool["description"], *_texts(tool["parameters"])]:
+                low = text.lower()
+                assert not any(word in low for word in _BOARD_WORDS), (lang, tool["name"], text)
+            if lang == "ru" and (tool["name"] in _THREAD_VARIANTS or tool["name"] in _FORUM_TOOLS):
+                assert "\u0451" not in tool["description"], tool["name"]
 
 
 def _types(schema: dict) -> tuple:
@@ -193,15 +313,17 @@ def _types(schema: dict) -> tuple:
 
 
 def test_every_released_tool_set_is_still_served():
-    """Arguments are validated against the current registry, so it must accept everything a shipped array
-    allows: no tool or property removed or retyped, no new required argument, enums only grow."""
+    """Arguments are validated against the current registry of the revision's mode, so it must accept everything a
+    shipped array allows: no tool or property removed or retyped, no new required argument, enums only grow."""
+    tools_for("llm")  # the registry is filled (also when this test runs alone)
     for rev in frozen.revisions():
+        mode = frozen.mode_of(rev)
         for lang in LANGS:
             for tool in frozen.snapshot(rev, lang):
                 where = (rev, lang, tool["name"])
                 spec = REGISTRY.get(tool["name"])
-                assert spec is not None and "llm" in spec.audience, where
-                old, new = tool["parameters"], spec.parameters
+                assert spec is not None and "llm" in spec.audience and mode in spec.modes, where
+                old, new = tool["parameters"], spec.parameters_for(mode)
                 new_props = new.get("properties", {})
                 for prop, schema in old.get("properties", {}).items():
                     assert prop in new_props, (*where, prop)
@@ -217,26 +339,42 @@ def test_every_released_tool_set_is_still_served():
 def test_schemas_are_plain_json():
     for kind in ("llm", "external", "user"):
         for lang in LANGS:
-            schemas = schemas_for(kind, lang)
-            assert frozen.normalize(schemas) == schemas
-            assert dumps(frozen.normalize(schemas)) == dumps(schemas)
+            for mode in MODES:
+                schemas = schemas_for(kind, lang, mode)
+                assert frozen.normalize(schemas) == schemas
+                assert dumps(frozen.normalize(schemas)) == dumps(schemas)
+                assert [s["name"] for s in schemas] == [s.name for s in tools_for(kind, mode)]
 
 
 def test_write_refuses_to_change_a_released_file(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(frozen, "SNAPSHOT_DIR", tmp_path)
     frozen._snapshot_text.cache_clear()
-    rev = frozen.TOOLSET_REVISION
-    path = tmp_path / f"llm_r{rev}.json"
+    paths = {"board": tmp_path / "llm_r5.json", "thread": tmp_path / "llm_thread_r6.json"}
     try:
         assert frozen.main(["--check"]) == 1  # missing
+        assert frozen.main(["--write", "--mode", "thread"]) == 0 and not paths["board"].exists()
+        assert frozen.main(["--check", "--mode", "thread"]) == 0 and frozen.main(["--check"]) == 1
         assert frozen.main(["--write"]) == 0
-        written = path.read_bytes()
-        assert b"\r\n" not in written and json.loads(written)["revision"] == rev
-        assert frozen.main(["--check"]) == 0 and frozen.main(["--write"]) == 0  # unchanged: rewritten as is
-        path.write_text(f'{{"revision": {rev}, "en": [], "ru": []}}', encoding="utf-8")
-        assert frozen.main(["--check"]) == 1
-        assert frozen.main(["--write"]) == 2  # a released revision is never edited
-        assert frozen.main(["--write", "--force"]) == 0 and path.read_bytes() == written
+        written = {mode: path.read_bytes() for mode, path in paths.items()}
+        for mode, rev in frozen.TOOLSET_REVISIONS.items():
+            data = json.loads(written[mode])
+            assert b"\r\n" not in written[mode] and data["revision"] == rev and data.get("mode", "board") == mode
+        assert "mode" not in json.loads(written["board"])  # as llm_r5.json
+        assert frozen.main(["--check"]) == 0 and frozen.main(["--write"]) == 0  # unchanged: left as is
+        assert {mode: path.read_bytes() for mode, path in paths.items()} == written
+        for mode, path in paths.items():
+            rev = frozen.TOOLSET_REVISIONS[mode]
+            path.write_text(f'{{"revision": {rev}, "en": [], "ru": []}}', encoding="utf-8")
+            capsys.readouterr()
+            assert frozen.main(["--check"]) == 1
+            assert f'set TOOLSET_REVISIONS["{mode}"] to NEWEST_REVISION + 1 (7)' in capsys.readouterr().err
+            assert frozen.main(["--write"]) == 2  # a released revision is never edited
+            assert frozen.main(["--write", "--force", "--mode", mode]) == 0 and path.read_bytes() == written[mode]
+        # a thread file without its "mode" is not the thread revision
+        data = json.loads(written["thread"])
+        del data["mode"]
+        paths["thread"].write_text(json.dumps(data), encoding="utf-8")
+        assert frozen.main(["--check", "--mode", "thread"]) == 1
     finally:
         frozen._snapshot_text.cache_clear()
 
@@ -248,7 +386,8 @@ async def test_new_agent_freezes_its_tools_before_the_first_call(tmp_path):
     try:
         agent = swarm.members()[0]["name"]
         record = frozen.read(swarm.db, agent)
-        assert record is not None and record["rev"] == frozen.TOOLSET_REVISION and record["language"] == "en"
+        assert record is not None and record["rev"] == frozen.TOOLSET_REVISIONS["board"] and record["language"] == "en"
+        assert record["mode"] == "board"
         stored = swarm.db.scalar("SELECT value FROM kv WHERE key = ?", (frozen.kv_key(agent),))
         assert stored == dumps(record)
         swarm.notify(agent, "n_restart")
@@ -405,9 +544,9 @@ async def test_compaction_moves_an_agent_to_the_current_tool_set(tmp_path, later
 async def test_an_upgrade_that_adds_only_properties_names_no_tool(tmp_path, monkeypatch):
     """A later revision that only adds a property (here `probe_flag` of `board`) moves the agent at its compaction
     like one that adds a tool, and the summary message names no new tool."""
-    monkeypatch.setattr(frozen, "TOOLSET_REVISION", LATER)
+    monkeypatch.setitem(frozen.TOOLSET_REVISIONS, "board", LATER)
 
-    def current(language):
+    def current(language, mode="board"):
         tools = frozen.snapshot(OLD, language)
         next(t for t in tools if t["name"] == "board")["parameters"]["properties"]["probe_flag"] = {"type": "boolean"}
         return tools
@@ -519,7 +658,7 @@ async def test_provider_requests_are_byte_identical_across_restarts(tmp_path):
         a = [json.dumps(anthropic_llm.build_request(profile, "s", msgs, t, use_betas=False)["tools"],
                         ensure_ascii=False) for t in sent]
         o = [json.dumps(openai_llm.build_request(profile, "s", msgs, t)["tools"], ensure_ascii=False) for t in sent]
-        snap = frozen.snapshot(frozen.TOOLSET_REVISION, "ru")  # a new agent: the current revision
+        snap = frozen.snapshot(frozen.TOOLSET_REVISIONS["board"], "ru")  # a new agent: the current revision
         assert a[0] == a[1] == json.dumps(anthropic_llm.convert_tools(snap), ensure_ascii=False)
         assert o[0] == o[1] == json.dumps(openai_llm.convert_tools(snap), ensure_ascii=False)
     finally:
@@ -598,7 +737,7 @@ async def test_has_tool_and_member_tool_names(tmp_path, later_revision):
         assert "probe" in names(swarm, swarm.member(unstarted))  # a history without a record: still the current set
         assert tool_rows(swarm) == rows  # ...and nothing is written
         assert "wait_for_events" in names(swarm, swarm.member("Claude Code"))
-        assert names(swarm, {"name": USER, "kind": "user"}) == {s.name for s in tools_module.tools_for("user")}
+        assert names(swarm, {"name": USER, "kind": "user"}) == {s.name for s in tools_module.tools_for("user", "board")}
     finally:
         await shutdown(swarm)
 
@@ -617,7 +756,7 @@ async def test_an_invalid_record_is_replaced(tmp_path, caplog):
         swarm.db.execute("UPDATE kv SET value = ? WHERE key = ?", ("{not json", key))
         assert frozen.read(swarm.db, agent) is None
         runtime = AgentRuntime(swarm, agent)  # a record it cannot use is rebuilt like a missing one
-        assert runtime.tools_rev == frozen.TOOLSET_REVISION
+        assert runtime.tools_rev == frozen.TOOLSET_REVISIONS["board"]
         assert frozen.read(swarm.db, agent) == frozen.current_record("en")
     finally:
         await shutdown(swarm)

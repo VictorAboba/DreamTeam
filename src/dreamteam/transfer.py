@@ -61,8 +61,8 @@ from . import mcp_library
 from .config import (CONFIG_FILE, AgentSettings, ApiSettings, MCPSettings, ModelProfile, RoleSettings,
                      ServerSettings, ShellSettings, SkillsSettings, SwarmSettings, TeamSettings, TracingSettings,
                      WorkspaceSettings, env_var_name, key_env_names, make_profile)
-from .db import (foreign_objects, known_columns, loads, made_by_earlier_version, max_tools_revision, reading_file,
-                 sqlite_uri, unknown_columns)
+from .db import (MODES as DB_MODES, foreign_objects, known_columns, loads, made_by_earlier_version,
+                 max_tools_revision, reading_file, session_mode, sqlite_uri, unknown_columns)
 from .mcp_forge import _split_command
 from .roles import missing_roles, role_key, team_key
 from .sessions import (LEGACY_ID, MOVE_JOURNAL, OVERRIDE_SECTIONS, REPLACED_PREFIX, SESSION_EVENTS, SESSION_FILE,
@@ -73,7 +73,7 @@ from .settings import (PROVIDER_CHOICES, _endpoint, _private, _stored_key, api_v
 from .shell import _KNOWN_SECRETS, _SECRET_RE, _URL_USERINFO, _is_secret, strip_url_credentials
 from .skills import META_FILE as SKILL_META, NAME_MAX, NAME_RE, ORIGINS, Library, Limits, SkillError, _read_json, \
     _rename, check_skill_dir, copy_skill
-from .tools.frozen import TOOLSET_REVISION
+from .tools.frozen import KV_PREFIX as TOOLS_KV_PREFIX, MODES as TOOL_MODES, NEWEST_REVISION, TOOLSET_REVISIONS
 from .treecopy import (EXPORT_EXCLUDE_NAMES, EXPORT_EXCLUDE_PATHS, TreeResult, compare_digest, copy_tree, is_within,
                        scan_tree, valid_mode)
 from .workspace import format_size, is_link, long_path, looks_like_git_dir, rmtree
@@ -1144,6 +1144,9 @@ def render_export_report(report: ExportReport) -> str:
         lines.append(f"  sessions  {_plural(len(report.sessions), 'session')}, "
                      f"{format_size(sizes.get('sessions', 0))} (databases {format_size(db)}, workspace files "
                      f"{format_size(files)})")
+        threads = [s["id"] for s in report.sessions if s.get("swarm_mode") == "thread"]
+        if threads:   # (a board session is shown as before)
+            lines.append(f"            thread mode: {', '.join(threads)}")
     if report.left_out:
         lines.append("Left out:")
         lines.extend(f"  - {item['what']}: {item['reason']}" for item in report.left_out)
@@ -1733,7 +1736,9 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
     meta_bytes = _json_bytes(stored)
     size = len(meta_bytes)
     files = 1
-    entry: dict[str, Any] = {"id": sid, "uid": item.uid, "title": item.meta.get("title") or sid,
+    # swarm_mode: the mode its database records (db.session_mode, missing = board; docs/SPEC.md §22.9), never the
+    # cache in its overrides
+    entry: dict[str, Any] = {"id": sid, "uid": item.uid, "title": item.meta.get("title") or sid, "swarm_mode": "board",
                              "created_at": item.meta.get("created_at"), "last_event": None, "events": 0,
                              "max_tools_rev": None, "db_sha256": None, "db_bytes": 0, "attached_skills": [],
                              "mcp_servers": [], "running_at_export": sid in running,
@@ -1759,6 +1764,8 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
             entry["db_sha256"] = _sha256(copied)
         else:
             entry["db_bytes"] = sum(p.stat().st_size for p in (db, db.with_name(DB_FILE + "-wal")) if p.is_file())
+        with contextlib.suppress(sqlite3.Error, OSError):   # (read only; an unreadable file stays "board")
+            entry["swarm_mode"] = session_mode(copied if target is not None else db)
         try:  # docs/SPEC.md §17.2: exported like any other, but the same version will refuse it at import
             earlier = made_by_earlier_version(copied if target is not None else db)
         except (sqlite3.Error, OSError):
@@ -1824,13 +1831,14 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
 
 def _manifest(report: ExportReport, home: Path) -> dict[str, Any]:
     """dreamteam-export.json: what the export holds, per category, and what import checks first (the format, the
-    database columns and the tool-set revision this version writes)."""
+    database columns and the tool-set revisions this version writes: the newest and the one of each session mode)."""
     return {
         "format": FORMAT, "format_version": FORMAT_VERSION, "dreamteam_version": __version__,
         "created_at": time.time(),
         "source": {"machine": platform.node(), "os": sys.platform, "home": str(home),
                    "python": platform.python_version()},
-        "schema": {"db_columns": sorted(known_columns()), "toolset_revision": TOOLSET_REVISION},
+        "schema": {"db_columns": sorted(known_columns()), "toolset_revision": NEWEST_REVISION,
+                   "toolset_revisions": dict(TOOLSET_REVISIONS)},
         "include": list(report.include),
         "settings": report.settings if "settings" in report.include else None,
         "skills": report.skills if "skills" in report.include else None,
@@ -2789,6 +2797,26 @@ def _session_overrides(exported: Any, old: Any, sid: str, global_external: Any =
     return {k: v for k, v in out.items() if v}, warnings
 
 
+def _keep_db_mode(overrides: dict[str, Any], mode: str) -> bool:
+    """Put the mode of the exported database (`mode`, db.session_mode) into the imported session's overrides
+    (docs/SPEC.md §22.9): `swarm.mode` = "thread" for a thread database, no key for a board one (a board session never
+    stores it, so 0.4.x keeps reading its session.json). True when the exported overrides named another mode (a hand
+    edit), which the plan warns of; a "board" a board database's overrides held goes without a warning."""
+    swarm = overrides.get("swarm") if isinstance(overrides.get("swarm"), dict) else None
+    named = swarm.get("mode") if swarm is not None else None
+    if mode == "thread":
+        if named == "thread":
+            return False
+        overrides["swarm"] = {**(swarm or {}), "mode": "thread"}
+        return True
+    if swarm is None or "mode" not in swarm:
+        return False
+    del swarm["mode"]
+    if not swarm:
+        del overrides["swarm"]
+    return named not in (None, "", "board")
+
+
 # ---- the plan -----------------------------------------------------------------------------------------------------
 class _Planner:
     def __init__(self, manager: SessionManager, folder: Path, manifest: dict[str, Any], plan: ImportPlan,
@@ -2929,6 +2957,26 @@ def _cached_sha256(path: Path) -> str:
     return _SHA_CACHE[key]
 
 
+def _record_modes(path: Path) -> set[Any]:
+    """The "mode" values the kv `tools:<member>` records of a database state (a record without one is a board
+    record and adds nothing; records that are not JSON objects are ignored, as db.max_tools_revision does)."""
+    found: set[Any] = set()
+    with _read_db(path, 10.0) as (conn, _immutable):
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kv'").fetchone():
+            return found
+        rows = conn.execute("SELECT value FROM kv WHERE substr(key, 1, ?) = ?",
+                            (len(TOOLS_KV_PREFIX), TOOLS_KV_PREFIX))
+        for (value,) in rows:
+            try:
+                rec = json.loads(value) if isinstance(value, (str, bytes)) else None
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and "mode" in rec:
+                mode = rec["mode"]
+                found.add(mode if isinstance(mode, (str, int, float, bool)) or mode is None else repr(mode))
+    return found
+
+
 def _check_export_db(path: Path, entry: dict[str, Any]) -> str | None:
     """Why the database of an exported session cannot be imported here, or None."""
     expected = entry.get("db_sha256")
@@ -2947,6 +2995,8 @@ def _check_export_db(path: Path, entry: dict[str, Any]) -> str | None:
         unknown = unknown_columns(path)
         revision = max_tools_revision(path)
         foreign = foreign_objects(path)
+        record_modes = _record_modes(path)
+        mode = session_mode(path)
         earlier = made_by_earlier_version(path)
     except (sqlite3.Error, OSError) as exc:
         return f"its database cannot be read: {exc}"
@@ -2956,9 +3006,13 @@ def _check_export_db(path: Path, entry: dict[str, Any]) -> str | None:
     if foreign:
         return (f"its database has {', '.join(foreign[:5])}{', ...' if len(foreign) > 5 else ''}, which DreamTeam "
                 "does not create (another program changed it, or a newer DreamTeam made it)")
-    if revision is not None and revision > TOOLSET_REVISION:
-        return (f"its agents use the tool set {revision}, which this DreamTeam does not know (it knows "
-                f"{TOOLSET_REVISION}): update DreamTeam here")
+    if revision is not None and revision > NEWEST_REVISION:
+        return (f"its agents use the tool set {revision}, which this DreamTeam does not know (it knows up to "
+                f"{NEWEST_REVISION}): update DreamTeam here")
+    if any(m not in TOOL_MODES for m in record_modes):   # docs/SPEC.md §22.9
+        return "its agents use a tool set of a mode this DreamTeam does not know: update DreamTeam here"
+    if mode not in DB_MODES:   # Swarm refuses it at open (docs/SPEC.md §22.1)
+        return f"its mode '{mode}' is unknown: it was made by a newer DreamTeam: update DreamTeam here"
     if earlier:  # docs/SPEC.md §17.2: this version never opens it
         return (f"it was made by an earlier version of DreamTeam and cannot be opened by this one ({__version__}); "
                 "import it with the version that made it")
@@ -3140,6 +3194,11 @@ def _plan_session(p: _Planner, eid: str, entry: dict[str, Any], meta: dict[str, 
     reason = _check_export_db(src / ".dreamteam" / DB_FILE, entry)
     if reason:
         return refuse(reason)
+    try:   # the session's mode is its database's (docs/SPEC.md §22.9), whatever its settings or the manifest say
+        mode = session_mode(src / ".dreamteam" / DB_FILE)
+    except (sqlite3.Error, OSError) as exc:
+        return refuse(f"its database cannot be read: {exc}")
+    item.data["mode"] = mode
     targets = target_uids.get(uid, [])
     target = None
     fresh_uid = None
@@ -3165,6 +3224,11 @@ def _plan_session(p: _Planner, eid: str, entry: dict[str, Any], meta: dict[str, 
         target = targets[0]
     if target is not None and target in claimed:
         return refuse(f"session {claimed[target]} of this import is the same session (it rewrites {target} here)")
+    if target is not None:   # never switched by an import (docs/SPEC.md §22.9, §22.10)
+        here_mode = manager.stored_mode(target, target_metas.get(target))
+        if here_mode != mode:
+            return refuse(f"its mode differs here ({here_mode}/{mode}): the mode is chosen when a session is "
+                          "created; delete one copy or import it as a new session")
     title = str(meta.get("title") or eid)
     kind, relative, stored, adopted = _workspace_kind(meta)
     old = target_metas.get(target) if target is not None else None
@@ -3175,6 +3239,9 @@ def _plan_session(p: _Planner, eid: str, entry: dict[str, Any], meta: dict[str, 
     overrides, notes = _session_overrides(meta.get("overrides"), old.get("overrides") if old else None, eid,
                                           mcp.get("external"),
                                           [n for n in _list(entry.get("credentials_removed")) if isinstance(n, str)])
+    if _keep_db_mode(overrides, mode):
+        notes.append(f"session {eid}: its settings named another mode than its database; the database's ({mode}) "
+                     "is kept")
     try:   # exactly what the import writes, so that a re-import of the same export is unchanged
         overrides, dropped_model = manager.import_overrides(overrides, p.models_after)
     except SessionError as exc:
@@ -4056,7 +4123,9 @@ def _by_order(items: list[ImportItem]) -> list[ImportItem]:
 
 
 def _line(item: ImportItem, text: str) -> str:
-    return f"  {item.category:<9} {item.name}: {text}"
+    # a thread session is marked (docs/SPEC.md §22.9); a board one is shown as before
+    mode = " (thread)" if item.category == "sessions" and item.data.get("mode") == "thread" else ""
+    return f"  {item.category:<9} {item.name}{mode}: {text}"
 
 
 def render_import_plan(plan: ImportPlan) -> str:

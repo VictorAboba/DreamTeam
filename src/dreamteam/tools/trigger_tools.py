@@ -62,20 +62,61 @@ _ACTION_SCHEMA = {
     },
     "required": ["type"],
 }
+# a thread session's triggers (docs/SPEC.md §22.5): no task functions, no task actions
+_DSL_THREAD = (
+    "Condition = a boolean expression with and/or/not, comparisons (== != < <= > >= in) and functions: "
+    "message(sender=, contains=) [a message to you arrived], file_exists(path), file_changed(path), "
+    "after(\"2026-10-09 18:00\"), elapsed(seconds), every(seconds) [periodic, >= 10], agent_status(name), goal_done(). "
+    "Examples: message(sender=\"Anna Smith\"); file_changed(\"report.md\"); file_exists(\"out/result.json\") or "
+    "elapsed(1800); every(1800)."
+)
+_DSL_THREAD_RU = (
+    "Условие — логическое выражение с and/or/not, сравнениями (== != < <= > >= in) и функциями: "
+    "message(sender=, contains=) [пришло сообщение тебе], file_exists(path), file_changed(path), "
+    "after(\"2026-10-09 18:00\"), elapsed(секунды), every(секунды) [периодически, >= 10], agent_status(имя), "
+    "goal_done(). Примеры: message(sender=\"Анна Смирнова\"); file_changed(\"report.md\"); "
+    "file_exists(\"out/result.json\") or elapsed(1800); every(1800)."
+)
+_ACTIONS_THREAD = (
+    "By default the trigger wakes you with the note; a message action can instead send a message (add "
+    "{\"type\": \"wake\"} to also wake you). Posts, comments and votes are followed with subscribe and @mentions, "
+    "not with triggers. once=true (default): the trigger is deactivated after it fires; once=false: it fires every "
+    "time the condition becomes true again (every() triggers always repeat)."
+)
+_ACTIONS_THREAD_RU = (
+    "По умолчанию триггер будит тебя с заметкой note; действие message позволяет вместо этого отправить сообщение "
+    "(добавь {\"type\": \"wake\"}, чтобы еще и проснуться). За объявлениями, комментариями и голосами следят через "
+    "subscribe и @упоминания, а не триггерами. once=true (по умолчанию): после срабатывания триггер отключается; "
+    "once=false: срабатывает каждый раз, когда условие снова становится истинным (триггеры с every() повторяются "
+    "всегда)."
+)
+_ACTION_SCHEMA_THREAD = {
+    "type": "object",
+    "properties": {key: _ACTION_SCHEMA["properties"][key] for key in ("type", "to", "text")} | {
+        "type": {"type": "string", "enum": ["wake", "message"]}},
+    "required": ["type"],
+}
+_CREATE_EN = "Create a trigger that fires when a condition over the swarm state becomes true. "
+_CREATE_RU = "Создать триггер, срабатывающий, когда условие над состоянием роя становится истинным. "
+_CREATE_PROPS = {
+    "condition": {"type": "string"},
+    "note": {"type": "string", "description": "Reminder shown when it fires (what to do then)"},
+    "once": {"type": "boolean"},
+    "actions": {"type": "array", "items": _ACTION_SCHEMA, "description": "Default: [{\"type\": \"wake\"}]"},
+}
 
 
 @tool(
     "trigger_create",
-    en="Create a trigger that fires when a condition over the swarm state becomes true. " + _DSL + " " + _ACTIONS,
-    ru="Создать триггер, срабатывающий, когда условие над состоянием роя становится истинным. " + _DSL_RU + " "
-       + _ACTIONS_RU,
-    properties={
-        "condition": {"type": "string"},
-        "note": {"type": "string", "description": "Reminder shown when it fires (what to do then)"},
-        "once": {"type": "boolean"},
-        "actions": {"type": "array", "items": _ACTION_SCHEMA, "description": "Default: [{\"type\": \"wake\"}]"},
-    },
+    en=_CREATE_EN + _DSL + " " + _ACTIONS,
+    ru=_CREATE_RU + _DSL_RU + " " + _ACTIONS_RU,
+    properties=_CREATE_PROPS,
     required=["condition"],
+    thread={
+        "en": _CREATE_EN + _DSL_THREAD + " " + _ACTIONS_THREAD,
+        "ru": _CREATE_RU + _DSL_THREAD_RU + " " + _ACTIONS_THREAD_RU,
+        "properties": {**_CREATE_PROPS, "actions": {**_CREATE_PROPS["actions"], "items": _ACTION_SCHEMA_THREAD}},
+    },
 )
 async def trigger_create(ctx: ToolContext, args: dict[str, Any]) -> str:
     trig = ctx.swarm.triggers.create(

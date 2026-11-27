@@ -10,10 +10,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .. import roles
-from ..console import _SCP_URL, _SKILL_REF, resolve_folder, unquote
+from ..console import _SCP_URL, _SKILL_REF, match_addressee, resolve_folder, unquote
+from ..models import USER
 from . import render
 from .client import HubError
-from .i18n import t
+from .dialogs import ConfirmDialog
+from .i18n import TEXTS, t
 from .input import ALL, CommandInfo, did_you_mean, number, parse_command, resolve_member
 
 if TYPE_CHECKING:
@@ -34,6 +36,14 @@ WRAP_UP_ON = ("", "on", "вкл")                  # /wrapup: the user's wrap-up
 WRAP_UP_OFF = ("off", "выкл", "stop", "стоп")   # ... or back off
 CLARIFY_ON = ("on", "вкл")                      # /clarify: clarify mode ([swarm] clarify) on ...
 CLARIFY_OFF = ("off", "выкл")                   # ... or off
+# a thread session (docs/SPEC.md §22.8 "TUI"): a post's number (9, #9, p9), a comment's (c31), a vote's target
+_POST_NUMBER = re.compile(r"(?:#|[pP])?(\d+)")
+_COMMENT_NUMBER = re.compile(r"[cC](\d+)")
+_VOTE_TARGET = re.compile(r"(#|[pPcC])?(\d+)")
+USER_NAMES = ("user", "пользователь")           # /feed @user: the user's posts
+RULE_WORDS = {"democracy": "democracy", "демократия": "democracy", "veto": "veto", "вето": "veto"}
+MODE_WORDS = {"board": "board", "доска": "board", "thread": "thread", "тред": "thread"}
+BOTH, BOARD, THREAD = ("board", "thread"), ("board",), ("thread",)
 
 # CLI flags that become session overrides of a new session (the sections of the launcher's modal)
 FLAT_OVERRIDES: dict[str, tuple[str, str]] = {
@@ -46,6 +56,8 @@ FLAT_OVERRIDES: dict[str, tuple[str, str]] = {
     "language": ("swarm", "language"),
     "network": ("swarm", "network"),   # --network off (docs/SPEC.md §7.2)
     "clarify": ("swarm", "clarify"),   # --clarify / --no-clarify (docs/SPEC.md §3 "Clarify mode")
+    "mode": ("swarm", "mode"),         # --mode board|thread (docs/SPEC.md §22.8)
+    "goal_rule": ("swarm", "goal_rule"),   # --goal-rule democracy|veto
 }
 
 
@@ -62,22 +74,36 @@ class Command:
     required: bool = False    # the arguments are required
     session: bool = False     # needs an attached session
     launcher: bool = False    # needs a launcher hub (sessions, settings)
+    # the work modes whose /help and suggestions list it (docs/SPEC.md §22.8: a thread session lists its own
+    # commands); it runs in either, and says what to use instead where it does not apply
+    modes: tuple[str, ...] = BOTH
 
-    def description(self, lang: str) -> str:
-        return t(lang, "cmd_" + self.name)
+    def _text(self, prefix: str, lang: str, mode: str) -> str:
+        """`<prefix><name>`, or its `_thread` variant in a thread session when there is one."""
+        key = prefix + self.name
+        if mode == "thread" and key + "_thread" in TEXTS.get(lang, TEXTS["en"]):
+            key += "_thread"
+        return t(lang, key)
 
-    def args_text(self, lang: str) -> str:
-        return t(lang, "cmdargs_" + self.name) if self.args else ""
+    def description(self, lang: str, mode: str = "board") -> str:
+        return self._text("cmd_", lang, mode)
 
-    def usage(self, lang: str) -> str:
-        return f"/{self.name} {self.args_text(lang)}".rstrip()
+    def args_text(self, lang: str, mode: str = "board") -> str:
+        return self._text("cmdargs_", lang, mode) if self.args else ""
 
-    def help_row(self, lang: str) -> dict[str, Any]:
-        return {"name": self.name, "args": self.args_text(lang), "description": self.description(lang),
+    def usage(self, lang: str, mode: str = "board") -> str:
+        return f"/{self.name} {self.args_text(lang, mode)}".rstrip()
+
+    def listed(self, mode: str = "board") -> bool:
+        return mode in self.modes
+
+    def help_row(self, lang: str, mode: str = "board") -> dict[str, Any]:
+        return {"name": self.name, "args": self.args_text(lang, mode), "description": self.description(lang, mode),
                 "aliases": list(self.aliases)}
 
-    def info(self, lang: str) -> CommandInfo:
-        return CommandInfo(self.name, self.description(lang), self.aliases, self.args_text(lang), self.required)
+    def info(self, lang: str, mode: str = "board") -> CommandInfo:
+        return CommandInfo(self.name, self.description(lang, mode), self.aliases, self.args_text(lang, mode),
+                           self.required)
 
 
 @dataclass
@@ -125,6 +151,19 @@ class CommandContext:
 
     async def state(self) -> dict:
         return await self.app.refresh_state()
+
+
+def _mode(app: Any) -> str:
+    """The attached session's work mode ("board" without one; a stand-in app without `mode` is a board)."""
+    return getattr(app, "mode", "board") if getattr(app, "attached", False) else "board"
+
+
+def _thread(app: Any) -> bool:
+    return _mode(app) == "thread"
+
+
+def _rule_word(c: "CommandContext", rule: Any) -> str:
+    return c.t("ev_rule_" + rule) if rule in ("democracy", "veto") else str(rule or "?")
 
 
 def _split(text: str) -> tuple[str, str]:
@@ -187,7 +226,7 @@ def _team_text(c: "CommandContext", rows: list[tuple[str, int]], catalog: list[d
 
 # ---- handlers -------------------------------------------------------------------------------------
 async def _help(c: CommandContext) -> None:
-    c.print(render.help_view(c.ctx, [cmd.help_row(c.lang) for cmd in COMMANDS]))
+    c.print(render.help_view(c.ctx, help_rows(c.lang, _mode(c.app)), thread=_thread(c.app)))
 
 
 async def _new(c: CommandContext) -> None:
@@ -216,19 +255,38 @@ async def _delete(c: CommandContext) -> None:
 
 
 async def _goal(c: CommandContext) -> None:
+    """`/goal`: the goal panel (a thread session's adds #1's vote line, the rule and the decision); `/goal text`: a
+    new goal, which in a thread session with a goal asks first (#1 and #2 are rewritten, the votes cleared)."""
+    thread = _thread(c.app)
     if not c.args:
         state = await c.state()
-        c.print(render.goal_panel(c.ctx, (state.get("swarm") or {}).get("goal")))
+        swarm = state.get("swarm") or {}
+        if thread:
+            c.print(render.goal_panel(c.ctx, swarm.get("goal"), vote=state.get("goal_vote"),
+                                      rule=swarm.get("goal_rule")))
+        else:
+            c.print(render.goal_panel(c.ctx, swarm.get("goal")))
         return
+    if thread and ((await c.state()).get("swarm") or {}).get("goal"):
+        if not await c.app.ask(ConfirmDialog(c.lang, c.t("goal_rewrite_title"), c.t("goal_rewrite"),
+                                             default=False)):
+            c.info(c.t("goal_unchanged"))
+            return
     await c.act("set_goal", {"title": c.args})  # the whole text: the hub splits it (first line = title)
 
 
 async def _board(c: CommandContext) -> None:
+    if _thread(c.app):   # a thread session has no board: its feed instead
+        await _feed(c)
+        return
     state = await c.state()
     c.print(render.board(c.ctx, state.get("tasks") or []))
 
 
 async def _task(c: CommandContext) -> None:
+    if _thread(c.app):
+        c.error(c.t("thread_no_tasks"))
+        return
     task_id = _int_arg(c.args)
     data = await c.client.task(c.sid, task_id)   # an unknown task errors before the snapshot is fetched
     try:                                         # the crew line and the subtasks come from the snapshot (§4.2)
@@ -236,6 +294,182 @@ async def _task(c: CommandContext) -> None:
     except HubError:                             # without it the task still prints, with no crew line or subtasks
         tasks = None
     c.print(render.task_detail(c.ctx, data, tasks))
+
+
+# ---- a thread session's commands (docs/SPEC.md §22.8 "TUI") ---------------------------------------------------
+def _board_session(c: CommandContext) -> bool:
+    """A thread command in a board session: says what to use there; True when it was refused so."""
+    if _thread(c.app):
+        return False
+    c.error(c.t("board_no_thread"))
+    return True
+
+
+def _post_id(text: str) -> int:
+    match = _POST_NUMBER.fullmatch(text.strip())
+    if match is None or int(match.group(1)) <= 0:
+        raise UsageError
+    return int(match.group(1))
+
+
+async def _feed(c: CommandContext) -> None:
+    """`/feed [@Name] [text]`: the `feed` tool with `by` (a member, retired ones included, or the user) and `query`;
+    an `@` that names nobody sends nothing."""
+    if _board_session(c):
+        return
+    arg = c.args.strip()
+    args: dict[str, Any] = {}
+    if arg.startswith("@"):
+        state = await c.state()
+        names = [str(a["name"]) for a in state.get("agents") or [] if isinstance(a, dict) and a.get("name")]
+        name, rest = match_addressee(arg, [*names, *USER_NAMES])
+        if name is None:
+            c.error(c.t("unknown_member", name=arg.split()[0].lstrip("@") or "@"))
+            return
+        args["by"] = USER if name in USER_NAMES else name
+        if rest.strip():
+            args["query"] = rest.strip()
+    elif arg:
+        args["query"] = arg
+    ok, text = await c.client.act(c.sid, "feed", args)
+    if not ok:
+        c.error(text)
+    else:
+        c.print(render.feed_text(c.ctx, text))
+
+
+async def _post(c: CommandContext) -> None:
+    """`/post N`: the post with its vote and comment tree (GET /api/posts/N; its comments feed the `cM`
+    suggestions); `/post` alone: the next input is a new post (its first line the title, the rest the text)."""
+    if _board_session(c):
+        return
+    if not c.args.strip():
+        c.app.ask_post()
+        return
+    data = await c.client.post(c.sid, _post_id(c.args))
+    c.app.open_post = data
+    c.print(render.post_view(c.ctx, data))
+
+
+async def _comment(c: CommandContext) -> None:
+    """`/comment N text`, `/comment N cM text` (a reply to comment M of post N)."""
+    if _board_session(c):
+        return
+    match = re.match(r"(\S+)\s*(.*)\Z", c.args.strip(), re.S)
+    if match is None:
+        raise UsageError
+    post_id, rest = _post_id(match.group(1)), match.group(2)
+    args: dict[str, Any] = {"post_id": post_id}
+    reply = re.match(r"(\S+)\s*(.*)\Z", rest, re.S)
+    if reply is not None and _COMMENT_NUMBER.fullmatch(reply.group(1)):
+        args["reply_to"] = f"c{int(reply.group(1)[1:])}"
+        rest = reply.group(2)
+    if not rest.strip():
+        raise UsageError
+    args["text"] = rest.strip()
+    await c.app.ensure_running()   # as a message: a comment to a stopped session starts it
+    await c.act("comment", args)   # the post.comment line says it
+
+
+async def _vote(c: CommandContext, value: str) -> None:
+    """`/like`, `/dislike`, `/unvote` with N (sent as #N: the forum refuses a bare number), #N, pN or cN."""
+    if _board_session(c):
+        return
+    arg = c.args.strip()
+    match = _VOTE_TARGET.fullmatch(arg)
+    if match is None or int(match.group(2)) <= 0:
+        raise UsageError
+    target = arg if match.group(1) else f"#{int(match.group(2))}"
+    await c.act("vote", {"target": target, "value": value}, report=True)
+
+
+async def _like(c: CommandContext) -> None:
+    await _vote(c, "like")
+
+
+async def _dislike(c: CommandContext) -> None:
+    await _vote(c, "dislike")
+
+
+async def _unvote(c: CommandContext) -> None:
+    await _vote(c, "none")
+
+
+async def _done(c: CommandContext) -> None:
+    """`/done [summary]`: the user completes the goal of a thread session (swarm_control complete_goal), after a
+    confirmation with «No» preselected; on a board the agents complete it."""
+    if not _thread(c.app):
+        c.error(c.t("board_done"))
+        return
+    if not await c.app.ask(ConfirmDialog(c.lang, c.t("done_title"), c.t("done_text"), default=False)):
+        c.info(c.t("goal_unchanged"))
+        return
+    summary = c.args.strip()
+    await c.act("swarm_control", {"complete_goal": True, **({"goal_summary": summary} if summary else {})})
+
+
+async def _rule(c: CommandContext) -> None:
+    """`/rule [democracy|veto]`: a thread session's goal rule (shown, or changed live through PATCH); a board
+    session has none; without a session the rule of the thread sessions this window creates (as /clarify)."""
+    arg = c.args.strip().casefold()
+    rule = RULE_WORDS.get(arg)
+    if arg and rule is None:
+        raise UsageError
+    if c.app.attached:
+        if not _thread(c.app):
+            c.info(c.t("rule_board"))
+            return
+        if rule is None:
+            state = await c.state()
+            c.info(c.t("rule_session", rule=_rule_word(c, (state.get("swarm") or {}).get("goal_rule"))))
+            return
+        data = await c.client.update_session(c.sid, {"swarm": {"goal_rule": rule}})
+        if isinstance(data.get("session"), dict):
+            c.app.session = {**(c.app.session or {}), **data["session"]}
+        c.info(c.t("rule_session_set", rule=_rule_word(c, rule)))
+        try:   # the vote is counted again under the new rule: the panel and the status read the snapshot
+            await c.state()
+        except HubError:
+            pass
+        return
+    swarm = c.app.overrides.get("swarm") or {}
+    if rule is None:
+        if "goal_rule" in swarm:
+            value, source = swarm["goal_rule"], "clarify_window"
+        else:
+            view = (await c.client.settings()).get("settings") or {}
+            value, source = (view.get("swarm") or {}).get("goal_rule") or "democracy", "clarify_inherited"
+        c.info(c.t("rule_new_state", rule=_rule_word(c, value), source=c.t(source)))
+        return
+    c.app.overrides.setdefault("swarm", {})["goal_rule"] = rule
+    c.info(c.t("rule_new_set", rule=_rule_word(c, rule)))
+
+
+async def _mode_command(c: CommandContext) -> None:
+    """`/mode [board|thread]`: a session's mode (chosen when it is created: an argument is refused), or without a
+    session the mode of the sessions this window creates (as /clarify)."""
+    arg = c.args.strip().casefold()
+    mode = MODE_WORDS.get(arg)
+    if arg and mode is None:
+        raise UsageError
+    if c.app.attached:
+        if arg:
+            c.error(c.t("mode_fixed"))
+            return
+        c.info(c.t("mode_session", mode=c.t("mode_" + _mode(c.app))))
+        return
+    swarm = c.app.overrides.get("swarm") or {}
+    if mode is None:
+        if swarm.get("mode") in MODE_WORDS.values():
+            value, source = swarm["mode"], "clarify_window"
+        else:
+            view = (await c.client.settings()).get("settings") or {}
+            value = "thread" if (view.get("swarm") or {}).get("mode") == "thread" else "board"
+            source = "clarify_inherited"
+        c.info(c.t("mode_new_state", mode=c.t("mode_" + value), source=c.t(source)))
+        return
+    c.app.overrides.setdefault("swarm", {})["mode"] = mode
+    c.info(c.t("mode_new_set", mode=c.t("mode_" + mode)))
 
 
 async def _agents(c: CommandContext) -> None:
@@ -634,7 +868,9 @@ async def _clarify(c: CommandContext) -> None:
         data = await c.client.update_session(c.sid, {"swarm": {"clarify": on}})
         if isinstance(data.get("session"), dict):
             c.app.session = {**(c.app.session or {}), **data["session"]}
-        c.info(c.t("clarify_session_on" if on else "clarify_session_off"))
+        # a thread session clarifies in #2, with questions to the user before the work starts (docs/SPEC.md §22.8)
+        on_key = "clarify_session_on_thread" if _thread(c.app) else "clarify_session_on"
+        c.info(c.t(on_key if on else "clarify_session_off"))
         return
     swarm = c.app.overrides.get("swarm") or {}
     if on is None:
@@ -667,6 +903,9 @@ async def _max(c: CommandContext) -> None:
 
 async def _approve(c: CommandContext) -> None:
     task_id, comment = _task_ref(c.args)
+    if task_id is not None and _thread(c.app):   # a thread has no tasks; `/approve name` of MCP is unchanged
+        c.error(c.t("thread_no_tasks"))
+        return
     if task_id is not None:
         await c.act("task_review", {"task_id": task_id, "approve": True, "comment": comment}, report=True)
         return
@@ -679,6 +918,9 @@ async def _approve(c: CommandContext) -> None:
 
 async def _reject(c: CommandContext) -> None:
     task_id, comment = _task_ref(c.args)
+    if task_id is not None and _thread(c.app):
+        c.error(c.t("thread_no_tasks"))
+        return
     if task_id is not None:
         if not comment:  # a return without a reason gives the agent nothing to act on
             c.error(c.t("review_reason_required", id=task_id))
@@ -735,8 +977,15 @@ COMMANDS: tuple[Command, ...] = (
     Command("resume", _resume, args=True, launcher=True),
     Command("delete", _delete, args=True, launcher=True),
     Command("goal", _goal, args=True, session=True),
-    Command("board", _board, session=True),
-    Command("task", _task, args=True, required=True, session=True),
+    Command("board", _board, session=True, modes=BOARD),   # in a thread session: /feed
+    Command("task", _task, args=True, required=True, session=True, modes=BOARD),
+    Command("feed", _feed, args=True, session=True, modes=THREAD),
+    Command("post", _post, args=True, session=True, modes=THREAD),
+    Command("comment", _comment, args=True, required=True, session=True, modes=THREAD),
+    Command("like", _like, args=True, required=True, session=True, modes=THREAD),
+    Command("dislike", _dislike, args=True, required=True, session=True, modes=THREAD),
+    Command("unvote", _unvote, args=True, required=True, session=True, modes=THREAD),
+    Command("done", _done, args=True, session=True, modes=THREAD),
     Command("agents", _agents, session=True),
     Command("roles", _roles, args=True),
     Command("jobs", _jobs, args=True, session=True),
@@ -756,6 +1005,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("pause", _pause, session=True),
     Command("wrapup", _wrapup, args=True, session=True),
     Command("clarify", _clarify, args=True, launcher=True),   # without a session: the next new ones (as --clarify)
+    Command("rule", _rule, args=True, launcher=True),         # the same for a thread session's goal rule
+    Command("mode", _mode_command, args=True, launcher=True),  # without a session: the next new ones' mode
     Command("budget", _budget, args=True, required=True, session=True),
     Command("max", _max, args=True, required=True, session=True),
     Command("approve", _approve, args=True, required=True, session=True),
@@ -784,13 +1035,13 @@ def names() -> list[str]:
     return list(_BY_NAME)
 
 
-def infos(lang: str) -> list[CommandInfo]:
-    """The registry as the suggestions need it."""
-    return [cmd.info(lang) for cmd in COMMANDS]
+def infos(lang: str, mode: str = "board") -> list[CommandInfo]:
+    """The registry as the suggestions need it: the commands of the session's work mode."""
+    return [cmd.info(lang, mode) for cmd in COMMANDS if cmd.listed(mode)]
 
 
-def help_rows(lang: str) -> list[dict[str, Any]]:
-    return [cmd.help_row(lang) for cmd in COMMANDS]
+def help_rows(lang: str, mode: str = "board") -> list[dict[str, Any]]:
+    return [cmd.help_row(lang, mode) for cmd in COMMANDS if cmd.listed(mode)]
 
 
 async def execute(app: "TUI", text: str) -> bool:
@@ -800,6 +1051,7 @@ async def execute(app: "TUI", text: str) -> bool:
         return False
     name, args = parsed
     lang = app.ctx.lang
+    mode = _mode(app)
     cmd = find(name)
     if cmd is None:
         app.print(render.error(app.ctx, t(lang, "unknown_command", cmd="/" + name)))
@@ -814,12 +1066,12 @@ async def execute(app: "TUI", text: str) -> bool:
         app.print(render.error(app.ctx, t(lang, "no_session")))
         return True
     if cmd.required and not args:
-        app.print(render.error(app.ctx, t(lang, "usage", usage=cmd.usage(lang))))
+        app.print(render.error(app.ctx, t(lang, "usage", usage=cmd.usage(lang, mode))))
         return True
     try:
         await cmd.handler(CommandContext(app, cmd, args))
     except UsageError:
-        app.print(render.error(app.ctx, t(lang, "usage", usage=cmd.usage(lang))))
+        app.print(render.error(app.ctx, t(lang, "usage", usage=cmd.usage(lang, mode))))
     except HubError as exc:
         app.print(render.error(app.ctx, app.hub_error(exc)))
     return True

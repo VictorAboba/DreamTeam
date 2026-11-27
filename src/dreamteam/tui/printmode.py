@@ -20,7 +20,7 @@ from ..autoreply import (
     AUTO_REPLY, AUTO_REPLY_MAX, AUTO_REVIEW, hub_answers, reply_text, review_key, review_text, wants_reply,
 )
 from ..copyfrom import size_text
-from ..instruct import continue_step, without_api_sessions
+from ..instruct import continue_step, post_parts, without_api_sessions
 from ..models import USER
 from ..result import build_result
 from .client import Connection, HubError
@@ -40,8 +40,9 @@ HEAL_MAX = 30.0
 PROGRESS_SKIP = ("agent.status", "agent.usage", "agent.activity", "trace.")  # fallback feed: too noisy
 # the user notices whose text goes to stderr once also without --verbose (docs/TUI.md §2): a model profile's calls
 # count as $0 (docs/SPEC.md §10), most of the money budget is spent (§3 record_usage), the whole team asleep with
-# nothing set to wake the team (§3 scheduler item 9: u_team_asleep, u_team_waits; the run goes on waiting)
-STDERR_NOTES = frozenset({"u_cost_unknown", "u_budget_low", "u_team_asleep", "u_team_waits"})
+# nothing set to wake the team (§3 scheduler item 9: u_team_asleep, u_team_waits; the run goes on waiting), a thread
+# session's team quiet with the goal undecided (§22.7: u_thread_quiet; the run goes on waiting too)
+STDERR_NOTES = frozenset({"u_cost_unknown", "u_budget_low", "u_team_asleep", "u_team_waits", "u_thread_quiet"})
 
 TEXTS = {
     "ru": {
@@ -70,8 +71,8 @@ TEXTS = {
                  "рой может ждать вас (и этот запуск тоже ждёт).",
         "asked_timeout": "{name} спрашивает вас (сообщение #{id}): ответьте на доске ({url}) или в dreamteam tui. До "
                          "тех пор рой может ждать вас (а этот запуск закончится по --timeout).",
-        "hub_answers": "Эта сессия создана через HTTP API с answers = \"auto\": на вопросы и ревью агентов за вас "
-                       "отвечает сам хаб, этот запуск автоответов не шлёт.",
+        "hub_answers": "Эта сессия создана через HTTP API с answers = \"auto\": на вопросы агентов (и, на доске "
+                       "задач, ревью) за вас отвечает сам хаб, этот запуск автоответов не шлет.",
     },
     "en": {
         "timeout": "Timed out after {seconds:g} s: the goal is not achieved.",
@@ -99,8 +100,9 @@ TEXTS = {
                  "swarm may wait for you (and this run waits too).",
         "asked_timeout": "{name} asks you (message #{id}): answer on the board ({url}) or in dreamteam tui. Until "
                          "then the swarm may wait for you (and this run ends at --timeout).",
-        "hub_answers": "This session was created through the HTTP API with answers \"auto\": the hub itself answers "
-                       "the agents' questions and reviews in your place, so this run sends no automatic replies.",
+        "hub_answers": "This session was created through the HTTP API with answers = \"auto\": the hub itself "
+                       "answers the agents' questions (and, on the task board, reviews) in your place, so this run "
+                       "sends no automatic replies.",
     },
 }
 
@@ -182,6 +184,13 @@ def _summary_line(ev: dict) -> str | None:
     elif isinstance(data.get("task"), dict):
         task = data["task"]
         detail = f"#{task.get('id')} {task.get('title', '')} [{task.get('status', '')}]"
+    elif etype.startswith("post.") and isinstance(data.get("post"), dict):
+        # a thread session's post (docs/SPEC.md §22.8 "Print mode"); the board's task.comment carries a post too
+        post = data["post"]
+        detail = f"#{post.get('id')} {post.get('title', '')}"
+    elif etype == "post.comment" and isinstance(data.get("comment"), dict):
+        comment = data["comment"]
+        detail = f"#{comment.get('post_id', data.get('post_id'))} c{comment.get('id')}: {comment.get('text', '')}"
     elif isinstance(data.get("goal"), dict):
         goal = data["goal"]
         detail = goal.get("summary") or goal.get("title") or ""
@@ -225,6 +234,16 @@ class _Progress:
             log.debug("render failed for %s", ev.get("type"), exc_info=True)
             line = _summary_line(ev)
             return [line] if line else []
+
+    def goal_vote(self, tally: Any) -> list[str]:
+        """Under a vote on #1: the vote line of the refreshed snapshot's goal_vote (docs/SPEC.md §22.8 "TUI")."""
+        from .render import goal_vote_line
+
+        try:
+            return self._text([goal_vote_line(self.ctx, tally, cont=True)])
+        except Exception:
+            log.debug("render failed for the goal vote", exc_info=True)
+            return []
 
     def due(self) -> list[str]:
         try:
@@ -388,8 +407,9 @@ class _PrintRun:
     async def attach(self, sid: str | None) -> None:
         """An existing session: the prompt becomes the goal when there is none, reopens a completed goal,
         else goes to the coordinator as a message (to the asker when the swarm waits for the user's answer to a
-        member's question: the prompt is the answer); the decision is instruct.continue_step's. Only what happens
-        from now on is followed."""
+        member's question: the prompt is the answer); in a thread session it becomes a post of the user in place of
+        the message (post_create with instruct.post_parts, docs/SPEC.md §22.9). The decision is
+        instruct.continue_step's. Only what happens from now on is followed."""
         client = self.client
         self.sid = sid
         latest = await client.events(sid, limit=1)
@@ -408,6 +428,9 @@ class _PrintRun:
             ok, text = await client.act(sid, "set_goal", {"title": self.prompt})
         elif step.action == "reopen_goal":
             ok, text = await client.act(sid, "swarm_control", {"reopen_goal_comment": self.prompt})
+        elif step.action == "post":
+            title, body = post_parts(self.prompt)
+            ok, text = await client.act(sid, "post_create", {"title": title, "text": body})
         else:
             ok, text = await client.act(sid, "send_message", {"to": [step.to], "text": self.prompt})
             if ok and step.answers_question is not None:
@@ -557,6 +580,8 @@ class _PrintRun:
         self.emit(ev)
         etype = ev.get("type")
         data = ev.get("data") or {}
+        if etype == "post.vote" and data.get("target") == "p1":
+            await self.goal_vote()
         if etype == "message.sent" and isinstance(data.get("message"), dict):
             await self.on_message(data["message"])
         elif etype == "task.updated" and isinstance(data.get("task"), dict):
@@ -570,6 +595,19 @@ class _PrintRun:
             await self.on_question(data.get("asker"), data.get("message_id"))
         elif etype == "notification" and data.get("kind") in STDERR_NOTES and data.get("recipient") == USER:
             self.on_user_notice(data.get("text"))
+
+    async def goal_vote(self) -> None:
+        """--verbose, after a vote on #1: the vote line of the refreshed snapshot under the vote's line, as the TUI
+        prints it (docs/SPEC.md §22.8 "TUI"); stream-json carries the event itself."""
+        if not self.verbose or self.format == "stream-json":
+            return
+        try:
+            state = await self.client.state(self.sid)
+        except HubError as exc:
+            log.debug("state refresh after a vote on #1 failed: %s", exc)
+            return
+        for line in self.feed().goal_vote(state.get("goal_vote")):
+            self.err.write(line + "\n")
 
     def on_user_notice(self, text: Any) -> None:
         """A user notice of STDERR_NOTES: its text on stderr once, in the `text` and `json` formats also without
@@ -681,12 +719,16 @@ class _PrintRun:
         if status == "done" and self.goal and (goal or {}).get("status") != "done":
             goal = self.goal  # the state may already be newer (e.g. reopened)
         summary = (goal or {}).get("summary", "") if status == "done" else ""
+        # a thread session's posts and the goal's decision (docs/SPEC.md §22.9 "Result"): a board run's are [] and null
+        mode = "thread" if swarm.get("mode") == "thread" else "board"
+        decision = (goal or {}).get("decision") if (goal or {}).get("status") == "done" else None
         # (the jobs still running: with an external hub they go on after this run, until the session stops)
         result = build_result(status=status, session=self.sid, goal=goal, summary=summary,
                               tasks=(state or {}).get("tasks") or [], agents=(state or {}).get("agents") or [],
                               jobs=(state or {}).get("jobs") or [], cost_usd=float(swarm.get("spent_usd") or 0.0),
                               duration_s=round(time.monotonic() - self.started, 3),
-                              error=reason if status != "done" and reason else None)
+                              error=reason if status != "done" and reason else None,
+                              mode=mode, posts=(state or {}).get("posts") or [], decision=decision)
         if self.format == "text":
             if status == "done":
                 self.out.write((summary or (goal or {}).get("title") or "").rstrip() + "\n")

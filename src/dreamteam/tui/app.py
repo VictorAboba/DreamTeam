@@ -52,7 +52,7 @@ from .dialogs import (
 from .i18n import LANGS, t
 from .input import (
     ALL, EXPLICIT_ADDRESSEE_SECONDS, Suggestion, bash_command, default_addressee, history_path, is_bash,
-    load_prefs, members_of, parse_command, save_prefs, split_mention, suggest, window,
+    load_prefs, members_of, parse_command, save_prefs, session_mode, split_mention, suggest, window,
 )
 
 log = logging.getLogger(__name__)
@@ -66,6 +66,7 @@ LOST_GRACE = 1.5             # a reconnect within this is not reported (1012 aft
 MAX_INPUT_LINES = 10
 BASH_TIMEOUT = 120.0
 HISTORY_MESSAGES = 6         # user <-> agent messages shown when attaching
+FEED_ROWS = 5                # a thread session's feed rows shown when attaching (docs/SPEC.md §22.8)
 SHUTDOWN_ROUNDS = 3
 SHUTDOWN_WAIT = 2.0
 CATCHUP_PAGE = 500
@@ -73,11 +74,13 @@ CATCHUP_PAGES = 4
 MCP_WAIT_POLL = 0.25         # the approval dialog waits for an empty input box this often
 BASH_HINT_CHARS = 40
 CD_TITLE_CELLS = 60          # a /cd question whose title is longer repeats the folder in its text
-# what is replayed after a reconnect (activity, usage and traces of the gap are skipped)
+# what is replayed after a reconnect (activity, usage and traces of the gap are skipped; post.* is a thread
+# session's feed, which a board session never has)
 CATCHUP_TYPES = ["message.*", "notification", "goal.*", "task.*", "agent.hired", "agent.retired", "swarm.*",
-                 "mcp.*", "skill.*"]
+                 "mcp.*", "skill.*", "post.*"]
 REFRESH_ON = ("goal.", "swarm.", "task.", "mcp.", "agent.hired", "agent.retired", "job.", "skill.",
-              "file.locked", "file.unlocked")   # the locks feed the /unlock suggestions
+              "file.locked", "file.unlocked",   # the locks feed the /unlock suggestions
+              "post.")                          # a thread session's posts feed the `#` suggestions
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -162,7 +165,8 @@ class TUI:
         self.hub: dict = {}
         self.local = bool(conn.owned)
         self.dialog: Dialog | None = None
-        # ("goal", None) | ("reject", server name) | ("skill_reject", skill name): what the input box asks for
+        # ("goal", None) | ("post", None) | ("reject", server name) | ("skill_reject", skill name): what the input
+        # box asks for
         self.input_mode: tuple[str, Any] | None = None
         self.suggestions: list[Suggestion] = []
         self.selected = 0
@@ -219,6 +223,8 @@ class TUI:
         # {asker, message_id, ...}: the member's question the swarm is paused for (send_message pause_swarm)
         self.question: dict | None = None
         self._question_forced: int | None = None   # the question whose asker was made the addressee
+        # a thread session: the post /post N opened last (GET /api/posts/N), whose comments the suggestions list
+        self.open_post: dict | None = None
         self.spent = 0.0
         self.budget = 0.0
         self.last_sender: str | None = None
@@ -243,6 +249,12 @@ class TUI:
     @property
     def members(self) -> list[str]:
         return members_of(self.state)
+
+    @property
+    def mode(self) -> str:
+        """The attached session's work mode, "board" | "thread" (docs/SPEC.md §22.8): the snapshot's swarm.mode, else
+        the summary's; "board" without a session."""
+        return session_mode(self.state, self.session) if self.attached else "board"
 
     @property
     def addressee(self) -> str | None:
@@ -433,6 +445,8 @@ class TUI:
             kind, name = self.input_mode
             if kind == "skill_reject":
                 return f"{self.t('col_skill')} {name}"
+            if kind == "post":
+                return self.t("box_new_post")
             return f"MCP {name}" if kind == "reject" else self.t("box_new_session")
         if not self.attached:
             return self.t("box_new_session")
@@ -457,8 +471,8 @@ class TUI:
 
     def _placeholder(self) -> str:
         if self.input_mode is not None:
-            key = {"goal": "ph_goal", "skill_reject": "skill_reject_reason"}.get(self.input_mode[0],
-                                                                                 "mcp_reject_reason")
+            key = {"goal": "ph_goal", "post": "ph_post", "skill_reject": "skill_reject_reason"}.get(
+                self.input_mode[0], "mcp_reject_reason")
         else:
             key = "ph_session" if self.attached else "ph_no_session"
         text = self._text(self.t(key))
@@ -544,10 +558,18 @@ class TUI:
             self.suggestions = []
             return
         self._dismissed = None
-        found = suggest(text, self.buffer.cursor_position, commands=commands.infos(self.ctx.lang),
+        thread = self.mode == "thread"   # its posts in place of tasks, and the open post's comments
+        open_post = (self.open_post or {}).get("post") if thread else None
+        found = suggest(text, self.buffer.cursor_position, commands=commands.infos(self.ctx.lang, self.mode),
                         members=self.members, tasks=(self.state or {}).get("tasks") or [],
                         everyone=self.t("everyone"), status=self._task_status,
-                        locks=(self.state or {}).get("locks") or [])
+                        locks=(self.state or {}).get("locks") or [],
+                        posts=[p for p in (self.state or {}).get("posts") or [] if isinstance(p, dict)]
+                        if thread else None,
+                        comments=(self.open_post or {}).get("comments") or [] if thread else (),
+                        open_post=open_post.get("id") if isinstance(open_post, dict)
+                        and isinstance(open_post.get("id"), int) else None,
+                        counts=lambda post: render.post_counts(self.ctx, post))
         if not self.attached:
             found = [s for s in found if s.kind == "command"]
         self.suggestions = found
@@ -784,6 +806,21 @@ class TUI:
         self.input_mode = ("goal", None)
         self.buffer.reset()
         self._cleared()
+
+    def ask_post(self) -> None:
+        """`/post` alone: the next input is a new post of the thread (its first line the title, the rest the text)."""
+        self.input_mode = ("post", None)
+        self.buffer.reset()
+        self._cleared()
+
+    async def new_post(self, text: str) -> None:
+        """Publish the user's post (post_create): the first line is its title, the rest its text; the post.created
+        line shows it."""
+        title, _, body = text.strip().partition("\n")
+        await self.ensure_running()   # as a message: a post to a stopped session starts it
+        ok, result = await self.client.act(self.sid, "post_create", {"title": title.strip(), "text": body.strip()})
+        if not ok:
+            self.error(result)
 
     def web_url(self, session: bool = True) -> str:
         base = (self.conn.base_url or self.client.base_url).rstrip("/")
@@ -1291,7 +1328,11 @@ class TUI:
             self.info(self.t("attached", title=title, id=sid or self.client.base_url))
         if not fresh:
             self.print(render.goal_panel(self.ctx, swarm.get("goal")))
-            if state.get("tasks"):
+            if self.mode == "thread":   # the vote line and the feed's first rows in place of the board summary
+                self.print(render.goal_vote_line(self.ctx, state.get("goal_vote")))
+                if state.get("posts"):
+                    self.print(render.feed_rows(self.ctx, state["posts"], FEED_ROWS))
+            elif state.get("tasks"):
                 self.print(render.board_summary(self.ctx, state["tasks"]))
             self._print_history(history)
         if folder_gone:
@@ -1339,8 +1380,8 @@ class TUI:
             if handle is not None:
                 handle.cancel()
         self._lost_handle = self._tools_timer = None
-        if self.input_mode is not None and self.input_mode[0] in ("reject", "skill_reject"):
-            self.input_mode = None
+        if self.input_mode is not None and self.input_mode[0] in ("reject", "skill_reject", "post"):
+            self.input_mode = None   # (a new post was meant for the session left)
         self._release_reject()
         self.attached = False
 
@@ -1384,6 +1425,10 @@ class TUI:
                 except HubError as exc:
                     log.debug("state refresh failed: %s", exc)
 
+    async def ensure_running(self) -> None:
+        """Start the attached session when it is stopped (a message, a post or a comment to it starts it)."""
+        await self._ensure_running()
+
     async def _ensure_running(self) -> None:
         if self.client.mode == "launcher" and self.sid and (self.session or {}).get("status") == "stopped":
             self.info(self.t("session_starting", title=(self.session or {}).get("title") or self.sid))
@@ -1426,6 +1471,10 @@ class TUI:
                         await self.decide_skill(mode[1], False, stripped)
                 finally:
                     self._release_reject()
+            elif mode[0] == "post":
+                if stripped and self.attached:
+                    self.print(render.user_echo(self.ctx, stripped, None))
+                    await self.new_post(stripped)
             elif stripped:
                 self.print(render.user_echo(self.ctx, stripped, None))
                 await self.new_session(stripped)
@@ -1882,8 +1931,22 @@ class TUI:
             for line in lines:
                 self.print(line)
             self._schedule_tools()
-        if etype.startswith(REFRESH_ON) or (etype == "notification" and data.get("kind") == "u_mcp_pending"):
+        if etype == "post.vote" and data.get("target") == "p1" and not replayed and not self.ctx.quiet:
+            self._spawn(self._print_goal_vote())   # under the vote's line: the vote of the refreshed snapshot
+        elif etype.startswith(REFRESH_ON) or (etype == "notification" and data.get("kind") == "u_mcp_pending"):
             self.request_refresh()
+
+    async def _print_goal_vote(self) -> None:
+        """After a vote on #1 (docs/SPEC.md §22.8): the vote line of the refreshed snapshot's goal_vote, for the
+        session still attached."""
+        generation = self._generation
+        try:
+            state = await self.refresh_state()
+        except HubError as exc:
+            log.debug("state refresh after a vote on #1 failed: %s", exc)
+            return
+        if self.attached and self._generation == generation:
+            self.print(render.goal_vote_line(self.ctx, state.get("goal_vote"), cont=True))
 
     def _schedule_tools(self) -> None:
         if self._tools_timer is not None:
@@ -2152,6 +2215,9 @@ class TUI:
             if (self.overrides.get("swarm") or {}).get("clarify") is True and self.client.mode == "launcher" \
                     and not self.attached:   # --clarify: the window's new sessions (/clarify off undoes it)
                 self.info(self.t("clarify_new_on"))
+            mode = (self.overrides.get("swarm") or {}).get("mode")
+            if mode in ("board", "thread") and self.client.mode == "launcher" and not self.attached:
+                self.info(self.t("mode_new_set", mode=self.t("mode_" + mode)))   # --mode: the window's new sessions
         except HubError as exc:
             self.error(self.hub_error(exc))
         finally:

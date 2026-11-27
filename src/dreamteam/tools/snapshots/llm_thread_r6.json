@@ -1,0 +1,1396 @@
+{
+ "revision": 6,
+ "mode": "thread",
+ "en": [
+  {
+   "name": "send_message",
+   "description": "Send a direct message to one or several members (array of names), to [\"all\"] (every member) or to [\"user\"] (the human). Use it to coordinate, ask, hand off and report: plain text replies reach nobody. Every message wakes its recipients: no greetings, thanks or acknowledgements. About a specific post, prefer a comment on it (an @mention wakes the one you name). pause_swarm=true is only for a question to [\"user\"] whose answer decides how the team goes on, so that work already under way would otherwise be redone: the session may then pause the whole swarm until the user answers, and every member gets your question with the answer. Never use it for what you can decide yourself, for a question that concerns only your own work, or for a report. Ask everything in that one message and make it the only tool call of your response: the result says whether the swarm was paused; if it was not, go on with the work that doesn't depend on the answer.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "to": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "Recipient names, \"all\" or \"user\""
+     },
+     "text": {
+      "type": "string"
+     },
+     "reply_to": {
+      "type": "integer",
+      "description": "Number of the message you answer"
+     },
+     "pause_swarm": {
+      "type": "boolean",
+      "description": "true: this question to \"user\" decides how the whole team goes on (work under way would otherwise be redone). The session may then pause every member until the user answers and give the answer to all of them; the result says whether the swarm was paused. Only with \"user\" among the recipients, one such question at a time; never for what you can decide yourself."
+     }
+    },
+    "required": [
+     "to",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "read_messages",
+   "description": "Read messages. Without arguments returns your unread messages (they are also shown when you wake up). with=<name> shows your conversation with that member (or \"user\"); include_read=true shows your recent message history.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "with": {
+      "type": "string",
+      "description": "Member name or \"user\""
+     },
+     "limit": {
+      "type": "integer",
+      "description": "Max messages (default 30, max 200)"
+     },
+     "include_read": {
+      "type": "boolean"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "read_file",
+   "description": "Read a text file from the shared workspace. Large files are returned in chunks: use offset (first line, 1-based) and limit (number of lines, default 400).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "offset": {
+      "type": "integer"
+     },
+     "limit": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "write_file",
+   "description": "Create or overwrite a whole file in the shared workspace (parent folders are created). The change is committed to git under your name. Fails if another member locked the file. For small changes use edit_file.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "content": {
+      "type": "string",
+      "description": "The full new file content"
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ]
+   }
+  },
+  {
+   "name": "edit_file",
+   "description": "Replace exact text in a workspace file. old_text must match exactly once (copy it from read_file) unless replace_all=true; new_text \"\" deletes it.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "old_text": {
+      "type": "string"
+     },
+     "new_text": {
+      "type": "string"
+     },
+     "replace_all": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path",
+     "old_text",
+     "new_text"
+    ]
+   }
+  },
+  {
+   "name": "list_files",
+   "description": "List files and folders of the shared workspace as a tree (path defaults to the root, depth 1-6, default 2).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "depth": {
+      "type": "integer"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "lock_file",
+   "description": "Lock a shared file (or folder) so that only you can write it (for minutes, default from config), or unlock it with unlock=true. Lock shared files before long edits and unlock them afterwards.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "minutes": {
+      "type": "number"
+     },
+     "unlock": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "shell",
+   "description": "Run a console command in the workspace directory and get its exit code and output (the result names the shell). Use it to run code, tests, package managers, git, etc. There is no input (stdin is closed). A command still running when its timeout expires is not killed: it continues as a background job, you get its output so far and you are notified when it ends. Start servers and other long commands with background=true: the call returns after 2 seconds with the job's id; `jobs` shows a job's output and `job_stop` stops it. Secrets from the environment are not available.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "command": {
+      "type": "string"
+     },
+     "timeout": {
+      "type": "integer",
+      "description": "Seconds to wait for the command (default from config); a command still running then continues in the background"
+     },
+     "background": {
+      "type": "boolean",
+      "description": "Start the command as a background job and return after 2 seconds"
+     }
+    },
+    "required": [
+     "command"
+    ]
+   }
+  },
+  {
+   "name": "jobs",
+   "description": "Background jobs: shell commands that kept running after their call returned (past their timeout, started in the background on purpose, or processes a command left running). Without job_id: the running jobs of the swarm and your jobs that ended in the last hour. With job_id: that job's state and the end of its output. You are notified when your job ends, so don't poll: do other work or call `wait`.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "job_id": {
+      "type": "string",
+      "description": "A job id such as j3; without it you get the list"
+     },
+     "tail": {
+      "type": "integer",
+      "description": "Lines of output to show (default 40, at most 400)"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "job_stop",
+   "description": "Stop a background job together with every process it started. Only its owner or the user can stop a job; its output stays in its log.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "job_id": {
+      "type": "string",
+      "description": "A job id such as j3"
+     }
+    },
+    "required": [
+     "job_id"
+    ]
+   }
+  },
+  {
+   "name": "mcp_create",
+   "description": "Build a new MCP server (a reusable tool set) from Python code using the mcp 2.x SDK, test it and register it for the swarm. The code must follow this template (type hints and docstrings become the tool schema; any library from `requirements` can be imported):\nfrom mcp.server.mcpserver import MCPServer\n\nmcp = MCPServer(\"my_tools\")\n\n@mcp.tool()\ndef add(a: int, b: int) -> int:\n    \"\"\"Add two numbers.\"\"\"\n    return a + b\n\nif __name__ == \"__main__\":\n    mcp.run()\nname: lowercase snake_case. scope: swarm (everyone, default; also saved to the cross-run library) or private. Calling it again with the same name replaces your server. If the smoke test fails you get the error log: fix the code and call again. Build one only for a capability that will be reused; for one-off work use shell.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "e.g. csv_tools"
+     },
+     "description": {
+      "type": "string",
+      "description": "What the tools are for (one sentence)"
+     },
+     "code": {
+      "type": "string",
+      "description": "Full server.py source"
+     },
+     "scope": {
+      "type": "string",
+      "enum": [
+       "swarm",
+       "private"
+      ]
+     },
+     "requirements": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "pip packages, e.g. [\"httpx\"]"
+     }
+    },
+    "required": [
+     "name",
+     "description",
+     "code"
+    ]
+   }
+  },
+  {
+   "name": "mcp_list",
+   "description": "List MCP servers available to you: built in this swarm, configured by the user, and from the library of earlier runs. Optional query filters by name/description/tool names.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "mcp_tools",
+   "description": "Show the tools of an MCP server with their input schemas (starts the server if needed).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "server": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "server"
+    ]
+   }
+  },
+  {
+   "name": "mcp_call",
+   "description": "Call a tool of an MCP server: server name, tool name and arguments object (see mcp_tools for schemas).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "server": {
+      "type": "string"
+     },
+     "tool": {
+      "type": "string"
+     },
+     "arguments": {
+      "type": "object",
+      "description": "Arguments of the MCP tool, e.g. {\"a\": 1}"
+     }
+    },
+    "required": [
+     "server",
+     "tool"
+    ]
+   }
+  },
+  {
+   "name": "agents",
+   "description": "Show the swarm roster: every member's name, role, status, model and spending.",
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   }
+  },
+  {
+   "name": "hire_agent",
+   "description": "Hire a new AI agent into the swarm with a role and instructions (what they should focus on). Optional model profile name and human name. Limited by max agents and the budget.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "role": {
+      "type": "string",
+      "description": "e.g. Backend developer, Researcher, QA engineer"
+     },
+     "instructions": {
+      "type": "string",
+      "description": "What they should do and focus on"
+     },
+     "model": {
+      "type": "string",
+      "description": "Model profile from the config (default if omitted)"
+     },
+     "name": {
+      "type": "string",
+      "description": "Human first and last name (generated if omitted)"
+     }
+    },
+    "required": [
+     "role",
+     "instructions"
+    ]
+   }
+  },
+  {
+   "name": "retire_agent",
+   "description": "Remove a member from the swarm (yourself by default, or a member you hired).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "reason": {
+      "type": "string"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "update_notes",
+   "description": "Replace your personal notebook with content ('' clears it). It is shown to you on every wake-up and survives context compaction: keep key facts, decisions, plans and file paths there.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "content": {
+      "type": "string",
+      "description": "The whole new notebook text"
+     }
+    },
+    "required": [
+     "content"
+    ]
+   }
+  },
+  {
+   "name": "wait",
+   "description": "End your turn and sleep until something happens (a message, an @mention of you, what your subscriptions catch, a trigger or the end of one of your background jobs). Call it when there is nothing useful left for you to do now. End every turn with it. Never poll the feed, messages or jobs in a loop instead: these events wake you.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "reason": {
+      "type": "string",
+      "description": "What you are waiting for"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "trigger_create",
+   "description": "Create a trigger that fires when a condition over the swarm state becomes true. Condition = a boolean expression with and/or/not, comparisons (== != < <= > >= in) and functions: message(sender=, contains=) [a message to you arrived], file_exists(path), file_changed(path), after(\"2026-10-09 18:00\"), elapsed(seconds), every(seconds) [periodic, >= 10], agent_status(name), goal_done(). Examples: message(sender=\"Anna Smith\"); file_changed(\"report.md\"); file_exists(\"out/result.json\") or elapsed(1800); every(1800). By default the trigger wakes you with the note; a message action can instead send a message (add {\"type\": \"wake\"} to also wake you). Posts, comments and votes are followed with subscribe and @mentions, not with triggers. once=true (default): the trigger is deactivated after it fires; once=false: it fires every time the condition becomes true again (every() triggers always repeat).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "condition": {
+      "type": "string"
+     },
+     "note": {
+      "type": "string",
+      "description": "Reminder shown when it fires (what to do then)"
+     },
+     "once": {
+      "type": "boolean"
+     },
+     "actions": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "type": {
+         "type": "string",
+         "enum": [
+          "wake",
+          "message"
+         ]
+        },
+        "to": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "description": "message: recipient names, \"all\" or \"user\""
+        },
+        "text": {
+         "type": "string",
+         "description": "message: text"
+        }
+       },
+       "required": [
+        "type"
+       ]
+      },
+      "description": "Default: [{\"type\": \"wake\"}]"
+     }
+    },
+    "required": [
+     "condition"
+    ]
+   }
+  },
+  {
+   "name": "trigger_list",
+   "description": "List your active triggers (all=true: every member's triggers, including inactive ones).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "all": {
+      "type": "boolean"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "trigger_delete",
+   "description": "Delete one of your triggers.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "trigger_id": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "trigger_id"
+    ]
+   }
+  },
+  {
+   "name": "skill_propose",
+   "description": "Propose a skill you made: a folder with a SKILL.md, which starts with front matter between two '---' lines (name: lowercase letters, digits and hyphens, up to 64 characters; description: what it does and when to use it, up to 1024 characters), followed by the instructions, plus any scripts or files it uses. Write the folder in the workspace (your scratch folder is best), then call this with its path. Use it for a procedure that worked and will be needed again. It is checked and attached to the swarm at once, so every member sees it; the user decides whether it is saved to the skills library for future runs. Proposing the same name again replaces your earlier version.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "The skill's folder (or its SKILL.md), relative to the workspace root"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "feed",
+   "description": "Show the feed: the system posts #1 (\"Goal reached?\", with the goal vote) and #2 (\"Let's plan the work\") first, then the posts by their latest activity (a new post, an edit or a comment), each with its author, likes, dislikes and comments. by, since and query narrow the list.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "by": {
+      "type": "string",
+      "description": "Only posts by this member (\"user\": the user's)"
+     },
+     "since": {
+      "type": "number",
+      "description": "Only posts active in the last N minutes"
+     },
+     "query": {
+      "type": "string",
+      "description": "Text to find in titles and texts"
+     },
+     "limit": {
+      "type": "integer",
+      "description": "Posts to show (default 30, max 100)"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "post_read",
+   "description": "Read a post: its text, likes and dislikes (for #1 the goal vote), then its comments as a tree (replies under the comment they answer; ids like c31, each with its likes and dislikes). since_id: only the comments after that one, to read what is new.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "post_id": {
+      "type": "integer",
+      "description": "Post number, e.g. 9"
+     },
+     "since_id": {
+      "type": "string",
+      "description": "Only the comments after this one: c31 or 31"
+     }
+    },
+    "required": [
+     "post_id"
+    ]
+   }
+  },
+  {
+   "name": "post_create",
+   "description": "Publish a post to the feed, one topic per post: a finding, a result, an intention, a question or a proposal. Name a member as @First Last to wake them. Look at the feed first: if a post on the same topic exists, comment there instead.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "title": {
+      "type": "string",
+      "description": "One line, at most 200 characters"
+     },
+     "text": {
+      "type": "string",
+      "description": "Markdown, at most 20000 characters"
+     }
+    },
+    "required": [
+     "title",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "post_update",
+   "description": "Edit your post: a new title and/or the whole new text; those who follow the post are told. A post cannot be deleted: if it is obsolete, say so in its text.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "post_id": {
+      "type": "integer",
+      "description": "Post number, e.g. 9"
+     },
+     "title": {
+      "type": "string",
+      "description": "One line, at most 200 characters"
+     },
+     "text": {
+      "type": "string",
+      "description": "Markdown, at most 20000 characters"
+     }
+    },
+    "required": [
+     "post_id"
+    ]
+   }
+  },
+  {
+   "name": "comment",
+   "description": "Comment on a post: discuss it, answer a question, report what you did about it. reply_to: the comment you answer, whose author is then told. To only agree or disagree, vote instead: a vote wakes no one. Name a member as @First Last to wake them.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "post_id": {
+      "type": "integer",
+      "description": "Post number, e.g. 9"
+     },
+     "text": {
+      "type": "string",
+      "description": "Markdown, at most 20000 characters"
+     },
+     "reply_to": {
+      "type": "string",
+      "description": "The comment you answer: c31 or 31"
+     }
+    },
+    "required": [
+     "post_id",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "vote",
+   "description": "Like or dislike a post or a comment (none withdraws your vote). A vote wakes no one and costs no one a turn: use it instead of a comment that only agrees or disagrees. On #1 (\"Goal reached?\") the AI agents' votes decide whether the goal is reached, under the session's rule (#1 states it): like #1 only after checking the result yourself against the goal, otherwise dislike it and say in a comment what is missing; change your vote when the situation changes. You cannot vote on your own posts and comments.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "target": {
+      "type": "string",
+      "description": "#5 or p5 for a post, c31 for a comment"
+     },
+     "value": {
+      "type": "string",
+      "enum": [
+       "like",
+       "dislike",
+       "none"
+      ],
+      "description": "like, dislike or none (withdraw your vote)"
+     }
+    },
+    "required": [
+     "target",
+     "value"
+    ]
+   }
+  },
+  {
+   "name": "subscriptions",
+   "description": "List your subscriptions with their ids (s12): what wakes you at once (wake) and what is collected for one wake-up (digest).",
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   }
+  },
+  {
+   "name": "subscribe",
+   "description": "Follow something, or change the mode of a subscription you have (the same what, target and by). You follow the whole feed and the reactions to your posts and comments from the start; follow a post to get its comments, and use by to follow one member. Votes never wake; @mentions of you always wake you, without a subscription. A file subscription sees write_file and edit_file edits and the changes that shell commands and background jobs commit; who made a shell or job change is only a guess (git cannot tell who wrote a file), and with git off in the workspace only write_file and edit_file edits are seen.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "what": {
+      "type": "string",
+      "enum": [
+       "feed",
+       "post",
+       "file",
+       "reactions"
+      ],
+      "description": "feed (new posts), post (comments and edits of one post), file (changes under a workspace path) or reactions (to your posts and comments)"
+     },
+     "target": {
+      "type": "string",
+      "description": "post: a post number (#9 or 9); file: a workspace path, a folder covering what is under it (none: the whole workspace)"
+     },
+     "by": {
+      "type": "string",
+      "description": "Only what this member does (\"user\": the user)"
+     },
+     "mode": {
+      "type": "string",
+      "enum": [
+       "wake",
+       "digest"
+      ],
+      "description": "wake (default: wakes you at once) or digest (collected for one wake-up)"
+     }
+    },
+    "required": [
+     "what"
+    ]
+   }
+  },
+  {
+   "name": "unsubscribe",
+   "description": "Remove one of your subscriptions by its id (subscriptions lists them). The subscription to the whole feed cannot be removed: change its mode instead.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "subscription_id": {
+      "type": "string",
+      "description": "s12 or 12"
+     }
+    },
+    "required": [
+     "subscription_id"
+    ]
+   }
+  }
+ ],
+ "ru": [
+  {
+   "name": "send_message",
+   "description": "Отправить личное сообщение одному или нескольким участникам (массив имен), всем — [\"all\"], или пользователю — [\"user\"]. Используй для координации, вопросов, передачи работы и отчетов: обычный текстовый ответ никому не доставляется. Каждое сообщение будит получателей: без приветствий, благодарностей и подтверждений. О конкретном объявлении лучше напиши комментарий к нему (@упоминание будит того, кого ты назвал). pause_swarm=true — только для вопроса к [\"user\"], от ответа на который зависит, как команда продолжит работу, так что иначе уже начатую работу пришлось бы переделывать: тогда сессия может поставить весь рой на паузу до ответа пользователя, и твой вопрос вместе с ответом получат все участники. Никогда не используй его для того, что можешь решить сам, для вопроса только о своей работе и для отчетов. Задай все вопросы в этом одном сообщении и сделай его единственным вызовом инструмента в ответе: результат скажет, встал ли рой на паузу; если нет, продолжай работу, которая не зависит от ответа.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "to": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "Recipient names, \"all\" or \"user\""
+     },
+     "text": {
+      "type": "string"
+     },
+     "reply_to": {
+      "type": "integer",
+      "description": "Number of the message you answer"
+     },
+     "pause_swarm": {
+      "type": "boolean",
+      "description": "true: this question to \"user\" decides how the whole team goes on (work under way would otherwise be redone). The session may then pause every member until the user answers and give the answer to all of them; the result says whether the swarm was paused. Only with \"user\" among the recipients, one such question at a time; never for what you can decide yourself."
+     }
+    },
+    "required": [
+     "to",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "read_messages",
+   "description": "Прочитать сообщения. Без аргументов — непрочитанные (они также показываются при пробуждении). with=<имя> — переписка с участником (или \"user\"); include_read=true — недавняя история сообщений.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "with": {
+      "type": "string",
+      "description": "Member name or \"user\""
+     },
+     "limit": {
+      "type": "integer",
+      "description": "Max messages (default 30, max 200)"
+     },
+     "include_read": {
+      "type": "boolean"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "read_file",
+   "description": "Прочитать текстовый файл из общего workspace. Большие файлы читаются частями: offset (первая строка, с 1) и limit (число строк, по умолчанию 400).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "offset": {
+      "type": "integer"
+     },
+     "limit": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "write_file",
+   "description": "Создать или целиком перезаписать файл в общем workspace (папки создаются автоматически). Изменение коммитится в git от твоего имени. Не сработает, если файл заблокирован другим участником. Для небольших правок используй edit_file.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "content": {
+      "type": "string",
+      "description": "The full new file content"
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ]
+   }
+  },
+  {
+   "name": "edit_file",
+   "description": "Заменить точный фрагмент текста в файле workspace. old_text должен встречаться ровно один раз (скопируй его из read_file), если не указан replace_all=true; new_text \"\" удаляет фрагмент.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "old_text": {
+      "type": "string"
+     },
+     "new_text": {
+      "type": "string"
+     },
+     "replace_all": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path",
+     "old_text",
+     "new_text"
+    ]
+   }
+  },
+  {
+   "name": "list_files",
+   "description": "Показать файлы и папки общего workspace деревом (по умолчанию корень; depth от 1 до 6, по умолчанию 2).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "depth": {
+      "type": "integer"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "lock_file",
+   "description": "Заблокировать общий файл (или папку), чтобы писать в него мог только ты (на minutes минут, по умолчанию из настроек), или разблокировать через unlock=true. Блокируй общие файлы перед долгой правкой и разблокируй после.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "minutes": {
+      "type": "number"
+     },
+     "unlock": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "shell",
+   "description": "Выполнить команду в консоли в папке workspace и получить код возврата и вывод (в результате указана оболочка). Подходит для запуска кода, тестов, пакетных менеджеров, git и т. п. Ввода нет (stdin закрыт). Команда, которая ещё работает, когда истёк её timeout, не убивается: она продолжает работать как фоновый процесс, ты получаешь её вывод на этот момент, а когда она завершится, придёт уведомление. Серверы и другие долгие команды запускай с background=true: вызов вернётся через 2 секунды с идентификатором процесса (например, j3); `jobs` покажет вывод процесса, а `job_stop` остановит его. Секреты из окружения недоступны.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "command": {
+      "type": "string"
+     },
+     "timeout": {
+      "type": "integer",
+      "description": "Seconds to wait for the command (default from config); a command still running then continues in the background"
+     },
+     "background": {
+      "type": "boolean",
+      "description": "Start the command as a background job and return after 2 seconds"
+     }
+    },
+    "required": [
+     "command"
+    ]
+   }
+  },
+  {
+   "name": "jobs",
+   "description": "Фоновые процессы — команды shell, которые продолжают работать после того, как вызов вернул результат (не уложились в timeout, запущены в фоне намеренно или остались работать после завершения команды). Без job_id — работающие фоновые процессы роя и твои, завершившиеся за последний час. С job_id — состояние процесса и конец его вывода. Когда твой процесс завершится, придёт уведомление, поэтому не опрашивай: займись другим делом или вызови `wait`.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "job_id": {
+      "type": "string",
+      "description": "A job id such as j3; without it you get the list"
+     },
+     "tail": {
+      "type": "integer",
+      "description": "Lines of output to show (default 40, at most 400)"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "job_stop",
+   "description": "Остановить фоновый процесс вместе со всеми процессами, которые он запустил. Остановить процесс может только его владелец или пользователь; его вывод остаётся в журнале.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "job_id": {
+      "type": "string",
+      "description": "A job id such as j3"
+     }
+    },
+    "required": [
+     "job_id"
+    ]
+   }
+  },
+  {
+   "name": "mcp_create",
+   "description": "Создать новый MCP-сервер (переиспользуемый набор инструментов) из кода на Python с SDK mcp 2.x, проверить его и зарегистрировать в рое. Код должен следовать шаблону (аннотации типов и docstring становятся схемой инструмента; можно импортировать библиотеки из `requirements`):\nfrom mcp.server.mcpserver import MCPServer\n\nmcp = MCPServer(\"my_tools\")\n\n@mcp.tool()\ndef add(a: int, b: int) -> int:\n    \"\"\"Add two numbers.\"\"\"\n    return a + b\n\nif __name__ == \"__main__\":\n    mcp.run()\nname: латиница snake_case. scope: swarm (все, по умолчанию; сохраняется и в общую библиотеку между запусками) или private. Повторный вызов с тем же name заменяет твой сервер. Если проверка не прошла, вернется лог ошибки: исправь код и вызови снова. Создавай сервер только для переиспользуемой возможности; для разовой работы используй shell.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "e.g. csv_tools"
+     },
+     "description": {
+      "type": "string",
+      "description": "What the tools are for (one sentence)"
+     },
+     "code": {
+      "type": "string",
+      "description": "Full server.py source"
+     },
+     "scope": {
+      "type": "string",
+      "enum": [
+       "swarm",
+       "private"
+      ]
+     },
+     "requirements": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "pip packages, e.g. [\"httpx\"]"
+     }
+    },
+    "required": [
+     "name",
+     "description",
+     "code"
+    ]
+   }
+  },
+  {
+   "name": "mcp_list",
+   "description": "Список доступных тебе MCP-серверов: созданных в этом рое, настроенных пользователем и из библиотеки прошлых запусков. query фильтрует по имени, описанию и названиям инструментов.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "mcp_tools",
+   "description": "Показать инструменты MCP-сервера с их входными схемами (при необходимости запускает сервер).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "server": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "server"
+    ]
+   }
+  },
+  {
+   "name": "mcp_call",
+   "description": "Вызвать инструмент MCP-сервера: имя сервера, имя инструмента и объект arguments (схемы — в mcp_tools).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "server": {
+      "type": "string"
+     },
+     "tool": {
+      "type": "string"
+     },
+     "arguments": {
+      "type": "object",
+      "description": "Arguments of the MCP tool, e.g. {\"a\": 1}"
+     }
+    },
+    "required": [
+     "server",
+     "tool"
+    ]
+   }
+  },
+  {
+   "name": "agents",
+   "description": "Показать состав роя: имя, роль, статус, модель и расходы каждого участника.",
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   }
+  },
+  {
+   "name": "hire_agent",
+   "description": "Нанять в рой нового ИИ-агента с ролью и инструкциями (на чём сосредоточиться). Можно указать профиль модели (model) и человеческое имя. Ограничено максимумом агентов и бюджетом.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "role": {
+      "type": "string",
+      "description": "e.g. Backend developer, Researcher, QA engineer"
+     },
+     "instructions": {
+      "type": "string",
+      "description": "What they should do and focus on"
+     },
+     "model": {
+      "type": "string",
+      "description": "Model profile from the config (default if omitted)"
+     },
+     "name": {
+      "type": "string",
+      "description": "Human first and last name (generated if omitted)"
+     }
+    },
+    "required": [
+     "role",
+     "instructions"
+    ]
+   }
+  },
+  {
+   "name": "retire_agent",
+   "description": "Вывести участника из роя (по умолчанию себя или нанятого тобой).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "reason": {
+      "type": "string"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "update_notes",
+   "description": "Заменить содержимое твоего блокнота на content ('' — очистить). Он показывается при каждом пробуждении и переживает сжатие контекста: храни там ключевые факты, решения, планы и пути к файлам.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "content": {
+      "type": "string",
+      "description": "The whole new notebook text"
+     }
+    },
+    "required": [
+     "content"
+    ]
+   }
+  },
+  {
+   "name": "wait",
+   "description": "Завершить ход и спать, пока что-нибудь не произойдет (сообщение, @упоминание тебя, то, что ловят твои подписки, триггер или завершение твоего фонового процесса). Вызывай, когда полезных дел для тебя сейчас нет. Заканчивай им каждый ход. Не опрашивай ленту, сообщения и фоновые процессы в цикле: эти события тебя разбудят.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "reason": {
+      "type": "string",
+      "description": "What you are waiting for"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "trigger_create",
+   "description": "Создать триггер, срабатывающий, когда условие над состоянием роя становится истинным. Условие — логическое выражение с and/or/not, сравнениями (== != < <= > >= in) и функциями: message(sender=, contains=) [пришло сообщение тебе], file_exists(path), file_changed(path), after(\"2026-10-09 18:00\"), elapsed(секунды), every(секунды) [периодически, >= 10], agent_status(имя), goal_done(). Примеры: message(sender=\"Анна Смирнова\"); file_changed(\"report.md\"); file_exists(\"out/result.json\") or elapsed(1800); every(1800). По умолчанию триггер будит тебя с заметкой note; действие message позволяет вместо этого отправить сообщение (добавь {\"type\": \"wake\"}, чтобы еще и проснуться). За объявлениями, комментариями и голосами следят через subscribe и @упоминания, а не триггерами. once=true (по умолчанию): после срабатывания триггер отключается; once=false: срабатывает каждый раз, когда условие снова становится истинным (триггеры с every() повторяются всегда).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "condition": {
+      "type": "string"
+     },
+     "note": {
+      "type": "string",
+      "description": "Reminder shown when it fires (what to do then)"
+     },
+     "once": {
+      "type": "boolean"
+     },
+     "actions": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "type": {
+         "type": "string",
+         "enum": [
+          "wake",
+          "message"
+         ]
+        },
+        "to": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "description": "message: recipient names, \"all\" or \"user\""
+        },
+        "text": {
+         "type": "string",
+         "description": "message: text"
+        }
+       },
+       "required": [
+        "type"
+       ]
+      },
+      "description": "Default: [{\"type\": \"wake\"}]"
+     }
+    },
+    "required": [
+     "condition"
+    ]
+   }
+  },
+  {
+   "name": "trigger_list",
+   "description": "Показать твои активные триггеры (all=true — триггеры всех участников, включая неактивные).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "all": {
+      "type": "boolean"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "trigger_delete",
+   "description": "Удалить свой триггер.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "trigger_id": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "trigger_id"
+    ]
+   }
+  },
+  {
+   "name": "skill_propose",
+   "description": "Предложить сделанный тобой скилл: папку с SKILL.md, который начинается с front matter между двумя строками '---' (name: строчные латинские буквы, цифры и дефисы, до 64 символов; description: что он делает и когда им пользоваться, до 1024 символов), за которым идут инструкции, и с нужными ему скриптами и файлами. Запиши папку в workspace (лучше в свою черновую папку) и вызови этот инструмент с её путём. Подходит для приёма, который сработал и ещё понадобится. Скилл проверяется и сразу подключается к рою, его видят все участники; сохранить ли его в библиотеку скиллов для будущих запусков, решает пользователь. Повторное предложение с тем же именем заменяет твою прежнюю версию.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "The skill's folder (or its SKILL.md), relative to the workspace root"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "feed",
+   "description": "Показать ленту: сначала системные объявления #1 («Цель достигнута?», с голосованием о цели) и #2 («Спланируем работу»), затем объявления по последней активности (новое объявление, правка или комментарий), у каждого — автор, «нравится», «не нравится» и комментарии. by, since и query сужают список.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "by": {
+      "type": "string",
+      "description": "Only posts by this member (\"user\": the user's)"
+     },
+     "since": {
+      "type": "number",
+      "description": "Only posts active in the last N minutes"
+     },
+     "query": {
+      "type": "string",
+      "description": "Text to find in titles and texts"
+     },
+     "limit": {
+      "type": "integer",
+      "description": "Posts to show (default 30, max 100)"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "post_read",
+   "description": "Прочитать объявление: текст, «нравится» и «не нравится» (для #1 — голосование о цели), затем комментарии деревом (ответы под комментарием, на который они отвечают; id вида c31, у каждого — «нравится» и «не нравится»). since_id — только комментарии после указанного, чтобы прочитать новое.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "post_id": {
+      "type": "integer",
+      "description": "Post number, e.g. 9"
+     },
+     "since_id": {
+      "type": "string",
+      "description": "Only the comments after this one: c31 or 31"
+     }
+    },
+    "required": [
+     "post_id"
+    ]
+   }
+  },
+  {
+   "name": "post_create",
+   "description": "Опубликовать объявление в ленте, одна тема — одно объявление: находка, результат, намерение, вопрос или предложение. Чтобы разбудить участника, упомяни его как @Имя Фамилия. Сначала посмотри ленту: если объявление на ту же тему уже есть, напиши комментарий там.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "title": {
+      "type": "string",
+      "description": "One line, at most 200 characters"
+     },
+     "text": {
+      "type": "string",
+      "description": "Markdown, at most 20000 characters"
+     }
+    },
+    "required": [
+     "title",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "post_update",
+   "description": "Изменить свое объявление: новый title и/или весь новый text; те, кто следит за объявлением, получат уведомление. Объявление нельзя удалить: если оно устарело, напиши об этом в его тексте.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "post_id": {
+      "type": "integer",
+      "description": "Post number, e.g. 9"
+     },
+     "title": {
+      "type": "string",
+      "description": "One line, at most 200 characters"
+     },
+     "text": {
+      "type": "string",
+      "description": "Markdown, at most 20000 characters"
+     }
+    },
+    "required": [
+     "post_id"
+    ]
+   }
+  },
+  {
+   "name": "comment",
+   "description": "Прокомментировать объявление: обсудить его, ответить на вопрос, сообщить, что ты сделал по нему. reply_to — комментарий, на который ты отвечаешь; его автор получит уведомление. Чтобы просто согласиться или не согласиться, проголосуй: голос никого не будит. Чтобы разбудить участника, упомяни его как @Имя Фамилия.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "post_id": {
+      "type": "integer",
+      "description": "Post number, e.g. 9"
+     },
+     "text": {
+      "type": "string",
+      "description": "Markdown, at most 20000 characters"
+     },
+     "reply_to": {
+      "type": "string",
+      "description": "The comment you answer: c31 or 31"
+     }
+    },
+    "required": [
+     "post_id",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "vote",
+   "description": "Отметить объявление или комментарий: like («нравится») или dislike («не нравится»); none снимает твой голос. Голос никого не будит и никому не стоит хода: используй его вместо комментария, который только соглашается или не соглашается. На #1 («Цель достигнута?») голоса ИИ-агентов роя решают, достигнута ли цель, по правилу сессии (оно указано в #1): ставь like на #1 только после того, как сам проверил результат по цели, иначе ставь dislike и напиши в комментарии, чего не хватает; меняй голос, когда положение меняется. За свои объявления и комментарии голосовать нельзя.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "target": {
+      "type": "string",
+      "description": "#5 or p5 for a post, c31 for a comment"
+     },
+     "value": {
+      "type": "string",
+      "enum": [
+       "like",
+       "dislike",
+       "none"
+      ],
+      "description": "like, dislike or none (withdraw your vote)"
+     }
+    },
+    "required": [
+     "target",
+     "value"
+    ]
+   }
+  },
+  {
+   "name": "subscriptions",
+   "description": "Показать свои подписки с их id (s12): что будит тебя сразу (wake) и что собирается к одному пробуждению (digest).",
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   }
+  },
+  {
+   "name": "subscribe",
+   "description": "Подписаться на что-то или сменить режим своей подписки (те же what, target и by). На всю ленту и на реакции к твоим объявлениям и комментариям ты подписан с самого начала; подпишись на объявление, чтобы получать его комментарии, а by позволяет следить за одним участником. Голоса никогда не будят; @упоминания тебя будят всегда, без подписки. Подписка на файлы видит правки через write_file и edit_file и изменения, которые фиксируют команды shell и фоновые процессы; кто сделал изменение из shell или фонового процесса, определяется лишь приблизительно (git не знает, кто написал файл), а при выключенном git в рабочей папке видны только правки через write_file и edit_file.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "what": {
+      "type": "string",
+      "enum": [
+       "feed",
+       "post",
+       "file",
+       "reactions"
+      ],
+      "description": "feed (new posts), post (comments and edits of one post), file (changes under a workspace path) or reactions (to your posts and comments)"
+     },
+     "target": {
+      "type": "string",
+      "description": "post: a post number (#9 or 9); file: a workspace path, a folder covering what is under it (none: the whole workspace)"
+     },
+     "by": {
+      "type": "string",
+      "description": "Only what this member does (\"user\": the user)"
+     },
+     "mode": {
+      "type": "string",
+      "enum": [
+       "wake",
+       "digest"
+      ],
+      "description": "wake (default: wakes you at once) or digest (collected for one wake-up)"
+     }
+    },
+    "required": [
+     "what"
+    ]
+   }
+  },
+  {
+   "name": "unsubscribe",
+   "description": "Удалить свою подписку по ее id (их показывает subscriptions). Подписку на всю ленту удалить нельзя: вместо этого смени ее режим.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "subscription_id": {
+      "type": "string",
+      "description": "s12 or 12"
+     }
+    },
+    "required": [
+     "subscription_id"
+    ]
+   }
+  }
+ ]
+}

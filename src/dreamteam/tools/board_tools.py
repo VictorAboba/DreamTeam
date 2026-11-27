@@ -7,7 +7,7 @@ from typing import Any
 from .. import prompts
 from ..board import MAX_POST, UNSET
 from ..models import PRIORITIES, USER, Status, Task, ToolError
-from . import ToolContext, tool
+from . import ToolContext, hold_after_refusal, tool
 from .fmt import crew_line, goal_line, post_line, subtask_line, task_detail, task_line, trim
 
 _STATUS_DOC = "todo | in_progress | waiting | review | done | failed | cancelled"
@@ -18,6 +18,8 @@ _PRIORITY = {"type": "integer", "minimum": 0, "maximum": 3, "description": "0 lo
 _TAGS = {"type": "array", "items": {"type": "string"}}
 _DEPENDS = {"type": "array", "items": {"type": "integer"}, "description": "Ids of tasks that must be done first"}
 
+# the board tools exist only in board sessions (docs/SPEC.md §22.5): a thread session has no tasks
+BOARD_ONLY = ("board",)
 BOARD_GOALS_UP_TO = 25     # with more tasks the board shows one line per task (goals via task_get)
 BOARD_MAX_TASKS = 100
 
@@ -54,6 +56,7 @@ def _opt_id(value: Any) -> int | None:
         "tag": {"type": "string"},
         "include_closed": {"type": "boolean", "description": "Also show done/failed/cancelled tasks"},
     },
+    modes=BOARD_ONLY,
 )
 async def board(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
@@ -123,6 +126,7 @@ def _directions_line(subtasks: list[Task]) -> str:
        "последние посты обсуждения.",
     properties={"task_id": _TASK_ID},
     required=["task_id"],
+    modes=BOARD_ONLY,
 )
 async def task_get(ctx: ToolContext, args: dict[str, Any]) -> str:
     board_ = ctx.swarm.board
@@ -184,6 +188,7 @@ async def task_get(ctx: ToolContext, args: dict[str, Any]) -> str:
                                       "taker writes its card"},
     },
     required=["title", "goal"],
+    modes=BOARD_ONLY,
 )
 async def task_create(ctx: ToolContext, args: dict[str, Any]) -> str:
     board_ = ctx.swarm.board
@@ -247,6 +252,7 @@ def _similar_item(task: Task) -> str:
     properties={"task_id": _TASK_ID},
     required=["task_id"],
     audience=("llm", "external"),
+    modes=BOARD_ONLY,
 )
 async def task_claim(ctx: ToolContext, args: dict[str, Any]) -> str:
     notes: list[str] = []
@@ -300,6 +306,7 @@ async def task_claim(ctx: ToolContext, args: dict[str, Any]) -> str:
                                       "you have none"},
     },
     required=["task_id"],
+    modes=BOARD_ONLY,
 )
 async def task_update(ctx: ToolContext, args: dict[str, Any]) -> str:
     board_ = ctx.swarm.board
@@ -385,8 +392,10 @@ def _diff(old: Task, new: Task) -> list[str]:
     properties={"task_id": _TASK_ID,
                 "result": {"type": "string", "description": "What was done, where it is, what is left"}},
     required=["task_id", "result"],
+    modes=BOARD_ONLY,
 )
 async def task_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
+    hold_after_refusal(ctx, "complete_refused")   # docs/SPEC.md §7.3 "A `wait` after a refusal"
     notes: list[str] = []
     before = ctx.swarm.board.get(args["task_id"])
     task = ctx.swarm.board.complete(ctx.actor, args["task_id"], args["result"], notes=notes)
@@ -422,6 +431,7 @@ def _completed(task: Any, before: Any) -> str:
     properties={"task_id": _TASK_ID, "approve": {"type": "boolean"},
                 "comment": {"type": "string", "description": "What is good / what must be fixed"}},
     required=["task_id", "approve"],
+    modes=BOARD_ONLY,
 )
 async def task_review(ctx: ToolContext, args: dict[str, Any]) -> str:
     notes: list[str] = []
@@ -440,6 +450,7 @@ async def task_review(ctx: ToolContext, args: dict[str, Any]) -> str:
     properties={"task_id": _TASK_ID, "text": {"type": "string"},
                 "reply_to": {"type": "integer", "description": "Number of the post you answer"}},
     required=["task_id", "text"],
+    modes=BOARD_ONLY,
 )
 async def task_comment(ctx: ToolContext, args: dict[str, Any]) -> str:
     post = ctx.swarm.board.post(ctx.actor, args["task_id"], args["text"], _opt_id(args.get("reply_to")))
@@ -452,6 +463,7 @@ async def task_comment(ctx: ToolContext, args: dict[str, Any]) -> str:
     ru="Прочитать обсуждение задачи (последние 200 постов или только новее since_id).",
     properties={"task_id": _TASK_ID, "since_id": {"type": "integer", "description": "Show posts after this one"}},
     required=["task_id"],
+    modes=BOARD_ONLY,
 )
 async def task_discussion(ctx: ToolContext, args: dict[str, Any]) -> str:
     task = ctx.swarm.board.get(args["task_id"])

@@ -465,7 +465,7 @@ async def test_scripted_agents_use_background_jobs_through_their_runtimes(tmp_pa
         await until(lambda: [t for t, _ in tool_results(swarm, ANNA)] == ["shell", "wait", "shell", "jobs",
                                                                           "job_stop", "wait"]
                     and [t for t, _ in tool_results(swarm, BORIS)] == ["shell", "shell", "shell", "wait"], 30)
-        assert swarm.runtimes[ANNA].tools_rev == swarm.runtimes[BORIS].tools_rev == frozen.TOOLSET_REVISION
+        assert swarm.runtimes[ANNA].tools_rev == swarm.runtimes[BORIS].tools_rev == frozen.TOOLSET_REVISIONS["board"]
         (_, timer), (_, waited), (_, server), (_, shown), (_, stopped), _ = tool_results(swarm, ANNA)
         timer_id = re.search(r"as job (j\d+) ", timer).group(1)
         server_id = re.search(r"as job (j\d+) ", server).group(1)

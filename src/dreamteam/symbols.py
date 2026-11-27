@@ -17,6 +17,8 @@ SYMBOLS: dict[str, str] = {
     "spark": "✻",      # thinking, welcome
     "mail": "✉",       # agent-to-agent message
     "chat": "💬",      # task discussion
+    "pin": "📌",       # a thread session's system posts #1 and #2 (and #1's vote line)
+    "post": "📎",      # an ordinary post of a thread session's feed
     "bell": "🔔",      # notification to the user
     "warn": "⚠",
     "alarm": "⏰",     # wake-up
@@ -53,6 +55,8 @@ SYMBOLS_ASCII: dict[str, str] = {
     "spark": "*",
     "mail": ">",
     "chat": "#",
+    "pin": "*",
+    "post": "#",
     "bell": "!",
     "warn": "!",
     "alarm": "@",

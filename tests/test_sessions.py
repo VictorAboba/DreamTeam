@@ -1249,3 +1249,250 @@ async def test_the_main_session_has_no_uid(tmp_path):
     assert manager.summary(LEGACY_ID)["uid"] is None
     manager.update(LEGACY_ID, title="Old project")  # its own session.json keeps title/created_at/autostart only
     assert manager.summary(LEGACY_ID)["uid"] is None
+
+
+# ---- the mode of a session (docs/SPEC.md §22.1, §22.8) --------------------------------------------------------
+def _set_home_swarm(home: Path, **swarm: Any) -> None:
+    raw = st.read_raw(home)
+    raw["swarm"].update(swarm)
+    st.write_raw(home, raw)
+
+
+def _kv_mode_and_forum(path: Path) -> tuple[str | None, bool]:
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute("SELECT value FROM kv WHERE key = 'swarm_mode'").fetchone()
+        forum = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('posts', 'post_comments', 'votes',"
+                             " 'subscriptions')").fetchone()[0] == 4
+        return (json.loads(row[0]) if row else None), forum
+    finally:
+        conn.close()
+
+
+async def test_a_thread_create_stores_its_mode_its_rule_and_its_database(tmp_path):
+    home = _home(tmp_path)
+    manager = _manager(home)
+    sid = (await manager.create("Thread", overrides={"swarm": {"mode": "thread"}}, start=False))["id"]
+    assert manager.meta(sid)["overrides"]["swarm"] == {"mode": "thread", "goal_rule": "democracy"}
+    db = manager.dir_of(sid) / ".dreamteam" / "swarm.db"
+    assert _kv_mode_and_forum(db) == ("thread", True)  # before any start
+    assert manager.config_for(sid).swarm.mode == "thread"
+    # a thread default and a veto rule: the rule is frozen into the new session
+    _set_home_swarm(home, mode="thread", goal_rule="veto")
+    manager = _manager(home)
+    veto = (await manager.create("Veto", start=False))["id"]
+    assert manager.meta(veto)["overrides"]["swarm"] == {"mode": "thread", "goal_rule": "veto"}
+    given = (await manager.create("Given", overrides={"swarm": {"goal_rule": "democracy"}}, start=False))["id"]
+    assert manager.meta(given)["overrides"]["swarm"] == {"mode": "thread", "goal_rule": "democracy"}
+    await manager.update_settings({"swarm": {"goal_rule": "democracy"}})
+    assert manager.config_for(veto).swarm.goal_rule == "veto"  # a global save does not reach it
+    swarm = await manager.start(veto)
+    assert swarm.mode == "thread" and swarm.goal_rule == "veto"
+    await manager.update_settings({"swarm": {"goal_rule": "democracy", "max_agents": 4}})
+    assert swarm.goal_rule == "veto" and swarm.config.swarm.max_agents == 4
+    await manager.shutdown()
+
+
+async def test_board_sessions_stay_board_under_a_thread_default(tmp_path):
+    home = _home(tmp_path)
+    manager = _manager(home)
+    old = (await manager.create("Old", start=False))["id"]  # never started: no database yet
+    assert "swarm" not in manager.meta(old)["overrides"]
+    await manager.update_settings({"swarm": {"mode": "thread"}})
+    assert manager.config.swarm.mode == "thread" and manager.config_for(old).swarm.mode == "board"
+    board = (await manager.create("Board", overrides={"swarm": {"mode": "board", "goal_rule": "veto",
+                                                                "max_agents": 2}}, start=False))["id"]
+    assert manager.meta(board)["overrides"] == {"swarm": {"max_agents": 2}}
+    bare = (await manager.create("Bare", overrides={"swarm": {"mode": "board"}}, start=False))["id"]
+    assert "swarm" not in manager.meta(bare)["overrides"]
+    for sid in (old, board, bare):
+        assert not (manager.dir_of(sid) / ".dreamteam" / "swarm.db").exists()
+        swarm = await manager.start(sid)
+        assert swarm.mode == "board" and swarm.forum is None, sid
+        assert _kv_mode_and_forum(manager.dir_of(sid) / ".dreamteam" / "swarm.db") == ("board", False)
+    await manager.shutdown()
+
+
+async def test_main_stays_board_under_a_thread_default(tmp_path):
+    from dreamteam.db import Database
+
+    home = _home(tmp_path)
+    _set_home_swarm(home, mode="thread")
+    Database(home / ".dreamteam" / "swarm.db").close()  # empty: it would take the config's mode
+    manager = _manager(home)
+    assert manager.config.swarm.mode == "thread" and manager.config_for(LEGACY_ID).swarm.mode == "board"
+    swarm = await manager.start(LEGACY_ID)
+    assert swarm.mode == "board"
+    assert _kv_mode_and_forum(home / ".dreamteam" / "swarm.db") == ("board", False)
+    await manager.shutdown()
+
+
+
+# ---- updating a session keeps its mode and its frozen rule (docs/SPEC.md §22.8) -----------------------------------
+def _refused(call, text: str) -> None:
+    with pytest.raises(SessionError) as refused:
+        call()
+    assert refused.value.status == 400 and str(refused.value) == text
+
+
+async def test_a_running_board_session_stays_board_after_a_thread_default_is_saved(tmp_path):
+    home = _home(tmp_path)
+    manager = _manager(home)
+    sid = (await manager.create("Board", "Build it", start=False))["id"]
+    swarm = await manager.start(sid)
+    await manager.update_settings({"swarm": {"mode": "thread", "goal_rule": "veto"}})
+    assert swarm.mode == "board" and swarm.forum is None and swarm.config.swarm.mode == "board"
+    summary = manager.summary(sid)
+    assert (summary["mode"], summary["goal_rule"], summary["goal_vote"], summary["posts"]) == ("board", None, None, 0)
+    assert "decision" not in summary["goal"]   # a board session's summary is as it was
+    await manager.stop(sid)
+    assert manager.summary(sid)["mode"] == "board" and "swarm" not in manager.meta(sid)["overrides"]
+    await manager.shutdown()
+
+
+async def test_update_refuses_a_mode_change_of_a_thread_session(tmp_path):
+    home = _home(tmp_path)
+    manager = _manager(home)
+    sid = (await manager.create("Thread", overrides={"swarm": {"mode": "thread", "max_agents": 2}},
+                                start=False))["id"]
+    before = (manager.dir_of(sid) / "session.json").read_bytes()
+    text = "the mode is chosen when the session is created"
+    for settings in ({"swarm": {"mode": "board"}}, {"swarm": {"mode": None}}, {"swarm": {"mode": ""}},
+                     {"swarm": {"mode": "board", "max_agents": 3}}):
+        _refused(lambda: manager.update(sid, settings=settings), text)
+    for overrides in ({"swarm": {"mode": "board"}}, {"swarm": {"mode": "other"}}):
+        _refused(lambda: manager.update(sid, overrides=overrides), text)
+    rule = "the goal rule of a thread session cannot be cleared"
+    for settings in ({"swarm": {"goal_rule": None}}, {"swarm": {"goal_rule": ""}}):
+        _refused(lambda: manager.update(sid, settings=settings), rule)
+    assert (manager.dir_of(sid) / "session.json").read_bytes() == before   # nothing written on a 400
+    # the stored mode is a no-op; a full replacement gets the mode and the rule back
+    manager.update(sid, settings={"swarm": {"mode": "thread", "max_agents": 3}})
+    assert manager.meta(sid)["overrides"]["swarm"] == {"mode": "thread", "goal_rule": "democracy", "max_agents": 3}
+    summary = manager.update(sid, overrides={"agents": {"digest_seconds": 30}})
+    assert manager.meta(sid)["overrides"] == {"agents": {"digest_seconds": 30},
+                                              "swarm": {"mode": "thread", "goal_rule": "democracy"}}
+    assert summary["mode"] == "thread" and manager.config_view(sid)["swarm"]["mode"] == "thread"
+    # a new rule applies; a full replacement with one keeps it
+    manager.update(sid, settings={"swarm": {"goal_rule": "veto"}})
+    assert manager.meta(sid)["overrides"]["swarm"]["goal_rule"] == "veto"
+    assert manager.summary(sid)["goal_rule"] == "veto"
+    manager.update(sid, overrides={"swarm": {"goal_rule": "democracy"}})
+    assert manager.meta(sid)["overrides"]["swarm"] == {"goal_rule": "democracy", "mode": "thread"}
+    _refused(lambda: manager.update(sid, settings={"swarm": {"goal_rule": "rule"}}),
+             "Invalid session settings: swarm.goal_rule must be 'democracy' or 'veto', got 'rule'")
+    await manager.shutdown()
+
+
+async def test_update_of_a_board_session_stores_no_mode_and_refuses_a_rule(tmp_path):
+    home = _home(tmp_path)
+    manager = _manager(home)
+    sid = (await manager.create("Board", overrides={"swarm": {"max_agents": 2}}, start=False))["id"]
+    manager.update(sid, settings={"swarm": {"mode": "board"}})
+    manager.update(sid, settings={"swarm": {"mode": None, "goal_rule": None}})
+    manager.update(sid, overrides={"swarm": {"mode": "board", "max_agents": 2}})
+    assert manager.meta(sid)["overrides"] == {"swarm": {"max_agents": 2}}
+    _refused(lambda: manager.update(sid, settings={"swarm": {"mode": "thread"}}),
+             "the mode is chosen when the session is created")
+    _refused(lambda: manager.update(sid, overrides={"swarm": {"mode": "thread"}}),
+             "the mode is chosen when the session is created")
+    for call in (lambda: manager.update(sid, settings={"swarm": {"goal_rule": "veto"}}),
+                 lambda: manager.update(sid, overrides={"swarm": {"goal_rule": "democracy"}})):
+        _refused(call, "goal_rule applies to a thread session")
+    manager.update(sid, settings={"agents": {"digest_seconds": 20}})   # an ordinary key in both modes
+    assert manager.meta(sid)["overrides"] == {"swarm": {"max_agents": 2}, "agents": {"digest_seconds": 20}}
+    await manager.shutdown()
+
+
+async def test_a_running_thread_session_takes_a_new_rule_live(tmp_path):
+    home = _home(tmp_path)
+    manager = _manager(home)
+    sid = (await manager.create("Thread", "Build it", overrides={"swarm": {"mode": "thread"}}))["id"]
+    swarm = manager.swarms[sid]
+    assert swarm.goal_rule == "democracy"
+    _refused(lambda: manager.update(sid, settings={"swarm": {"mode": "board"}}),
+             "the mode is chosen when the session is created")
+    manager.update(sid, settings={"swarm": {"goal_rule": "veto"}})
+    await asyncio.sleep(0)
+    assert swarm.goal_rule == "veto" and swarm.mode == "thread"
+    summary = manager.summary(sid)
+    assert summary["goal_rule"] == "veto" and summary["goal_vote"]["rule"] == "veto"
+    await manager.shutdown()
+
+
+async def test_the_database_mode_wins_over_a_hand_edited_cache(tmp_path):
+    home = _home(tmp_path)
+    manager = _manager(home)
+    sid = (await manager.create("Thread", overrides={"swarm": {"mode": "thread", "goal_rule": "veto"}},
+                                start=False))["id"]
+    path = manager.dir_of(sid) / "session.json"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta["overrides"] = {"agents": {"digest_seconds": 40}}   # the cache and the rule removed by hand
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    assert manager.summary(sid)["mode"] == "thread"            # kv swarm_mode
+    manager.update(sid, settings={"agents": {"digest_seconds": 50}})
+    assert manager.meta(sid)["overrides"] == {"agents": {"digest_seconds": 50}, "swarm": {"mode": "thread"}}
+    board = (await manager.create("Board", start=False))["id"]
+    swarm = await manager.start(board)
+    await manager.stop(board)
+    path = manager.dir_of(board) / "session.json"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta["overrides"] = {"swarm": {"mode": "thread"}}           # a cache that names the other mode
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    assert manager.summary(board)["mode"] == "board" and swarm.mode == "board"
+    manager.update(board, settings={"swarm": {"max_agents": 2}})
+    assert manager.meta(board)["overrides"] == {"swarm": {"max_agents": 2}}
+    await manager.shutdown()
+
+
+async def test_summaries_and_read_stats_of_a_thread_session(tmp_path):
+    from dreamteam.db import Database
+
+    home = _home(tmp_path)
+    manager = _manager(home)
+    sid = (await manager.create("Thread", "Build the parser", overrides={"swarm": {"mode": "thread"}},
+                                start=False))["id"]
+    summary = manager.summary(sid)
+    assert (summary["mode"], summary["goal_rule"], summary["goal_vote"], summary["posts"]) == (
+        "thread", "democracy", None, 0)
+    assert summary["goal"] == {"title": "Build the parser", "description": "", "status": "pending", "summary": "",
+                               "decision": None}
+    swarm = await manager.start(sid)
+    name = next(m["name"] for m in swarm.members() if m["kind"] == "llm")
+    swarm.forum.create(name, "First", "")
+    swarm.forum.create(USER, "Second", "")
+    summary = manager.summary(sid)
+    assert summary["posts"] == 2 and summary["goal"]["decision"] is None
+    assert summary["goal_vote"] == {"rule": "democracy", "counted": 1, "for": [], "against": [], "needed": 1,
+                                    "met": False}
+    swarm.forum.vote(name, "#1", "like")   # the only member: the vote completes the goal
+    await manager.stop(sid)
+    db = manager.dir_of(sid) / ".dreamteam" / "swarm.db"
+    stats = read_stats(db, goal_rule="veto")   # the file's kv says thread; the cached mode is only a default
+    assert stats["mode"] == "thread" and stats["goal_rule"] == "veto" and stats["posts"] == 2
+    assert stats["goal"]["status"] == "done"
+    assert stats["goal"]["decision"] == {"rule": "democracy", "for": [name], "against": [], "counted": 1,
+                                         "wrap_up": False}
+    assert "completed_by" not in stats["goal"]
+    assert stats["goal_vote"]["rule"] == "veto" and stats["goal_vote"]["for"] == [name]
+    assert manager.summary(sid)["goal"]["decision"]["rule"] == "democracy"
+    swarm = await manager.start(sid)
+    swarm.reopen_goal(USER, "-")
+    await manager.stop(sid)
+    assert read_stats(db)["goal"]["decision"] is None and read_stats(db)["goal"]["status"] == "active"
+    # a board session's file and a missing one
+    board = (await manager.create("Board", start=False))["id"]
+    await manager.start(board)
+    await manager.stop(board)
+    stats = read_stats(manager.dir_of(board) / ".dreamteam" / "swarm.db", mode="thread")
+    assert (stats["mode"], stats["goal_rule"], stats["goal_vote"], stats["posts"]) == ("board", None, None, 0)
+    missing = read_stats(tmp_path / "none.db", mode="thread", goal_rule="veto")
+    assert (missing["mode"], missing["goal_rule"], missing["goal_vote"], missing["posts"]) == (
+        "thread", "veto", None, 0)
+    # a file whose kv says thread but that has no forum tables: 0 and null, the other figures stay
+    bare = Database(tmp_path / "bare.db")
+    bare.set("swarm_mode", "thread")
+    bare.close()
+    stats = read_stats(tmp_path / "bare.db")
+    assert (stats["mode"], stats["goal_vote"], stats["posts"], stats["earlier_version"]) == ("thread", None, 0, False)
+    await manager.shutdown()

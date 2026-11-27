@@ -8,6 +8,7 @@ import hmac
 import ipaddress
 import logging
 import os
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -377,6 +378,54 @@ def _int(request: Request, name: str, default: int, lo: int = 0, hi: int = 10_00
     return max(lo, min(value, hi))
 
 
+NO_POSTS_TEXT = "This session works on a task board: it has no posts."
+_POST_ID = re.compile(r"#?(\d{1,18})")
+
+
+def post_view(swarm: "Swarm", post_id: Any, since_id: Any = None) -> tuple[dict[str, Any], int]:
+    """GET /api/posts/{id}?since_id= of a thread session (docs/SPEC.md §22.8), as (body, status): `{post, comments,
+    votes, goal_vote?}`. `post` is Forum.get with the user's `my_vote`; `comments` the post's comments in id order
+    (only those after `since_id` when given), each `{id, author, text, reply_to, ts, likes, dislikes, my_vote}`;
+    `votes` the post's voters `[{voter, value, counted}]`; `goal_vote` for #1 only. 404 for an unknown post and for
+    every path in a board session, 400 for a `since_id` that is not a number."""
+    forum = getattr(swarm, "forum", None)
+    if forum is None:
+        return {"error": NO_POSTS_TEXT}, 404
+    match = _POST_ID.fullmatch(str(post_id or "").strip())
+    if match is None:
+        return {"error": f"No post {post_id or ''}".strip()}, 404
+    pid = int(match.group(1))
+    since = 0
+    if since_id not in (None, ""):
+        found = re.fullmatch(r"[cC]?(\d{1,18})", str(since_id).strip())
+        if found is None:
+            return {"error": "since_id must be a comment id such as c31"}, 400
+        since = int(found.group(1))
+    try:
+        post = forum.get(pid)
+    except ToolError as exc:
+        return {"error": str(exc)}, 404
+    target = f"p{pid}"
+    comments = [c for c in forum.comments(pid, limit=10**9) if c["id"] > since]
+    mine = {r["target"]: int(r["value"]) for r in swarm.db.all("SELECT target, value FROM votes WHERE voter = ?",
+                                                                (USER,))}
+
+    def vote_of(key: str) -> str | None:
+        value = mine.get(key) or 0
+        return None if not value else ("like" if value > 0 else "dislike")
+
+    body: dict[str, Any] = {
+        "post": {**post, "my_vote": vote_of(target)},
+        "comments": [{"id": c["id"], "author": c["author"], "text": c["text"], "reply_to": c["reply_to"],
+                      "ts": c["ts"], "likes": c["likes"], "dislikes": c["dislikes"], "my_vote": vote_of(f"c{c['id']}")}
+                     for c in comments],
+        "votes": forum.votes(target),
+    }
+    if post["kind"] == "goal":
+        body["goal_vote"] = forum.goal_vote()
+    return body, 200
+
+
 STOPPED_SKILLS_TEXT = "The session is stopped: start it to attach skills (importing into the library works)."
 
 
@@ -583,6 +632,12 @@ def create_app(swarm: "Swarm", host: str = "127.0.0.1", *,
                   for r in reversed(rows)]
         return JSONResponse({"task": task.to_dict(), "discussion": swarm.board.discussion(task_id), "events": events})
 
+    async def post_detail(request: Request):
+        # a thread session's post as the thread tab opens it (docs/SPEC.md §22.8 "Snapshot and REST"); every
+        # /api/posts path is 404 in a board session
+        body, status = post_view(swarm, request.path_params.get("post_id"), request.query_params.get("since_id"))
+        return JSONResponse(body, status_code=status)
+
     async def messages(request: Request):
         limit = _int(request, "limit", 200, 1, 1000)
         since = _int(request, "since", 0)
@@ -702,6 +757,8 @@ def create_app(swarm: "Swarm", host: str = "127.0.0.1", *,
         Route("/api/roles", role_catalog),
         Route("/api/hub", hub_info),
         Route("/api/tasks/{task_id:int}", task_detail),
+        Route("/api/posts/{post_id:path}", post_detail),
+        Route("/api/posts", post_detail),
         Route("/api/messages", messages),
         Route("/api/inbox", inbox),
         Route("/api/read", mark_read, methods=["POST"]),

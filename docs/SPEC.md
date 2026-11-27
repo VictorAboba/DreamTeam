@@ -11,7 +11,8 @@ User-visible texts for agents live in `prompts.py` (ru/en). Python >= 3.11, asyn
 * Actors: a member name (`"John Smith"`), or the reserved `USER = "user"` (the human).
   `"all"` is a pseudo-recipient for messages. Names are unique, case-insensitive, stored canonically.
 * Errors meant for the caller (agent, user, MCP client) are raised as `models.ToolError(msg)`.
-  Messages are short, in English, and tell the caller how to fix the call.
+  Messages are short, in English (the read-before-write refusals and their held calls: in the member's
+  language, §7.3), and tell the caller how to fix the call.
 * JSON in DB: `db.dumps` / `db.loads` (ensure_ascii=False; a value holding a lone surrogate, e.g. from LLM
   tool arguments, is written with ASCII escapes instead, so it is storable and loads back identical).
   Plain TEXT columns cannot hold lone surrogates: `db.utf8_safe(text)` replaces them with U+FFFD; a tool
@@ -30,15 +31,16 @@ User-visible texts for agents live in `prompts.py` (ru/en). Python >= 3.11, asyn
 src/dreamteam/
   __init__.py  __main__.py
   config.py      Config / ModelProfile / templates                  (exists)
-  db.py          Database (sqlite)                                   (exists)
+  db.py          Database (sqlite); FORUM_SCHEMA, the thread mode's tables (§22.1)  (exists)
   models.py      USER, ALL, ToolError, Status, Task, AgentKind...    (exists)
   events.py      EventBus; read_page: a page of the journal by id (§21.6)  (exists)
   names.py       generate_name                                       (exists)
-  prompts.py     system_prompt(), t(), PLANNING_TASK, DEFAULT_ROLE   (exists)
+  prompts.py     system_prompt(mode), t(), mode_key(), PLANNING_TASK, DEFAULT_ROLE (exists; texts by mode, §22.6)
   roles.py       role catalog: presets, [[roles]] overlay, resolution, starting team, saved teams (§17.3); imports
                  nothing from the package
   goal_text.py   split_goal, shorten_title: a goal typed as one text -> title + description (§3)
   board.py       Board          — tasks, goal field, discussion, independent review (§4)
+  forum.py       Forum          — the thread mode: posts, comments, votes, subscriptions, the goal vote (§22)
   mailbox.py     Mailbox        — direct messages
   workspace.py   Workspace      — shared files, git, locks
   hubgit.py      DreamTeam's own git in the members' folders: environment, fixed options, the repository's
@@ -63,14 +65,18 @@ src/dreamteam/
                  members' proposals and the user's library decision, the roles' skills (§19)
   skill_deps.py  skills' script dependencies: manifest detection, EnvManager — environments shared by all sessions
                  under ~/.dreamteam/skill-envs, builds, OS locks, Node views, cleanup (§19)
-  tools/__init__.py  registry: ToolSpec, ToolContext, tool(), tools_for(), schemas_for(), call_tool()
+  tools/__init__.py  registry: ToolSpec, ToolContext, tool(), tools_for(), schemas_for(), call_tool(); the session
+                 modes (`MODES`, `ToolSpec.modes` and `variants`, `parameters_for`, §22.5)
   tools/board_tools.py comm_tools.py file_tools.py job_tools.py swarm_tools.py trigger_tools.py mcp_tools.py
   tools/skill_tools.py the skills tools: the user's `skills`, `skill_attach`, `skill_detach`, `skill_approve`,
                  `skill_reinstall`, and the members' `skill_propose` (§19)
-  tools/frozen.py    frozen LLM tool sets: revisions (now 5), the kv record of each agent,
-                     `python -m dreamteam.tools.frozen` (§6.1)
-  tools/snapshots/   llm_r<N>.json: the shipped LLM tool sets, revision OLDEST_OPEN_REVISION..TOOLSET_REVISION
-                     (now 5; en and ru), never edited
+  tools/forum_tools.py the thread mode's tools: `feed`, `post_read`, `post_create`, `post_update`, `comment`,
+                 `vote`, `subscriptions`, `subscribe`, `unsubscribe`, and their id parsers (§22.5)
+  tools/frozen.py    frozen LLM tool sets: revisions in one numbering for both modes (board 5, thread 6:
+                     TOOLSET_REVISIONS), the kv record of each agent, `python -m dreamteam.tools.frozen` (§6.1,
+                     §22.5)
+  tools/snapshots/   llm_r<N>.json (board) and llm_thread_r<N>.json (thread): the shipped LLM tool sets, revision
+                     OLDEST_OPEN_REVISION..NEWEST_REVISION (now 5 and 6; en and ru), never edited
   agent.py       AgentRuntime   — ReAct loop of one LLM agent
   swarm.py       Swarm          — composition root
   hub_mcp.py     the swarm as an MCP server (stdio / streamable HTTP / stdio->HTTP proxy)
@@ -99,8 +105,9 @@ src/dreamteam/
   uitext.py      the feed's texts (ru/en), moved out of tui/i18n.py, which stays as a shim (§21.6)
   symbols.py     the feed's symbols, moved out of tui/theme.py, which re-exports them (§21.6)
   result.py      the result object of a run, shared by `dreamteam -p` and the API (§21.7)
-  instruct.py    what `dreamteam -p -r` and the API's continue do with a prompt: coordinator, continue_step; the
-                 sessions `-c` picks from: without_api_sessions (§21.2, §21.4)
+  instruct.py    what `dreamteam -p -r` and the API's continue do with a prompt: coordinator (board sessions),
+                 continue_step, post_parts (a post by the user in a thread session, §22.9); the sessions `-c`
+                 picks from: without_api_sessions (§21.2, §21.4)
   sessionopts.py team, model and limits of a request -> session overrides, shared with the launcher MCP (§21.4)
   apifolders.py  [api] folders: the roots, their checks, a request's folder (§21.10)
   nofollow.py    open, list and walk inside a root without following links (§21.8)
@@ -168,7 +175,9 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
   context_tokens.
 * `history`: agent, seq, msg (json neutral message, §6.1) — append-only per agent except compaction.
 * `messages` + `inbox(message_id, recipient, read_at)`.
-* `notifications`: id, ts, recipient, kind (prompt key), text (rendered), data (json), delivered_at.
+* `notifications`: id, ts, recipient, kind (prompt key), text (rendered), data (json), delivered_at. Data flags
+  (§3 `notify`): `_quiet` (sent with `wake=False`); in a thread session also `_digest` (a digest item) and `_settle`
+  (a waking `f_file` waiting for its run of changes to settle), §22.3.
 * `triggers` (§8): id, owner, condition, note, actions (json), once, active, created_at, last_value, last_fired,
   fire_count, last_error, and the wake limit's told_at (when the trigger last told its owner), held (fires since then
   whose notice waits), held_last (the latest of them), held_files (json `{path: {count, by, first, last, settled}}`:
@@ -188,14 +197,22 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
   2000 characters of the output, at the end), started_at, background_at, ended_at. `CREATE TABLE IF NOT EXISTS`:
   an older database gets it at its next open.
 * `traces`, `spans`, `history_archive(agent, epoch, seq, msg, archived_at)`: tracing.py SCHEMA (§16).
-* kv keys: `goal` → `{"title","description","status":"active"|"done","summary","set_by","updated_at"}`,
+* `posts`, `post_comments`, `votes`, `subscriptions`: the thread mode, `db.FORUM_SCHEMA` (§22.1), only in a thread
+  session's database (never in `SCHEMA`: a board session's file stays importable into 0.4.x).
+* kv keys: `goal` → `{"title","description","status":"active"|"done","summary","set_by","updated_at"}`, plus
+  `completed_by` (set by `complete_goal`: the actor; null when a retire, rule change or start met a thread
+  session's vote) and, in a thread session while done, `decision` (§22.1, §22.4; no `artifacts`),
   `limits` → `{"max_cost_usd": float, "max_agents": int}` (overrides config), `paused` → `{"paused": bool,
   "reason": str}` (a member's question, §3.1: `{"paused": true, "reason": "question", "asker": str, "message_id":
   int, "since": float}`), `budget_notice` → `{"limit": float, "at": float, "spent": float, "ts": float}` (the money
   notice sent for that limit and fraction, §3 `record_usage`; a new limit or fraction re-arms it),
-  `tools:<agent name>` → `{"rev": int, "language": "en"|"ru", "tools": [{"name","description","parameters"}]}` (the
-  agent's frozen tool set, §6.1; kept for retired agents, traces read it), `wait_progress:<actor>` → the last events
-  id whose board progress `wait_for_events(progress=true)` returned to that actor (§12).
+  `tools:<agent name>` → `{"rev": int, "language": "en"|"ru", "tools": [{"name","description","parameters"}],
+  "mode"?: "board"|"thread"}` (the agent's frozen tool set, §6.1; no "mode" = board, §22.1, §22.5; kept for retired
+  agents, traces read it), `wait_progress:<actor>` → the last events id whose board progress (in a thread session:
+  the feed's progress, §22.5) `wait_for_events(progress=true)` returned to that actor (§12), `swarm_mode` →
+  `"board"` | `"thread"`: the session's mode, fixed when it is created (§22.1), `file_read:<member>:<path key>` →
+  `"<sha256>"` or `"<sha256>:<line ranges>"`: the member's file read mark (§7.3; both modes, one row per member and
+  file).
 
 ## 3. Swarm (swarm.py) — what other modules may use
 
@@ -203,6 +220,10 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 class Swarm:
     config: Config; db: Database; bus: EventBus
     board: Board; mail: Mailbox; workspace: Workspace; triggers: TriggerEngine; forge: MCPForge
+    forum: Forum | None                      # the thread mode's posts, votes, subscriptions; None on a board
+                                             # (§22.2)
+    mode: str; is_thread: bool               # "board" | "thread", from kv swarm_mode, fixed at creation (§22.1)
+    goal_rule: str                           # config.swarm.goal_rule; only thread sessions read it (§22.4)
     runtimes: dict[str, AgentRuntime]        # running LLM agents
     language: str                            # config.swarm.language
     llm_semaphore: asyncio.Semaphore
@@ -218,16 +239,23 @@ class Swarm:
         # a failure after the database was opened (a corrupt swarm.db...) closes it before re-raising
     async def start(self, run_agents: bool = True) -> None
         # tracer.recover(), then jobs.recover() (rows a previous process left running become `lost`, §7.1 "Crash
-        # recovery"), and the trace prune first (§16.1); the very first start creates the starting team:
+        # recovery"), and the trace prune first (§16.1); the very first start creates the starting team through
+        # `_create_member` (not `hire`: no limit check and no n_hired; in a thread session its thread prompt, thread
+        # role texts and automatic subscriptions come from `_create_member`, §22.3):
         # roles.starting_team(swarm.starting_roles, swarm.start_agents), member i gets starting_roles[i], the rest
         # (and blank entries) are generalists (§17.3); LLM agents with open tasks, reviews waiting for them or
         # pending events (goal active), or whose last activation was cut short (the stored history ends
-        # mid-activation), get `n_restart`; hire() respects run_agents. After forge.start(): skills.start() (the
-        # session's skills read again, their script dependencies planned in a daemon thread and held in use, the
+        # mid-activation, a held `wait` too: §7.3 "A `wait` after a refusal"), get `n_restart`; hire() respects
+        # run_agents. After forge.start(): skills.start() (the session's skills read again, their script
+        # dependencies planned in a daemon thread and held in use, the
         # agents' mirror rebuilt from the session copies with its node_modules links, the owners of decisions made
         # while stopped told, §19), then skills.ensure_deps() as a `_background` task (builds never waited for);
         # after the starting team is created: skills.ensure_role_skills(announce=False)
         # (the skills the members' roles list; nobody is told: every first wake-up after a start shows the index).
+        # A thread session (§22.4, §22.7): `_digest_floor` = now and `_thread_quiet` / `_thread_quiet_woken` empty;
+        # `forum.rewrite_goal_rule()` and `forum.recheck_goal(None)` once after the starting team exists, before the
+        # restart notices; a goal set before the very first start gets `_kickoff_thread(USER, goal, True)`, never
+        # `_kickoff` (no planning task)
         # The scheduler calls skills.check() (the mirror, at most once a minute) and skills.touch_envs() (hourly)
     async def stop(self) -> None
         # wakes every wait_signal() waiter (stopping=True), closes external trace sessions (a failure is logged:
@@ -267,11 +295,18 @@ class Swarm:
     def language_of(self, name: str) -> str             # member language, else swarm language
 
     # notifications / waking
-    def notify(self, recipient: str, key: str, *, wake: bool = True, **kw) -> None
+    def notify(self, recipient: str, key: str, *, wake: bool = True, batch: bool = False, defer: bool = False,
+               **kw) -> None
         # text = prompts.t(language_of(recipient), key, **kw); insert notifications row (kind=key,
         # data=kw); emit "notification" {recipient, kind, text}; if wake: signal(recipient).
         # wake=False for a member: data also gets "_quiet": true; such a row is news for the member's
         # next wake-up (render_wake delivers it) but does not count in has_pending
+        # batch (thread sessions, only with wake=False, never for USER): data also gets "_digest": true (DIGEST_KEY),
+        # a digest item of the forum's delivery (§22.3; `digest` stays an ordinary data key: u_mcp_pending passes
+        # `digest=` for its `{digest}` placeholder); defer (only with wake=True, never for USER): the row is
+        # waking but not signalled, then defer_wake(recipient) (§22.3 "Quiet new posts"). A quiet row becomes news
+        # that wakes only when the thread scheduler drops its "_quiet" (a due digest, a settled file item, §22.7):
+        # a bare signal never activates a member with nothing pending (§6.2)
     def signal(self, name: str) -> None                 # wakes LLM runtime / releases wait_signal waiters
     async def wait_signal(self, name: str, timeout: float) -> bool
     def has_pending(self, name: str) -> bool            # unread inbox or undelivered non-quiet notifications
@@ -280,6 +315,10 @@ class Swarm:
         # (JobManager.busy) and whose end will wake it (JobManager.awaited): a member's broadcast reaches it without a
         # wake (§5 "Quiet broadcasts")
     def defer_wake(self, name: str) -> None              # such news reached `name` unwoken (_wake_deferred, below)
+    def digest_deadline(self, name: str) -> float | None
+        # thread sessions: when the oldest undelivered digest item of `name` other than a vote falls due
+        # (max(ts, _digest_floor) + [agents] digest_seconds); None while the goal is not active or there is none.
+        # The scheduler's digest batching and `wait_for_events` use it (§22.3 "Digest items")
     def team_asleep(self, caller: str | None = None) -> bool
         # nobody in the team can act or be woken by something already set (scheduler item 9 below, `wait`'s result,
         # §12). `caller`, when given, is the member calling `wait` (still working): it counts as idle with nothing
@@ -294,12 +333,13 @@ class Swarm:
         # stamps the triggers' times); no external member made a hub call in the last `EXTERNAL_IDLE_SECONDS` (15
         # min, tracing.py): `_external_seen` {member: time.time()}, in memory, stamped by `hub_call` (§13) for every
         # call but `wait_for_events`, whether tracing is on or not (a client that only listens is asleep like the
-        # others)
+        # others); in a thread session (§22.7) also false while the goal is active and an idle LLM member other than
+        # `caller` has an undelivered `_digest` row other than an `f_vote` one, or any member a `_settle` row
     def stall_ids(self, name: str) -> frozenset[int]
         # the public form of `_stall_ids` (scheduler items 2-3, `wait`'s result): the in_progress task ids of `name`
         # that count as stalled, not a clarify planning card whose holder waits for the user's answers (`asks_user`,
         # §3.1) nor a crew task with a direction that can still move (`Board.has_live_directions`); a `waiting` task
-        # never counts (answers wake its holder, system prompt rule 7)
+        # never counts (answers wake its holder, system prompt rule 7); always empty in a thread session (§22.7)
     def render_wake(self, name: str, incoming: bool = False, stamps: bool = False,
                     since: float | None = None) -> str | None
         # drains (marks read/delivered) and renders the wake-up text (§6.3); None if nothing pending
@@ -332,14 +372,26 @@ class Swarm:
         # summary, documentation, release, depends only on the tasks it cannot be written without; exploratory and
         # optional tasks do not block it); 6 tests by someone else; 7 reviews; 8 team; 9 finish quickly. n_kickoff
         # tells the others that the first tasks come before the plan is complete. A clarify card wakes only the first
-        # LLM member; the others get the same n_kickoff quietly (§3.1 "Kickoff")
-    def complete_goal(self, actor: str, summary: str) -> dict
+        # LLM member; the others get the same n_kickoff quietly (§3.1 "Kickoff"). A thread session (§22.4) never
+        # gets a planning task: `forum.ensure_system_posts(goal)` writes or rewrites #1 and #2 whether or not the
+        # swarm is started, then, when started, `_kickoff_thread` sends `n_kickoff_thread` (first goal) or
+        # `n_goal_updated_thread`; with a clarify #2 (a first or a new goal) only one asker is woken, by the clarify
+        # variant
+    def complete_goal(self, actor: str | None, summary: str, *, decision: dict | None = None) -> dict
         # ToolError when there is no goal, it is already done, or the summary is empty; notifies USER u_goal_done;
         # background jobs keep running (a dev server may be for the user): when some run, USER also gets the quiet
         # u_jobs_running {jobs: "j3 (Anna Smith: npm run dev, 25 min); ..."}, and their later ends wake nobody
+        # `decision` (a thread session, §22.4) goes into kv `goal` in the same write; actor None when no voter met
+        # the rule; with a decision USER gets u_goal_decided in place of u_goal_done (none at all for rule `user`)
+        # and every LLM member the quiet n_goal_decided
+    def complete_goal_by_user(self, summary: str = "") -> dict
+        # thread sessions only (a board session: ToolError): complete_goal(USER, summary or goal_completed_by_user,
+        # decision={rule: "user", ...}); swarm_control complete_goal (§12, §22.4)
     def reopen_goal(self, actor: str, comment: str = "") -> dict
         # only a done goal (else ToolError); notifies ONE LLM member n_goal_reopened: the one who completed
-        # the goal, else the most recently active (the others are offered new tasks by the scheduler).
+        # the goal, else the most recently active (the others are offered new tasks by the scheduler). A thread
+        # session (§22.4): `decision` popped, summary "", the votes on #1 cleared, the comment posted on #1 unless empty
+        # or "-", n_goal_reopened_thread waking to every LLM member (staggered, as the kickoff).
         # set_goal and reopen_goal both end wrap-up mode (end_wrap_up, below)
 
     # team
@@ -361,12 +413,20 @@ class Swarm:
         # raise max_agents."; external members are not limited. After the member is created and before n_hired:
         # skills.ensure_role_skills([name]) (its role's skills, §19; the other members are told, not the new one,
         # whose first wake-up lists them), the report kept for `hire_agent` (skills.note_hire / hire_report)
+        # In a thread session (§22.3, §22.4, §22.6): `_create_member` (shared with the first start()'s starting team, §3
+        # start) uses roles.find_role(..., mode="thread") and system_prompt(..., mode="thread") and calls
+        # forum.auto_subscribe(name) (feed, reactions, posts 1 and 2, all digest, for every kind of member); hire then
+        # sends n_hired_thread (no recheck_goal: a hire never meets the rule, §22.4)
     async def retire(self, by: str, name: str, reason: str = "") -> list[int]   # returns released task ids
         # before the first await: the ids of its running jobs, and jobs.forbid(name) (none of its commands may
         # become a job while it leaves); then tasks and locks released (workspace.release_all: its own lock waits are
-        # dropped, the members waiting for its locks woken, §7 "Lock waiters"), triggers deactivated, status retired,
+        # dropped, the members waiting for its locks woken, §7 "Lock waiters"), its file read marks deleted
+        # (workspace.drop_file_reads, §7.3), triggers deactivated, status retired,
         # `agent.retired` {name, reason, released, jobs}, its pending question dropped (`_drop_question(by, "left")`,
-        # §3.1), n_member_retired; then its runtime stops; last
+        # §3.1), n_member_retired; in a thread session also forum.drop_subscriptions(name) with the triggers'
+        # deactivation (every row, the feed one too, §22.3), forum.drop_reads(name) (its forum marks, §22.11) and
+        # forum.recheck_goal(None) after n_member_retired_thread
+        # (§22.4); then its runtime stops; last
         # jobs.stop_owner(name, "retired"): its jobs and its foreground commands (an external member's call in
         # flight) are killed and awaited, committed under its name, with no notice to it; then its held new files
         # (workspace.commit_held(name, "when <name> left the team", leaving=True): it is no suspect any more, §7
@@ -391,6 +451,7 @@ class Swarm:
         # gives no low notice, and a raised limit gives it at the next call that finds spent past the new threshold.
         # A new limit (set_limits, a settings change, reconfigure) or a new fraction differs from the kv record and
         # so re-arms the notice, with no hook; the same limit set again does not
+        # In a thread session (§22.7) the notice is `n_budget_low_thread`; the task and review terms are empty there
     def budget_exceeded(self) -> bool
     paused: bool; pause_reason: str
     def pause(self, actor: str, reason: str, **details) -> bool
@@ -418,6 +479,8 @@ class Swarm:
         # `_considering` start (`_nudge_idle`'s decision window; an offer made during the pause counts from the resume)
         # and every free-place clock (`_crew_gaps`, scheduler item 8: a crew task's state does not age while paused);
         # it drops the team-asleep clock (`_team_asleep` = None, scheduler item 9: its `n_resumed` wakes the holders)
+        # In a thread session (§22.3, §22.7) it also sets `_digest_floor` to now and drops `_thread_quiet` and
+        # `_thread_quiet_woken`; a member whose only news is digest items gets no n_resumed: the digest batch wakes it
     def pending_question(self) -> dict | None            # {asker, message_id, since} of the question holding the
                                                          # pause (kv `paused` with reason "question"), else None
     def last_message_id(self, sender: str, recipient: str, since: float = 0.0) -> int | None
@@ -431,7 +494,9 @@ class Swarm:
     def question_answered(self, message: dict, question: dict) -> None
         # Mailbox.send's hook (§5): the user's `message` answers `question`; tells the others, then resumes (or turns
         # the pause into a budget pause); never raises
-    def asks_user(self, name: str, task: Task) -> bool   # the clarify planner waits for the user's answers (§3.1)
+    def asks_user(self, name: str, task: Task | None = None) -> bool  # the clarify planner waits for the user's
+                                                         # answers (§3.1); in a thread session the kickoff asker
+                                                         # of a clarify #2, task None (§22.4 "Clarify")
     clarifying: bool                                     # [swarm] clarify and no auto-reply lease (§3.1)
     def hold_auto_reply(self) -> None                    # the lease for this object's whole life (§3.1, §21.5)
     wrapping_up: bool                                    # the user's wrap-up mode (kv "wrap_up" {"on", "by", "since"})
@@ -443,10 +508,12 @@ class Swarm:
         # with what was achieved and what is left, without new tasks). While on: every wake-up carries
         # `wrap_up_line` (§6.3), no command of a member becomes a new job (§7.1 "Wrap-up mode"), `_check_all_done`
         # sends `n_all_done_wrap_up` (goal_complete, no new tasks) instead of `n_all_done`. Nothing is paused; the
-        # user's own actions are not restricted
-    def end_wrap_up(self, actor: str) -> bool
+        # user's own actions are not restricted. A thread session (§22.4, §22.7): `n_wrap_up_thread` and
+        # `wrap_up_line_thread`; a like on #1 then means "finish with what we have"; no `_check_all_done`
+    def end_wrap_up(self, actor: str, clear_votes: bool = True) -> bool
         # off (False when it was not on): `swarm.wrap_up` {on: false} and a quiet `n_wrap_up_end` to every LLM member
         # (shown at its next wake-up); called by the user (swarm_control wrap_up=false), set_goal and reopen_goal
+        # (these two pass clear_votes=False: they reset the votes on #1 themselves); a thread session: §22.4
     def make_llm(self, profile_name: str | None, agent: str) -> LLMClient
         # a member's profile (agents.model) that no longer exists in the settings (deleted, or renamed by a hand edit
         # of dreamteam.toml) falls back to the default profile with a warning, instead of crashing that agent at every
@@ -465,7 +532,8 @@ member, members, is_member, kind_of, resolve_member, language_of, notify, signal
 board, mail, workspace, triggers, goal, set_goal, complete_goal` (attributes may be None until a test
 wires them), and records notifications in `fake.notified: list[tuple[recipient, key, kw]]`. Its
 resolve_member is the real `resolve_member_in`; set_goal / complete_goal validate, split the goal and notify
-like the real ones (the planning task is created when a real Board is wired: `prompts.planning_task(language,
+like the real ones (complete_goal takes `decision=` and an actor of None too; the planning task is created when a
+real Board is wired: `prompts.planning_task(language,
 config.swarm.clarify)` with its tags, §3.1). It has no `pending_question`, `ask_user`, `asks_user` or `pause_text`:
 their callers (Mailbox.send, send_message, the in-activation nudge, `_stop_reason`) look them up with getattr, so
 with FakeSwarm a message never answers or pauses anything. Nor has it `team_asleep` or `stall_ids` (and its
@@ -635,12 +703,18 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
      external member is ever woken (no scheduler item wakes one), and a `dreamteam -p` run still waits, until its
      `--timeout` when one is given, with the user's notice on stderr (docs/TUI.md §2).
 
+In a thread-mode session (§22) items 1-9 do not run: §22.7 replaces them with digest batching (`_deliver_digests`)
+and the quiet check (`_check_quiet`); the steps before item 1, `_wake_deferred` included, run in both modes.
+
 `reconfigure()` applies new settings to a running swarm, lifts a budget pause the new budget allows and retries
 agents in ERROR; a changed role catalog (§17.3), `[swarm] independent_review` and `crew_review` apply at once (new
 hires use the new catalog; existing members keep their frozen prompts); `[swarm] clarify` switched off lifts a
 question pause and tells a clarify planner that waits for the user (§3.1). The money notice needs no hook: a new
 `max_cost_usd` or `[swarm] budget_notice_at` no longer matches kv `budget_notice`, so the next `record_usage` past the
-new threshold sends it again (§3 `record_usage`); `agents.idle_nudge_seconds` reaches item 9's delay at the next pass.
+new threshold sends it again (§3 `record_usage`); `agents.idle_nudge_seconds` reaches item 9's delay (in a thread
+session the quiet check's, and `agents.digest_seconds` digest batching, §22.7) at the next pass. In a thread session
+a changed `[swarm] goal_rule` (frozen per session, §22.4) runs `_goal_rule_changed()`: #1's text names the new rule
+and `forum.recheck_goal(None)` may complete the goal.
 
 ### 3.1 Clarify mode and questions that pause the swarm
 
@@ -649,6 +723,8 @@ override or a PATCH reaches it through `reconfigure`), turns on two things: the 
 member's critical question pauses the whole swarm until the user answers. **Effective clarify** is
 `Swarm.clarifying` = `config.swarm.clarify and not auto_reply_active` (the lease below: `dreamteam -p` with automatic
 replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and the `swarm_status` CLARIFY line use it.
+A thread session has no clarify card: the decision is a flag on system post #2, its kickoff wakes one asker, and
+every guard below that names the card's holder means that asker (§22.4 "Clarify").
 
 - **The clarify planning card.** `set_goal` on an empty board with `clarifying` creates
   `prompts.planning_task(language, True)` (`PLANNING_CLARIFY`, tags `["planning", "clarify"]`: `prompts.CLARIFY_TAG`)
@@ -1849,9 +1925,11 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   members may work on it at once, its owner included; directions = its areas, one per item; the members who take
   them write the details.` The planning card (board data, §3) says the same in one sentence, and its "only one task"
   counts a crew task the planner owns and its own direction of it as one (and the crew task alone as none while the
-  planner works on none of its directions). Every member of a session this version opens has revision 5 or later
-  (§17.2 "Sessions of an earlier version"), so these texts and every text for agents may name crew tasks, `crew`
-  and `directions` (§12 R0′). External members have no system prompt (their briefing, join_swarm's text, is
+  planner works on none of its directions). Every member of a board session this version opens has board revision 5
+  or later (§17.2 "Sessions of an earlier version"; a thread session's members have the thread revision 6, which has
+  no tasks, §22.5), so these texts and every board text for agents (`prompts.BOARD_KEYS`, §22.6) may name crew tasks,
+  `crew` and `directions` (§12 R0′, per mode §22.5); shared and thread texts never do. External members have no
+  system prompt (their briefing, join_swarm's text, is
   unchanged): they see the live `task_create` / `task_update` descriptions and learn the rest from the claim
   results and `n_crew_owner`.
 - **Surfaces.** The web board shows subtasks in their parent's stack (§18.4 "Subtasks"). The TUI (docs/TUI.md,
@@ -1980,7 +2058,8 @@ class Mailbox:
         # those recipients with their inbox row already read and no signal: the MCP client that sends acts as them
         # too, so the message is in their history but is no news to them. Only that sender's: a task started inside
         # the block inherits the context (an agent runtime starts in a context of its own anyway, §6.2), and the
-        # messages of every other sender reach those members as news.
+        # messages of every other sender reach those members as news. `seen_as(sender)` returns the block's
+        # members for that sender, else frozenset() (§22.3).
         # The answer to a question pause (§3.1): a message from USER, not `automatic` (a user-owned trigger's message
         # action passes it, §8), whose resolved recipients include the asker of `swarm.pending_question()` (looked up
         # with getattr: FakeSwarm has none) gets `reply_to` = the question's id when it has none; after the store and
@@ -2012,7 +2091,9 @@ job's end wakes it and shows the message in the same wake-up instead of a wake-u
 whole context to read "all" news). `swarm.defer_wake` records it; should its wait end without a wake (the busy window
 of a server ended, its end became quiet), the scheduler's `_wake_deferred` wakes it. Personal messages (also to several
 named members, or "all" plus its name), every message of the user (its "all" included), reviews, assignments and
-notifications wake as always. The sender's result is unchanged.
+notifications wake as always. The sender's result is unchanged. In a thread session a member's new post that
+reaches a member only through its `feed` subscriptions in `wake` follows the same rule (`notify(..., defer=True)`,
+§22.3 "Quiet new posts").
 
 ## 6. Agent runtime (agent.py)
 
@@ -2034,24 +2115,31 @@ the compaction request, or an overflow of the main call) the agent compacts with
 a digest of its latest steps + the kept texts. The system prompt is frozen in `agents.system_prompt` at
 creation, and the tools array is frozen per agent (below; agent-built MCP tools go through `mcp_call`). New rules
 reach existing members through tool results and notifications, and new tools at their next compaction.
+In a thread session `compaction_request` and `compacted` are replaced by `compaction_request_thread` and
+`compacted_thread`, and while the goal is active the summary message also gets the `my_goal_vote` line, after the
+notes (§22.6).
 
 **Frozen tool sets** (tools/frozen.py). The tools array is part of the prompt prefix that thinking blocks are bound
 to, so every LLM agent sends exactly the array it was given, and the array changes only where nothing is bound to
 it:
-- Every released LLM tool set is a numbered **revision** (`{"revision": N, "en": [...], "ru": [...]}`), never
-  edited, and a number is never reused. The revisions a session this version opens can hold, from
-  `OLDEST_OPEN_REVISION` to `TOOLSET_REVISION`, are shipped as `tools/snapshots/llm_r<N>.json`. `TOOLSET_REVISION`
-  (now 5: `task_create` and `task_update` gain `crew` and `directions`, §4.2) is what `schemas_for("llm", language)`
-  builds.
-- Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
-  tool order round-trip exactly). `AgentRuntime.__init__` (`_load_tools`) reads it; an agent without a usable one
-  (`frozen.valid`, below) gets `frozen.current_record(language)`, written at once: a session this version opens
+- Every released LLM tool set is a numbered **revision** (`{"revision": N, "en": [...], "ru": [...]}`, a thread
+  set also `"mode": "thread"`), never edited, and a number is never reused: one numbering for both session modes,
+  each number belonging to one mode (§22.5). The revisions a session this version opens can hold, from
+  `OLDEST_OPEN_REVISION` to `NEWEST_REVISION`, are shipped as `tools/snapshots/llm_r<N>.json` (board) and
+  `llm_thread_r<N>.json` (thread). `TOOLSET_REVISIONS[mode]` (now board 5: `task_create` and `task_update` gain
+  `crew` and `directions`, §4.2; thread 6, §22.5) is what `schemas_for("llm", language, mode)` builds.
+- Record: kv `tools:<name>` = `{"rev", "language", "tools", "mode"}` (§2; no `mode` = board), stored through
+  `db.set` (`db.dumps`: key and tool order round-trip exactly). `AgentRuntime.__init__` (`_load_tools`) reads it
+  with the session's mode; an agent without a usable one (`frozen.valid`, below; a record of the other mode is
+  unusable too, §22.5) gets `frozen.current_record(language, swarm.mode)`, written at once: a session this version
+  opens
   has no agent with a history and no usable record (§17.2 "Sessions of an earlier version"), so a missing record
   means the agent never ran; `member_tool_names` follows the same rule. View-only loads (no runtime) write nothing.
 - `AgentRuntime`: `tools_rev`, `tools` (the record's list, passed unchanged to `llm.complete`), `tool_names`
   (frozenset), `tool_parameters(name) -> dict | None` (None: the agent lacks that tool).
-- **Upgrade at compaction only**: `_replace_with_summary` moves an agent whose `tools_rev != TOOLSET_REVISION` to
-  `frozen.current_record(language)` (`!=`: after a code downgrade it realigns too); the record is written in the same
+- **Upgrade at compaction only**: `_replace_with_summary` moves an agent whose `tools_rev !=
+  TOOLSET_REVISIONS[swarm.mode]` to `frozen.current_record(language, swarm.mode)`, never across modes (`!=`: after
+  a code downgrade it realigns too); the record is written in the same
   `db.transaction()` as the history rewrite (`_replace_history(messages, tools=)`), and the new history holds no
   assistant turn bound to the old array. The compaction request itself still sends the old array. Downgrading the
   code below a session's newest revision is unsupported. When the upgrade adds tools, the summary message gets
@@ -2059,24 +2147,28 @@ it:
   no tool (only properties or descriptions) gets no such line. `agent.compacted` data and the compaction span meta
   carry `tools_revision`.
 - **Oldest revision opened**: `OLDEST_OPEN_REVISION = 5`, a fixed constant (the revision of crew tasks, 0.2.0; never
-  derived from `TOOLSET_REVISION`, so a later revision still opens sessions of revision 5). A session with a member
+  derived from `TOOLSET_REVISIONS`, so a later revision still opens sessions of revision 5; one literal for both
+  modes: the thread set, revision 6, is not below it). A session with a member
   recorded below it, or with an agent that has a history and no record (it ran before tool sets were frozen), was
   made by an earlier version and is not opened (§17.2 "Sessions of an earlier version"): no session this version
   opens builds a runtime below revision 5 (`AgentRuntime` itself does not check: the check is the session's), and
   the upgrade at compaction moves only revisions 5 and later. Only the revisions from `OLDEST_OPEN_REVISION` on are
   shipped (tests/test_frozen_tools.py checks that exactly these are, and that each stays served, §12 R0′).
   `frozen.for_span` reads them for trace spans recorded before an agent's last upgrade. `--check` compares only the
-  current revision's file.
-- `frozen` API: `kv_key(name)`, `normalize(tools)`, `revisions()`, `snapshot(rev, language)` (a fresh copy; unknown
-  language → en), `current(language)`, `record(rev, language, tools)`, `current_record(language)`,
-  `valid(rec) -> bool` (a dict with an integer, non-bool `rev` and `tools` a list of dicts with a str `name` and a
-  dict `parameters`; shared by `read` and `db.made_by_earlier_version`),
-  `read(db, name) -> dict | None` (a record that is not `valid` is logged and ignored),
-  `write(db, name, rec)`, `names(tools)`, `for_span(db, name, language, revision)` (§16), `member_tool_names(swarm,
-  member) -> frozenset` (a runtime's names, else the record or the set its first start will freeze, nothing
-  written; the live registry for external members and the user). `python -m dreamteam.tools.frozen --write
-  [--force]` writes `llm_r{TOOLSET_REVISION}.json` (exit 2 when a different file exists: a released revision is
-  never edited), `--check` exits 1 when the code differs from it.
+  current revisions' files (one per mode).
+- `frozen` API: `kv_key(name)`, `normalize(tools)`, `revisions(mode=None)`, `mode_of(rev)`, `snapshot(rev,
+  language)` (a fresh copy, found by its number whatever the mode; unknown language → en), `current(language,
+  mode="board")`, `record(rev, language, tools, mode="board")`, `current_record(language, mode="board")`,
+  `valid(rec) -> bool` (a dict with an integer, non-bool `rev`, `tools` a list of dicts with a str `name` and a
+  dict `parameters`, and `mode` absent or in `MODES`; shared by `read` and `db.made_by_earlier_version`),
+  `read(db, name, mode=None) -> dict | None` (a record that is not `valid`, or one of another mode than `mode`, is
+  logged and ignored), `write(db, name, rec)`, `names(tools)`, `for_span(db, name, language, revision)` (§16),
+  `member_tool_names(swarm, member) -> frozenset` (a runtime's names, else the record or the set its first start
+  will freeze in the session's mode, nothing written; the live registry of the session's mode for external
+  members and the user); `TOOLSET_REVISIONS`, `NEWEST_REVISION`, `OLDEST_OPEN_REVISION`, `MODES` (§22.5).
+  `python -m dreamteam.tools.frozen --write [--force] [--mode board|thread]` writes the current file of every mode,
+  or of one (`llm_r5.json`, `llm_thread_r6.json`; exit 2 when a different file exists: a released revision is
+  never edited), `--check` exits 1 when the code differs from one of them.
 
 ### 6.2 Loop
 ```python
@@ -2106,9 +2198,13 @@ class AgentRuntime:
   emit `agent.activity` events (thinking summary / text / tool call / tool result, truncated 2000
   chars), count the reply in `llm_steps`, execute tool calls sequentially via `tools.call_tool`, append results
   (`_run_tools` cuts each one for the model to `agents.tool_output_chars` with `shell.truncate_middle`; the trace
-  keeps the whole text, §16.1), call `swarm.hint_planner(name)` (§3 scheduler item 4; never raises); after tools, if
+  keeps the whole text, §16.1), call `swarm.hint_planner(name)` (§3 scheduler item 4; in a thread session only its
+  clarify branch, §22.4; never raises); after tools, if
   `render_wake(name, incoming=True)` returns text, append it as a user message. Stops when: `wait` was
-  called, no tool calls (a `nudge` once per in_progress task the agent holds, except a clarify planning task it
+  called (not a `wait` that follows a read-before-write refusal in the same response: it is not run, nor are
+  `task_complete`, `goal_complete` and a `vote` like on `#1`, §7.3 "A `wait` after a refusal"), no tool calls (a
+  `nudge` once per in_progress task the agent holds (never in a thread session, §22.7), except a clarify planning
+  task it
   waits for the user's answers about, `swarm.asks_user` looked up with getattr, §3.1, and a crew task with open
   directions, §3 item 3, unless one is free and its owner, working on none of them, could take it: then the nudge
   is the "free directions" sentence of §4.2 "Finishing" (Liveness; `Swarm.crew_nudge(name, tasks)`, looked up with
@@ -2156,6 +2252,8 @@ class AgentRuntime:
 * State changes emit `agent.status` {name, status}; persisted in `agents.status`.
 
 ### 6.3 Wake-up text (render_wake)
+In a thread session the wake-up is §22.6's (no task lines, a `digest` group, the vote line); below is the board's.
+
 `wake_header` (or `incoming_header`), then (not for incoming, only while the user's wrap-up mode is on, §3) the one-line
 `wrap_up_line` ("Wrap-up mode (the user): start no new computations or background jobs; finish your tasks with what
 you have."), `reasons:` then one bullet per undelivered notification text and
@@ -2187,7 +2285,10 @@ wrap-up: finish what is nearly done and start nothing large.` (it echoes `n_budg
 конца то, что почти готово, и не начинай ничего большого.»); rule 10 ends with ``A process you start with & or
 nohup that `jobs` does not list is not tracked: its end wakes nobody.`` (ru «Процесс, запущенный через & или
 nohup, которого нет в списке `jobs`, не отслеживается: его завершение никого не разбудит.»; `jobs` in both, so the
-backticked identifiers still match).
+backticked identifiers still match); rule 4 ("Doing") gains the file sentence of §7.3 "Texts" after its "Take
+small steps" sentence (en and ru, pinned there). A thread session's members get `SYSTEM_THREAD_EN` /
+`SYSTEM_THREAD_RU` instead (§22.6), which keep these sentences (the budget one in its thread wording, the file one in
+rule 3).
 
 The **Skills index** (§19 "Delivery to agents"; never for external members, never in an incoming render): with skills
 attached, the full `skills_index` (or `skills_index_own` when the member's role lists one of them) once per agent
@@ -2232,6 +2333,9 @@ class Workspace:
     def resolve(self, path: str) -> Path         # inside root (no escape, no .git); ToolError otherwise
     def rel(self, p: Path) -> str                # posix relative path
     def read(self, path: str, offset: int = 1, limit: int = 400) -> str   # lines offset..offset+limit-1, header "[path: lines a-b of N]"; binary -> ToolError
+        # read(path, offset, limit, actor=None): for a member actor (and its seen_as members) also records the
+        # file read mark (the sha256 of the whole bytes read and the lines shown), in both modes (§7.3)
+    def drop_file_reads(self, name: str) -> int  # retire: deletes the member's file read marks (kv rows, §7.3)
     async def write(self, actor: str, path: str, content: str) -> str
     async def edit(self, actor: str, path: str, old: str, new: str, replace_all: bool = False) -> str
         # both refuse a path under SKILLS_MIRROR (`.scratch/_skills`, a lexical check on the resolved relative path,
@@ -2244,6 +2348,9 @@ class Workspace:
         # write and edit write in one checked step: refused when the file's folder now resolves outside the
         # workspace, the file became a link, or it has another hard link (st_nlink > 1, checked on the opened file
         # before it is truncated; resolve() cannot see a hard link); reading such a file is allowed
+        # for a member actor, both also refuse an existing file it has not read in its current content (write:
+        # every line of it; edit of a binary file: not checked), after the lock check and under _io_lock, and move
+        # the member's mark; in both modes (§7.3)
     def list(self, path: str = ".", depth: int = 2) -> str   # tree text, dirs end with "/", skips .git, sizes;
         # folders named `.scratch` are shown collapsed like the NO_EXPAND ones (".scratch/ (2 entries)"), so the
         # agents' temporary files do not inflate every listing; list(".scratch/<slug>") lists them; tree() (the
@@ -2290,14 +2397,19 @@ class Workspace:
 Writes/edits check locks, create parent dirs, write UTF-8, emit `file.changed` {path, op} (the actor is
 the event's top-level `actor`), then commit that path; a path under `.scratch/` is written and emits
 `file.changed` but is never committed, and the result says so (`Created .scratch/anna.smith/c.py (1 line, 9 B)
-(in .scratch/: not committed).`). Lock events: `file.locked` {path, owner, expires_at, refreshed},
+(in .scratch/: not committed).`). In a thread session (`Workspace.commit_events`) a whole-tree autocommit and each
+per-owner commit of held new files also emit `files.committed` (§22.2), which `file` subscriptions follow (§22.3);
+`file.changed` itself is unchanged. In both modes a member's write or edit of an existing file is also refused, after
+the lock check, while the member has not read the file's current content (by content hash, whoever changed it), and
+the refusal shows that content (§7.3). Lock events: `file.locked` {path, owner, expires_at, refreshed},
 `file.unlocked` {path, owner, forced} or {path, owner, expired: true}. Unless the folder is adopted (below),
 `init()` also writes repo-local settings (`_configure_repo`: core.autocrlf=false, commit.gpgsign=false, on
 Windows core.longpaths=true, and a default identity), so that git commands run from the shell behave like the
 autocommits (line endings, long paths, no signing); an agent's own commits carry its identity from the shell
 environment (`agent_git_env`, below).
 
-**Lock waiters.** A lock is advisory: only `write_file`, `edit_file` and `lock_file` check it (`shell` does not).
+**Lock waiters.** A lock is advisory: only `write_file`, `edit_file` and `lock_file` check it (`shell` does not). A
+write that passes the lock check still needs a fresh read (§7.3, both modes): a lock is no proof of it.
 A lock blocks another owner's lock on the same path, a folder above it or a path under it, and another owner's
 write or edit of a path it covers. These refusals, and a member's `lock_file` unlock=true of someone else's lock,
 are English ToolErrors that keep `'{rel}' is locked by X until HH:MM (N min left)[ (lock on '{path}')]` (the unlock:
@@ -2926,6 +3038,8 @@ def shown_log(log) -> str                                # a data_dir log with "
 | `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`, on Linux also `nohup timeout N cmd &`, `setsid cmd &` and a daemon that keeps its environment, which leave the group but keep the token (§7 "Process layer"); with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
 
 `wakes(job)` is that last column; `awaited(owner)` = the owner's running jobs with `wakes(job)`.
+In a thread session (§22.7) "the owner holds an in_progress task" in the last two columns, and in `busy` below,
+reads "the goal is active" (`JobManager._works_on(name)`, used by `busy` and `wakes`).
 
 **A call** — `JobManager.run(actor, command, *, timeout, env, max_output, background=False) -> ShellOutcome`:
 - Refused (ToolError) while the session stops: `The session is stopping: no new commands are started.`; for a
@@ -2936,7 +3050,8 @@ def shown_log(log) -> str                                # a data_dir log with "
   max_jobs_per_member or max_jobs is 0): run the command without background.`; with `background` in the user's
   wrap-up mode (below): `The user asked the team to wrap up, so no new background jobs are started. If the command is
   quick, run it without background (it is stopped at its timeout); otherwise finish your task with what you have
-  (task_complete with the result so far and what is left).` (nothing starts).
+  (task_complete with the result so far and what is left).` (nothing starts; in a thread session
+  `jobs.WRAP_UP_ERROR_THREAD`, §22.7).
 - Wait: `BACKGROUND_GRACE` (2 s) with `background`, else `timeout`. With `background_on_timeout` an AI agent waits at
   most `[shell] foreground_max` (180 s; blocked in a long command it would see no message, comment or review), an
   external member at most `EXTERNAL_WAIT_MAX` (600 s, below the stdio proxy's read timeout of 700 s). Without
@@ -2983,7 +3098,8 @@ def shown_log(log) -> str                                # a data_dir log with "
 or external, never for the user): no command becomes a NEW job. `background=true` is refused before anything starts
 (the error above); a foreground command still running at its timeout is killed then, like `background_on_timeout`
 off, with the note `wrap_up` ("It was not moved to the background: the user asked the team to wrap up, so no new
-background jobs are started. Finish your task with the results you have and say what is left."), an AI agent waiting
+background jobs are started. Finish your task with the results you have and say what is left."; in a thread session
+`jobs.NOTES_THREAD["wrap_up"]`, §22.7), an AI agent waiting
 up to its own `timeout`, not `foreground_max`; processes a command leaves running after its shell exited are killed
 at its end (`leftovers_killed`, note `wrap_up_left`: "They were not kept as a background job: …"), except for a
 `background=true` call accepted before the mode began. Jobs started before keep running (their owners may
@@ -3264,6 +3380,311 @@ hint says to restart `dreamteam sandbox` (it then adds the firewall, `docker.wan
   detected yet)}; the session summary has `network` ("on"/"off"); the launcher's `GET /api/settings` has
   `network_isolation`.
 
+### 7.3 Read before write (files)
+The owner's decisions of 2026-11-27. After a thread session in which an agent overwrote a file another had written a
+minute before without ever reading it (§22.11): **a member overwrites or edits an existing workspace file only while
+it has read the file's current content**; the same day the owner extended this file rule to board sessions. So it
+holds in **both modes**, with one implementation, one storage and the same texts. What a member has read is its
+**file read mark**; a `write_file` or `edit_file` of a file that changed since, or that the member never read, is
+refused, and the refusal shows the current content and counts as reading it, so a retry passes if the member still
+wants it. A thread session applies the same principle to posts and the feed (§22.11); that part stays thread only:
+the board has no forum, and its claims are atomic already (`task_claim`, §4).
+- **Who.** Every active member (`swarm.is_member`), an AI agent or one that joined through MCP (a call with
+  `as_agent`), is checked and has marks. An actor that is no member is never checked and records nothing: USER
+  (`write_file` and `edit_file` have no user audience, §12) and the swarm's own writes. A mark moves for the call's
+  actor when it is a member and, in the same step, for every member in `mailbox.seen_as(actor)` during that call (§5
+  `sent_as_seen_by`: an MCP client that acts as several members, or reads as USER and listens as its member, has
+  seen what it read or wrote), USER's `read_file` included. A mark moves only for names that are members
+  (`swarm.is_member`) at the moment of the move, the actor and each `seen_as` name alike: `HubClients.members_of`
+  keeps every member a client ever acted as, a retired one included, and a write of a leaving member can end after
+  its retire's `drop_file_reads` (a write's mark moves after the awaited `_store`), so neither leaves a row that
+  nothing deletes. A check compares only the member's own mark with the file's bytes: a change is found by content,
+  whoever made it.
+- **Not checked**: `read_file`, `list_files`, `lock_file`, `shell`, jobs and a new file. What `shell`, jobs, git or
+  the user's editor write is found by content at the member's next `write_file` or `edit_file` (below).
+
+**Marks** (kv, one row per member and file)
+- Key `file_read:<member>:<path key>` (`workspace.FILE_READ_PREFIX` = `file_read:`): `<member>` the canonical member
+  name (generated names hold no `:`, `names.generate_name`), `<path key>` the file's `workspace.path_key` (the
+  relative posix path, case-folded on Windows). Value (a JSON string, `Database.set`): `<sha256>` for a **whole**
+  mark, every line seen at that hash, or `<sha256>:<ranges>` for a **partial** one, `<ranges>` the merged 1-based
+  line ranges seen, as `1-400,801-1200`, possibly empty; `<sha256>` is the hex digest of the file's bytes the member
+  last read or wrote. A move is one `Database.set` (an upsert on kv's primary key), a check one `Database.get`.
+- `Workspace.drop_file_reads(name) -> int` deletes the member's rows (`DELETE FROM kv WHERE substr(key, 1, ?) = ?`,
+  the prefix `file_read:<name>:`); `Swarm.retire` calls it next to `release_all`, in both modes (§3 `retire`). Names
+  are never reused (§3), so this only keeps kv small. Nothing else resets a mark: not a compaction (the summary keeps
+  what the member decided, and every change after a mark still blocks), a restart, a reconnect or a welcome back
+  (`join_swarm(name=)` is the same member), a new goal, or a workspace switch or move (the hashes match or not).
+- **Why kv, in both modes.** A board database must stay importable into 0.4.x. Its import (0.4.1's
+  `transfer._check_export_db`) refuses a database with a `table.column` it does not know (`db.unknown_columns`:
+  anything outside its `SCHEMA`, the trace tables and `ADDED_COLUMNS`) or an index, trigger or view it does not
+  create (`db.foreign_objects`), and it reads kv only by exact keys and by the `tools:` prefix
+  (`max_tools_revision`, `made_by_earlier_version`). So 0.4.x ignores no table, and a kv row of a new key is what it
+  ignores: no table goes into `SCHEMA` (it would land in every board database and make every board export of this
+  version unimportable there, §22.1 "Why not in `SCHEMA`"), and no forum table goes into a board database. A thread
+  session keeps its file marks in the same rows, not in `read_marks` (the forum's marks of posts and comments,
+  §22.11), so `Workspace` needs neither the mode nor the forum: one code path and one storage for both modes, with
+  no `FORMAT_VERSION` bump, no `ADDED_COLUMNS` entry and no manifest change.
+- **Rejected.** One JSON per member (`file_reads:<member>`, like `wait_progress:<actor>`): each `read_file` page
+  would rewrite the member's whole dict (hundreds of files with their ranges), and two moves of one member would need
+  a transaction not to lose each other's update; a row per file is one upsert, a check one primary-key read. Memory
+  only: lost at every restart (a hub update included), so each member would be refused once per file it writes
+  again, safe but in every session after every restart. The price of kv: about members × files read rows, which
+  nothing lists (every kv reader takes one key; the unindexed `tools:` prefix scans, `made_by_earlier_version` in
+  `read_stats` among them, also step over these short rows), and a prefix delete at retire.
+- A session that 0.4.x runs meanwhile keeps the rows and moves none: a mark of a file its members changed no longer
+  matches, so the next write there is refused once, the safe direction.
+
+**What moves a mark.** Always to what was shown or written, never to "the current state at the time of the move".
+- A member's `read_file` records the lines its result showed: `Workspace.read(path, offset, limit, actor=None)` gains
+  `actor` (the handler passes `ctx.actor`) and hashes the bytes it already reads whole (§7), not a second read. The
+  lines are `offset` to the last line `_fit` showed; a single line that `_fit` cut to its head counts as seen (no tool
+  shows more of a line). At the mark's hash the ranges merge, and once they cover every line the mark becomes whole
+  (a whole mark stays whole); at another hash the read replaces the mark. An empty file records a whole mark of the
+  hash of no bytes; a binary file is never read (read()'s ToolError).
+- Why a part is not enough for every write: `edit_file`'s exact `old_text` match guards the region it edits, so any
+  mark at the current hash, a partial one included, lets it pass; `write_file` replaces the whole file, so over an
+  existing file it needs a whole mark, else it could drop lines the member never saw (the incident, on a long file).
+- A member's own `write_file` moves its mark to a whole mark of the data written once `_store` succeeded, its early
+  `… unchanged (same content).` too (the member's content is the file's). `edit_file` moves it to the edited bytes'
+  hash, whole when the mark was whole and partial with no ranges otherwise (the edit moved lines, and the member
+  still has not seen the rest), so a later `write_file` needs the whole file read.
+- A write whose call was cancelled moves nothing (`_late_write_ended`): the next write is refused once, safely.
+- `list_files`, `shell` (a `cat` too), jobs, `file_changed` triggers and, in a thread session, `f_file` items and
+  `files.committed` move nothing: they carry no content, or what they showed is unknown.
+
+**The check** runs inside `Workspace._io_lock`, the section that already holds `check_writable`, the read of the
+current bytes and `_store_and_commit`, so two `write_file` / `edit_file` calls never interleave. It comes after
+`check_writable`: a lock refusal comes first and records its lock waiter as now, and a passing lock check clears the
+member's waiter row of the path as now, whatever follows. A read refusal records no waiter (nothing is to be waited
+for: the refusal shows the content or `read_file` gets it), so `waits_for_lock` and the nudge of §6.2 are unchanged.
+- `write_file` of an existing file, after its same-content return: refused when the member has no mark for the path,
+  its hash differs from the sha256 of the current bytes (read under the lock, as write() reads them already), or the
+  mark is partial. `edit_file`: refused when there is no mark or its hash differs (a partial mark at the current
+  hash passes), on the bytes it reads before `_apply_edit`, so an edit of a changed file is refused even when its
+  `old_text` still matches (a change elsewhere can break it).
+- `edit_file` of a binary file (a NUL in its first `BINARY_PROBE_BYTES`) skips the check: `_apply_edit` refuses it as
+  now (`'x' is a binary file; it cannot be edited as text.`), so the member is never told by a read refusal to resend
+  an edit that cannot work. Only `write_file` meets the binary refusal below.
+- Passes with no read: a path that does not exist (a new file, also one deleted since the member read it), a file of
+  0 bytes (nothing can be lost), and the member's own scratch folder `scratch_rel(actor)` (private; its jobs' logs
+  live there), whose reads and writes record no marks. Other members' scratch folders follow the rule;
+  `.scratch/_skills` keeps its own refusal (§7).
+- **By content, not by who.** The hash compares the bytes the member last read or wrote with the bytes there now, so
+  a change by another member, by a `shell` command or a job (the member's own included: a formatter, `sed`, a
+  generator), by git (`checkout`, `stash`, `pull`) or by the user's editor counts alike, whether or not an event or a
+  commit showed it, with `[workspace] git` off too. A `shell` write between the check and `_store` cannot be stopped
+  (shell is not under `_io_lock`, as it is not under locks, §7): the rule narrows that window to one write.
+
+**The refusal** (`ReadRefusal`, below; the first lines in the member's language, `swarm.language_of`, from
+`workspace.UNREAD_FILE_TEXTS` {"en", "ru"}, en for an unknown language). `{why}`: `exists, and you have not read it`
+/ `уже существует, а ты его не читал(а)` (no mark), `changed since you last read or wrote it` / `изменился с тех пор,
+как ты его читал(а) или писал(а)` (another hash), and for `write_file` `has lines you have not read since it last
+changed ({missing})` / `содержит строки, которые ты не читал(а) с тех пор, как он изменился ({missing})` (a partial
+mark at the current hash; `{missing}` the line ranges not in it, at most 10, then `, …`, or `all` for a partial mark
+with no ranges); `{size}` `format_size` of the current bytes. en ``Not written: '{rel}' {why} ({size}). You may
+overwrite or edit a file only after reading its current content (another member, a command or git may have changed
+it).`` / ru ``Не записано: '{rel}' {why} ({size}). Перезаписывать или править файл можно, только прочитав его текущее
+содержимое (его мог изменить другой участник, команда или git).``, then one of:
+- it fits: en ``Its current content is below and now counts as read: if your change still fits it, send it again
+  (for `edit_file`, copy old_text from this text).`` / ru ``Его текущее содержимое ниже и теперь считается
+  прочитанным: если твое изменение ему еще подходит, отправь его снова (для `edit_file` копируй old_text из этого
+  текста).``, then read()'s rendering of the whole file (`[rel: lines 1-N of N]` and its lines); the mark moves to a
+  whole mark of the bytes shown;
+- too long, `edit_file`: en ``It is too long to show here (lines: {lines}): read it with `read_file` (offset and
+  limit; for `edit_file` the part you change is enough), then send your change again.`` / ru ``Он слишком длинный,
+  чтобы показать его здесь (строк: {lines}): прочитай его через `read_file` (offset и limit; для `edit_file`
+  достаточно той части, которую ты меняешь), затем отправь изменение снова.``; nothing moves, and any `read_file`
+  page of it moves the mark (above);
+- too long, `write_file`: en ``It is too long to show here (lines: {lines}): `write_file` replaces the whole file, so
+  read with `read_file` (offset and limit) every line you have not read since it changed, or change it with
+  `edit_file`; then send your change again.`` / ru ``Он слишком длинный, чтобы показать его здесь (строк: {lines}):
+  `write_file` заменяет весь файл, поэтому прочитай через `read_file` (offset и limit) все строки, которые ты не
+  читал(а) с тех пор, как он изменился, или измени его через `edit_file`; затем отправь изменение снова.``; nothing
+  moves (the `{why}` above names the missing ranges when the mark is partial);
+- binary (`write_file` only): en ``It is a binary file, which `read_file` cannot show; this refusal counts as reading
+  it: send your change again if it is still right.`` / ru ``Это двоичный файл, `read_file` его не покажет; этот отказ
+  считается его прочтением: отправь изменение снова, если оно еще верно.``; the mark moves to a whole mark of its
+  hash.
+- **The limit.** The content is shown when read()'s `_fit` of lines 1..N shows every line uncut within
+  `Workspace._max_chars()` less the refusal's own lines and `workspace.REFUSAL_RESERVE` = 300 characters (the `Error: `
+  prefix and any note `call_tool` adds; the forum's refusals, §22.11, import the same constant); with the default
+  12 000 that is a file of about 11 000 characters (the incident's files had 1.9k to 6.3k). Beyond it the member
+  calls `read_file`: a refusal never shows a part of a file and calls it read, and a `read_file` page is recorded as
+  that part only ("What moves a mark").
+- The marks of `write_file` and `edit_file`, and their refusals' marks, are single kv upserts under `_io_lock` (no
+  transaction spans the threaded store and the git await, §7), a refusal's before its ToolError. `read_file`'s mark
+  is a plain read-merge-upsert outside it: `Workspace.read` is synchronous and never takes the asyncio lock, and it
+  needs none, since the mark records the hash of the bytes that read returned, so a race with a write can at worst
+  cost one more refusal.
+
+**A `wait` after a refusal** (both modes: the file refusals here and the forum's of §22.11). An LLM agent's response
+runs all its calls in order (§6.2), and the prompts ask for `wait` at the end of every turn and for independent calls
+in one response, so `[edit_file, wait]` (in a thread session also `[comment, wait]`) is the usual shape: a refused
+write followed by `wait` would end the activation before the member could decide again, and nothing would wake it for
+that news (its marks moved). So every read-before-write refusal is a `ReadRefusal(ToolError)` (`models.py`, a
+subclass: every surface treats it as a ToolError). `call_tool`, which turns a ToolError into an error result, catches
+`ReadRefusal` before `ToolError` and, when `ctx.runtime` is not None, sets `ctx.runtime.read_refused = name` (the
+refused tool's name, for the `{tool}` of the texts below; a later refusal in the response replaces it), a setattr
+guarded as its `getattr(ctx.runtime, "tool_parameters", None)` is, since tool tests pass simpler runtimes. The other
+surfaces (the hub, `/api/act`) have runtime None and get no flag. `AgentRuntime._run_tools` sets
+`self.read_refused = None` before its loop, so the flag lasts one response; while it is set, these later calls of
+the same response are not run (each hold reads `getattr(ctx.runtime, "read_refused", None)` and formats `{tool}`
+from it):
+- `wait` (no `end_turn()`): its result is the error of `prompts.TEXTS` key `wait_refused` (a shared key, §22.6 "Keys
+  by mode") in the member's language, en ``Not waiting: your `{tool}` above was refused because of what you had not
+  read. Decide on it first (send it again or drop it), then call `wait`.`` / ru ``Не жду: твой вызов `{tool}` выше
+  отклонен из-за того, чего ты не читал(а). Сначала реши, как с ним быть (отправь снова или откажись), затем вызови
+  `wait`.``, and the activation goes on to its next step;
+- `task_complete` (board sessions; the task would go to review, or be done, without the refused change): its result
+  is the error of key `complete_refused` (`BOARD_KEYS`), en ``Not completed: your `{tool}` above was refused because
+  of what you had not read, so the task may lack that change. Decide on it first (send it again or drop it), then
+  call `task_complete`.`` / ru ``Не завершено: твой вызов `{tool}` выше отклонен из-за того, чего ты не читал(а),
+  так что в задаче может не хватать этого изменения. Сначала реши, как с ним быть (отправь снова или откажись),
+  затем вызови `task_complete`.``; the board is not touched;
+- `goal_complete` (board sessions; the whole goal would be declared reached without the refused change, and the
+  member would get no step to decide again): its result is the error of key `goal_complete_refused` (`BOARD_KEYS`),
+  en ``Not completed: your `{tool}` above was refused because of what you had not read, so the goal may lack that
+  change. Decide on it first (send it again or drop it), then call `goal_complete`.`` / ru ``Не завершено: твой
+  вызов `{tool}` выше отклонен из-за того, чего ты не читал(а), так что в цели может не хватать этого изменения.
+  Сначала реши, как с ним быть (отправь снова или откажись), затем вызови `goal_complete`.``; the goal is not
+  touched;
+- `vote` with value `like` on `#1` (thread sessions; that like may be the one that meets the rule and completes the
+  goal, §22.4, without the refused change): its result is the error of key `vote_refused` (`THREAD_KEYS`), en ``Not
+  voted: your `{tool}` above was refused because of what you had not read, so the goal may lack that change. Decide
+  on it first (send it again or drop it), then call `vote` on #1.`` / ru ``Не проголосовано: твой вызов `{tool}`
+  выше отклонен из-за того, чего ты не читал(а), так что в цели может не хватать этого изменения. Сначала реши, как
+  с ним быть (отправь снова или откажись), затем вызови `vote` для #1.``; no vote is recorded. A `dislike`, a `none`
+  and a vote on another post run as now: none of them can complete the goal.
+
+A held call's result is stored as any other (a tool row named after the call, `is_error` true), so
+`AgentRuntime._ended_mid_activation` also returns True when the last stored row is a `wait` result with `is_error`
+true: the held `wait`, or any `wait` that did not end the turn (arguments that did not parse, a repaired
+`interrupted` result). A session stopped, or a hub restarted, after `[edit_file (refused), wait (held)]` and before
+the next step's reply is stored therefore gives the member `n_restart` (§3 `start`), with or without open tasks or
+pending events, and it decides again; else the refused write would never be retried and nothing would wake the
+member, the gap the hold closes.
+
+Every other call of the response runs as now (a `read_file` sent after the refused write is the usual repair), and a
+held call in the next response runs as always. Behaviour only: the descriptions and schemas of `wait`,
+`task_complete`, `goal_complete` and `vote` stay frozen; a refusal of another kind (a lock, a hard link, the skills
+mirror) sets no flag. An external member's calls arrive as separate requests, possibly concurrent, and its client
+may send several calls of one turn before it sees any result, as an LLM agent does; the hub cannot see that turn,
+so no hold applies to it: the refusal comes back in its own result, a task sent to review meanwhile is caught
+there, a task done meanwhile is reopened by its creator (§4 `update`), and a goal completed meanwhile by the user
+(`reopen_goal`, §3); its likes on `#1` are never counted (§22.4). "Not in this version" states this limit.
+
+**Texts**
+- `SYSTEM_EN` / `SYSTEM_RU` (the board's, §6.3), "## How you work" rule 4 ("Doing"): after "Take small steps and
+  verify the result (run the code or tests, reread the file)." comes, the rest of the rule as it is:
+  ```text
+     ... Before you overwrite or edit a file, read it: `write_file` or `edit_file` of an existing file is refused if
+     it changed since you last read or wrote it, or you never read it (`write_file` of a long file needs every line
+     read: else use `edit_file`); the refusal shows the current content and then counts as read (a long file it
+     cannot show: read that with `read_file`), so decide again whether your change still fits it. If a contract ...
+  ```
+  ru: «Прежде чем перезаписать или править файл, прочитай его: `write_file` или `edit_file` существующего файла не
+  пройдет, если он изменился с тех пор, как ты его читал(а) или писал(а), или ты его не читал(а) (для `write_file`
+  длинного файла нужно прочитать все его строки, иначе используй `edit_file`); отказ покажет текущее содержимое, и
+  после него оно считается прочитанным (длинный файл, который отказ показать не может, прочитай через `read_file`),
+  так что реши заново, подходит ли ему еще твое изменение.» (е, not the dotted letter, although the rest of
+  `SYSTEM_RU` keeps it). The thread prompts say the same in rule 3 (§22.11 "Texts"). Pinned substrings
+  (tests/test_prompts.py), in all four templates: en "`write_file` or `edit_file` of an existing file is refused if
+  it changed since you last read or wrote it, or you never read it" / ru «`write_file` или `edit_file` существующего
+  файла не пройдет, если он изменился с тех пор, как ты его читал(а) или писал(а), или ты его не читал(а)»; en
+  "`write_file` of a long file needs every line read" / ru «для `write_file` длинного файла нужно прочитать все его
+  строки».
+- `hub_mcp.INSTRUCTIONS` (board; the launcher's `HUB_INSTRUCTIONS` repeat it, §13, §18.2) gains, in the members'
+  side after the max_agents sentence: "As a member, `write_file` and `edit_file` of an existing file are refused
+  while it changed since you last read or wrote it, or you never read it (`write_file` of a long file needs every
+  line read: else use `edit_file`); the refusal shows the current content and counts as reading it (a long file it
+  cannot show: read that with `read_file`), so a retry passes." `INSTRUCTIONS_THREAD` says it in its read-before-write
+  bullet (§22.11 "Texts").
+- Members created before this change keep their frozen prompt (§6.3, §22.6), so every refusal states the rule itself.
+- **The frozen tool sets stay as they are.** No description and no schema changes: `tools/snapshots/llm_r5.json` and
+  `llm_thread_r6.json` are untouched, `TOOLSET_REVISIONS` stays `{"board": 5, "thread": 6}`, and
+  tests/test_frozen_tools.py passes unchanged. Behaviour, refusal texts, results and prompts are not part of a
+  revision (§12 R0′), so this changes revision 5's behaviour in every board session, the existing ones included, as
+  the owner decided. `write_file`'s "Fails if another member locked the file." still holds; it simply is not the only
+  refusal, as the skills mirror's and the hard-link refusals are not either (§7).
+
+**Interactions** (mostly board; a thread session has no tasks)
+- **Locks** (§7 "Lock waiters") are kept next to the marks: a lock holder still needs a fresh read, since `shell`
+  passes locks and the holder's own commands may change the file. The order and the waiter rows: "The check".
+  `n_lock_free`'s "If you still need it, read it again first: it has probably changed" (a shared text, §22.6) is now
+  enforced in both modes and keeps its text; `n_lock_wanted`, `lock_waiter_task` and `held_locks_note` are
+  unchanged.
+- **Tasks.** `task_claim`, `task_update`, `task_comment`, `task_review` and `task_complete` write no file and are not
+  checked (`task_complete` after a refused write in the same response: "A `wait` after a refusal"). Owning a task is
+  no proof of having read the files it touches, which other tasks, the directions of a crew task (§4.2) and commands
+  share. In a crew, one direction's edit of a shared contract (CONTRACTS.md) refuses another direction's next write of
+  that file once, with the new content shown: what the rule is for.
+- **Review** (§4.1): the reviewer reads the files (its marks move) and does not fix the work (rule 6). The owner of a
+  returned task is refused only for the files that changed since its own last read or write (by a reviewer who edited
+  anyway, another member, a command), so a fix of files nobody else touched passes at once.
+- A refused write writes nothing: no `file.changed`, no commit, no `file_changed` trigger, no `f_file`, no lock
+  change; the held new files (§7 "Held new files") are not touched.
+- **Workspace switch or move** (`n_workspace_changed`, `n_workspace_moved`): nothing to do; the hashes match or not.
+
+**Export and import** (§20)
+- The marks are kv rows of `swarm.db` and travel with it in both modes, with no transfer code (transfer has no
+  per-row handling of kv; member names and paths are not remapped, and none need be). `db.known_columns()`,
+  `db.known_objects()` and the manifest's `schema.db_columns` are unchanged.
+- A board session exported by this version still imports into 0.4.x, which ignores kv rows of a new key ("Why kv");
+  a thread session's export is refused there already (§22.9). A mark keyed on Windows (case-folded) may miss on
+  another system after an import: one refusal, the safe direction.
+
+**Not in this version**: blocking the writes of `shell` commands, jobs and git (they are found by content and refuse
+the next tool write); a diff of what changed in a file since the member read it (the refusal shows the current
+content); a setting or switch that turns the rule off, per session or for tests; a hold for an external member's
+calls (a `task_complete`, a `goal_complete` or a like on `#1` sent with a refused write, before its result: "A
+`wait` after a refusal").
+
+**Tests** (tests/test_workspace.py in a board session, its default, and the same cases parametrized for a thread
+session with identical results; the other files named)
+- `write_file` over a file the member never read is refused with the content shown, and then passes; a file changed
+  by another member's `write_file`, by a `shell` command and by a plain write of the test (no event) since the
+  member's `read_file` is refused; one page of `read_file` of a long file lets `edit_file` pass, while `write_file` is
+  refused with the missing ranges named and passes once every page has been read (in any order); after an
+  `edit_file` on a partial mark a `write_file` is refused; a line `_fit` cut counts as seen; a new file, a 0-byte
+  file and the member's own scratch pass with no read; another member's scratch does not; a file larger than the
+  limit gives the "too long" text of its tool and no mark, then `edit_file` passes after one `read_file` page and
+  `write_file` after all of them; a binary file is refused once for `write_file` and then passes, and an `edit_file`
+  of an unread binary file gets `_apply_edit`'s binary error and no read refusal; an `edit_file` whose `old_text`
+  still matches a changed file is refused; a lock refusal comes before the read refusal, records the waiter, and a
+  read refusal after a passing lock check records none and clears the waiter row; two concurrent `write_file` calls
+  of members who read the same content give one write and one refusal; `Workspace.write` with an actor that is no
+  member is never checked and records nothing; a refused write emits no `file.changed` and makes no commit;
+- storage: a mark is the kv row `file_read:<member>:<path key>` with the value formats above; a board database gets
+  no table, column, index or forum table from the rule (tests/test_db_schema.py: `known_columns()` and
+  `known_objects()` unchanged), and a thread database keeps its file marks in kv, none in `read_marks`; a restart, a
+  compaction and a welcome back keep the marks; `drop_file_reads` at retire deletes exactly the member's rows (not
+  those of a member whose name extends it, as `Anna Smith` and `Anna Smith 2`); a client that acted as a member that
+  has since retired writes no row for it when it reads or writes as another member or as USER, and a write of a
+  member that ends after its retire records no row;
+- tests/test_transfer.py: a board session with file marks exported by this version imports into 0.4.1 (the existing
+  0.4.1 check, now with `file_read:` rows) and into this version with its marks; tests/test_transfer_thread.py: a
+  thread export keeps them too;
+- tests/test_runtime.py (ScriptedLLM): `[write_file (refused), wait]` in a board and in a thread session keeps the
+  activation running, the `wait` result is `wait_refused` in the member's language, and the next step's retry
+  passes; `[edit_file (refused), task_complete]` leaves the task in progress with `complete_refused`; `[edit_file
+  (refused), goal_complete]` leaves the goal active with `goal_complete_refused`; in a thread session `[write_file
+  (refused), vote like on #1]` records no vote and gives `vote_refused`, while a `dislike` there is recorded; a
+  `wait` after a lock refusal or another ToolError ends the turn as now, and `[write_file (lock refused),
+  task_complete]` completes the task as now; a `wait`, `task_complete` or `goal_complete` alone in the next response
+  runs; a swarm restarted with a history that ends `[write_file (refused), wait (held)]` gives the member
+  `n_restart` (no open task, no pending event) and its retry passes;
+- MCP (tests/test_hub_clients.py): an external member (`as_agent`) of a board session is refused and marks like an
+  AI agent; a client acting as two members marks for both; USER's `read_file` through such a client marks for its
+  member;
+- the suites that write an existing file as a member (tests/test_workspace.py, tests/test_lock_wake.py,
+  tests/test_held_files.py, tests/test_tools.py and the agent tests among them) read it first or write a new one;
+  none turns the rule off;
+- texts (tests/test_prompts.py): `UNREAD_FILE_TEXTS`, `wait_refused`, `complete_refused`, `goal_complete_refused`
+  and `vote_refused` have the same keys, placeholders and backticked identifiers in en and ru, name only real tools
+  of their revisions, and no ru text contains the dotted letter (U+0451); the pinned substrings above are in all
+  four system prompts; `INSTRUCTIONS` names the file rule; the frozen-tool tests pass with the snapshots unchanged.
+
 ## 8. Triggers (triggers.py)
 
 Condition DSL: a Python *expression* parsed with `ast` and evaluated by a whitelist interpreter
@@ -3291,11 +3712,16 @@ chars / 200 AST nodes.
 | `agent_status(name)` | member status |
 | `goal_done()` | global goal status is done |
 
+In a thread session (§22.5) the engine refuses at creation, on every surface, a condition that calls a task function
+(`status`, `done`, `any_done`, `finished`, `failed`, `assignee`, `count`, `all_done`, `comment`) or uses a bare
+task-status name, and the `set_status` and `create_task` actions; its errors end with `GRAMMAR_THREAD` /
+`ACTIONS_HELP_THREAD`. No function reads the forum in v1: posts and comments are followed with subscriptions.
+
 ```python
 class TriggerEngine:
     tick_seconds: float = 2.0
     def __init__(self, swarm): ...
-    def validate(self, condition: str) -> None              # ToolError with the grammar summary on error
+    def validate(self, condition: str) -> None              # ToolError with its mode's grammar summary on error
     def create(self, owner: str, condition: str, *, note: str = "", actions: list[dict] | None = None,
                once: bool = True) -> dict
     def delete(self, actor: str, trigger_id: int) -> None    # owner or USER
@@ -3326,7 +3752,8 @@ true at creation fires on the first evaluation. `once` → deactivated after fir
 `n_trigger_held` while fires are held (both below);
 `message` {to, text} → `mail.send(owner, to, text, automatic=True)` (a user-owned trigger's message never answers
 a question pause, §3.1); `set_status` {task_id, status} →
-`board.update(owner, ...)`; `create_task` {title, goal?, description?, assignee?, tags?, priority?}.
+`board.update(owner, ...)`; `create_task` {title, goal?, description?, assignee?, tags?, priority?} (both board
+sessions only: refused in a thread session, §22.5).
 Action errors are stored in `last_error` and reported to the owner via `n_trigger` note. Evaluation
 errors are stored in `last_error`, not fired. After a fire, `message()`/`comment()`/`file_changed()`/`every()`
 are measured from that fire. A repeating trigger with message/set_status/create_task actions that fires 20
@@ -3445,7 +3872,9 @@ of triggers.py. The check never fires, evaluates or changes a trigger.
 goal.reopened agent.hired agent.retired agent.status agent.activity agent.compacted agent.usage
 file.changed file.locked file.unlocked trigger.created trigger.fired trigger.deleted
 mcp.created mcp.status swarm.paused swarm.resumed swarm.wrap_up swarm.limits job.started job.ended
-skill.attached skill.detached skill.proposed skill.library skill.deps session.started session.stopped`
+skill.attached skill.detached skill.proposed skill.library skill.deps session.started session.stopped
+post.created post.updated post.comment post.vote subscription.changed files.committed` (the last six: the thread
+mode, §22.2)
 
 `session.started` {} and `session.stopped` {reason: `user` | `done` | `budget` | `shutdown` | `restart` | `failed`,
 error?}, actor None: the session manager journals them into the session's own journal when a run starts (right before
@@ -3654,6 +4083,8 @@ class ToolSpec:
     audience: frozenset[str]                # subset of {"llm","external","user"}
     allow_empty: frozenset[str]             # required string args that may be "" (write_file content...)
     order: tuple[int, int]                  # (module rank, definition order): registry order
+    modes: frozenset[str]                   # the session modes that have it (default both, §22.5)
+    variants: dict[str, ToolVariant]        # per-mode texts and schema ("thread"): describe/parameters_for(mode)
 @dataclass
 class ToolContext:
     swarm: Swarm; actor: str; runtime: AgentRuntime | None = None
@@ -3668,10 +4099,14 @@ class ToolContext:
     def has_tool(self, name: str) -> bool    # the caller has that tool: an LLM agent's own frozen set
                                              # (runtime.tool_names, §6.1), else the live registry for ctx.kind;
                                              # results that point at a tool are tailored with it
+    @property mode -> str                    # the session's mode (getattr(swarm, "mode", "board"), §22.5); for
+                                             # callers without a frozen set has_tool also needs ctx.mode in modes
 REGISTRY: dict[str, ToolSpec]               # sorted by `order` once all modules are loaded (import-order free)
-def tool(name, en, ru, properties, required=(), audience=("llm","external","user"), allow_empty=()): decorator
-def tools_for(kind: str) -> list[ToolSpec]
-def schemas_for(kind: str, language: str) -> list[dict]   # [{"name","description","parameters"}], deterministic copies
+def tool(name, en, ru, properties, required=(), audience=("llm","external","user"), allow_empty=(),
+         modes=("board","thread"), thread=None): decorator   # thread: the thread variant (§22.5)
+def tools_for(kind: str, mode: str | None = None) -> list[ToolSpec]   # mode None: both modes
+def schemas_for(kind: str, language: str, mode: str = "board") -> list[dict]   # [{"name","description",
+                                                                     # "parameters"}], deterministic copies
 async def call_tool(ctx: ToolContext, name: str, args: dict) -> tuple[str, bool]
     # rejects actors that are neither USER nor an active member; an LLM agent (a runtime with
     # tool_parameters) calls only the tools of its frozen set, with their frozen parameters: a tool it lacks is
@@ -3684,6 +4119,9 @@ async def call_tool(ctx: ToolContext, name: str, args: dict) -> tuple[str, bool]
     # unknown args are ignored but reported in the result; ToolError -> ("Error: msg", True);
     # UnicodeEncodeError (lone surrogate) -> an "invalid Unicode" error; other exception ->
     # ("Internal error in <tool>: ...", True) + log
+    # a tool outside the session's mode (ToolSpec.modes) is refused before the audience check with the mode
+    # fix-it text; validation uses spec.parameters_for(ctx.mode), the unknown-argument drop
+    # frozen_params or spec.parameters_for(ctx.mode) (§22.5)
 ```
 Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via UI/MCP):
 
@@ -3700,18 +4138,18 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `task_discussion` | task_id, since_id? | LEU |
 | `send_message` | to (string or array), text, reply_to?, pause_swarm? (boolean: a question to "user" that may pause the swarm, §3.1) | LEU |
 | `read_messages` | with?, limit?, include_read? | LEU |
-| `agents` | — (the roster, then the role catalog) | LEU |
+| `agents` | — (the roster, then the role catalog in the session's mode, §22.6) | LEU |
 | `hire_agent` | role, instructions ("" for a catalog role), model?, name? | LEU |
 | `retire_agent` | name?, reason? | LEU |
 | `update_notes` | content | L |
 | `wait` | reason? | L |
-| `goal_complete` | summary | LE |
+| `goal_complete` | summary (board sessions only: a thread session decides by the vote on #1, §22.4) | LE |
 | `trigger_create` | condition, note?, once?, actions? | LEU |
 | `trigger_list` | all? | LEU |
 | `trigger_delete` | trigger_id | LEU |
 | `read_file` | path, offset?, limit? | LEU |
-| `write_file` | path, content | LE |
-| `edit_file` | path, old_text, new_text, replace_all? | LE |
+| `write_file` | path, content (an existing file only after reading it, both modes, §7.3) | LE |
+| `edit_file` | path, old_text, new_text, replace_all? (only after reading the file, both modes, §7.3) | LE |
 | `list_files` | path?, depth? | LEU |
 | `lock_file` | path, minutes?, unlock? | LE |
 | `file_unlock` | path (as it was locked: a member's lock removed by the user, the waiters woken, §7 "Lock waiters") | U |
@@ -3728,7 +4166,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `swarm_status` | brief? (the goal as one line) | EU |
 | `swarm_control` | action (pause/resume; pause while paused changes nothing and says `already paused (<pause_text>)`; resume during a question pause goes on without the answer, §3.1), wrap_up? (true/false: the user's wrap-up mode, §3), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
 | `mcp_approve` | name, approve, comment?, digest? (the `snapshot_digest`, or its start, that `mcp_list` and the MCP card show: refused when the server's differs, §11) | U |
-| `agent_traces` | agent?, trace_id?, span_id?, context?, status?, task?, limit?, offset? | EU (§16.2) |
+| `agent_traces` | agent?, trace_id?, span_id?, context?, status?, task? (board only), limit?, offset? | EU (§16.2) |
 | `skills` | available? (also the library's and Claude Code's skills not attached) | U (§19) |
 | `skill_attach` | name? (a reference: `x`, `library:x`, `claude-user:x`, `claude-project:x`) or source? (a folder or .zip path on the hub's machine, or a Git URL: imported into the library first), pick?, replace? | U (§19) |
 | `skill_detach` | name | U (§19) |
@@ -3736,9 +4174,19 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `skill_reinstall` | name, ecosystem? (`python` or `node`; default both: the skill's packages installed again) | U (§19) |
 | `skill_propose` | path (the skill's folder, or its SKILL.md, in the workspace) | LE (§19) |
 
+In a thread session (§22.5) the board-only tools (`board`, the eight `task_*` tools, `goal_complete`) exist for no
+audience; the forum tools are added (`feed`, `post_read`, `post_create`, `post_update`, `comment`, `vote`: LEU;
+`subscriptions`, `subscribe`, `unsubscribe`: LE); `send_message`, `wait`, `agents`, `retire_agent`, `mcp_create`,
+`trigger_create`, `wait_for_events`, `swarm_status`, `swarm_control` and `agent_traces` have thread variants; the
+LLM set is revision 6. `swarm_control` also takes `complete_goal?` (boolean) and `goal_summary?` (string), thread
+sessions only: the user completes the goal (§22.4).
+
 Tool results are plain text (compact, line-oriented), language = English for data, ToolError texts in
-English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
-`ctx.runtime.note_sent_to_user()` when USER is a recipient.
+English, except the read-before-write refusals and the held calls' `wait_refused`, `complete_refused`,
+`goal_complete_refused` and `vote_refused`, which are in the member's language (§7.3; the forum's refusals,
+§22.11). The `wait` tool calls `ctx.runtime.end_turn()`, unless a read-before-write refusal came earlier in the same
+response (§7.3 "A `wait` after a refusal"). `send_message` calls `ctx.runtime.note_sent_to_user()` when USER is a
+recipient.
 
 `send_message` and `pause_swarm` (§3.1). The description (en and ru) keeps "wakes its recipients" and
 adds that `pause_swarm=true` is only for a question to ["user"] whose answer decides how the team goes on, so that
@@ -3768,12 +4216,15 @@ usage line is `send_message(to, text, reply_to?, pause_swarm?)`. The result star
 Anthropic thinking blocks bind to the exact prefix, so a changed name, description, parameter, `required` list, enum
 or order of a tool with the `llm` audience is released as a new revision, in one change:
 1. change the code;
-2. bump `frozen.TOOLSET_REVISION`;
-3. run `python -m dreamteam.tools.frozen --write` (it writes `tools/snapshots/llm_r<N>.json`);
+2. set the mode's entry of `frozen.TOOLSET_REVISIONS` to `frozen.NEWEST_REVISION + 1` (one numbering for both modes;
+   a change to a tool both arrays share is released in each mode whose array changes, §22.5);
+3. run `python -m dreamteam.tools.frozen --write` (it writes `tools/snapshots/llm_r<N>.json`, or
+   `llm_thread_r<N>.json` for the thread mode);
 4. pin its exact-order digests (`sha256(db.dumps(tools))` per language) in tests/test_frozen_tools.py (`RELEASED`).
 
 Existing agents keep their revision until their next compaction; new agents get the current one. Arguments are
-still validated against the current registry, so the registry must keep serving every shipped revision
+still validated against the current registry (its schema for the session's mode, `parameters_for`, §22.5), so for
+each mode the registry must keep serving every shipped revision of that mode
 (tests/test_frozen_tools.py checks it): no tool leaves the `llm` audience, no property is removed or retyped
 (`items.type` included), the current `required` is a subset of every shipped one, enums only grow, a free property
 never gains an enum. Revisions 1-4 were the tool sets of 0.1.x (their sessions are not opened, §17.2); 5 = crew
@@ -3796,13 +4247,15 @@ and when all of them are finished you write the task's result and complete it (c
 again).` (ru « Если задача, над которой ты работаешь, оказалась слишком велика для одного участника, передай crew и
 directions: ты станешь её владельцем, а первое направление — твоя часть; каждое направление сдаётся отдельно, а
 когда все они завершены, ты пишешь итог задачи и завершаешь её (crew 0 снова делает её обычной задачей).»; no
-other tool changed, `task_claim` included). A session with a member below
-`frozen.OLDEST_OPEN_REVISION` (5) is not opened (§6.1, §17.2 "Sessions of an earlier version"), so notifications
-and wake-up texts name only tools and parameters of every shipped revision from 5 on (tests/test_prompts.py),
-crew tasks, `crew` and `directions` included; tool results that point at a newer tool check
+other tool changed, `task_claim` included); 6 = the thread mode's first set (§22.5). A session with a member below
+`frozen.OLDEST_OPEN_REVISION` (5) is not opened (§6.1, §17.2 "Sessions of an earlier version"), so board
+notifications and wake-up texts name only tools and parameters of every shipped board revision from 5 on
+(tests/test_prompts.py), crew tasks, `crew` and `directions` included; tool results that point at a newer tool check
 `ToolContext.has_tool`, and a notification the recipient's frozen record (`frozen.member_tool_names`). `allow_empty`
 is validation only, not part of the schema. Tools of the `user`/`external` audiences only (e.g. `set_goal`) are not
-in the LLM tools array, and external members and the user always see the live registry.
+in the LLM tools array, and external members and the user always see the live registry. The texts rule holds per
+mode (§22.6 "Keys by mode"; tests/test_prompts.py): board texts against the board revisions, thread texts against
+the thread revisions, shared texts against both (so no shared text names crew tasks, `crew` or `directions`).
 
 `trigger_create` and `trigger_list` say what the frozen description cannot (§8), with the settings in force:
 - `trigger_create`: `Trigger #N created: CONDITION (NOTES)` then `; actions: …` when they are not just a wake.
@@ -3853,7 +4306,8 @@ Results and checks of the review and role-catalog flows:
   ~ "Parser crashes on empty input" (1.0); "Benchmark solver on N=100" / "N=200", "Optimize the step function" /
   "Verify the step function", "Compute lower bound for C5" / "upper bound", "Write unit tests for the parser" /
   "for the lexer" (0.67, no goal confirms) and "Implement login page UI" / "Implement login API endpoint" (one shared
-  word) are not.
+  word) are not. `board.similar_items(title, goal, candidates, limit=SIMILAR_MAX)` is the same ranking over any
+  items with `.id`, `.title` and `.goal` (`similar_tasks` is its wrapper); `post_create` uses it for posts (§22.2).
 - `goal_complete` (switch on) is refused while tasks are in review: ``Tasks are still waiting for review: #N
   (reviewer), .... The goal can be completed only after every task is reviewed: call `wait` ...``. The "already
   achieved" check comes first.
@@ -3876,6 +4330,9 @@ Results and checks of the review and role-catalog flows:
   count toward max_agents.
 
 Results of the team, wait and job flows:
+- In a thread session `agents`, `hire_agent`, `retire_agent`, `join_swarm`, `set_goal`, `swarm_status`,
+  `swarm_control`, `shell`'s wrap-up refusal and `wait_for_events(progress=true)` give the thread texts of §22.5
+  (no task, board or planning card).
 - `agents` starts with `AI agents: 2 of max 6, plus 1 external member (not counted).` and the budget line (the
   same team line in `swarm_status`); a member line ends with `, background jobs: j3, j5` while it has running jobs.
 - `swarm_status`: its first line `Swarm "<name>" — running` (or `PAUSED: <Swarm.pause_text()>`: `PAUSED: waiting
@@ -3885,7 +4342,9 @@ Results of the team, wait and job flows:
   new computations or background jobs` while the user's wrap-up mode is on, and with `; CLARIFY MODE: the planning
   task first asks the user, and a member's question to the user with pause_swarm=true pauses the swarm until the user
   answers` while `clarifying`.
-- `swarm_control`: the limits, then `reopen_goal_comment` (which ends wrap-up mode), then `action`, then `wrap_up`;
+- `swarm_control`: in a thread session the refusals of `complete_goal` first (with `reopen_goal_comment`;
+  `goal_summary` without it; nothing applied, §22.4), then the limits, then `reopen_goal_comment` (which ends wrap-up
+  mode) or `complete_goal` (`goal marked reached`), then `action`, then `wrap_up`;
   `pause` while paused changes nothing and is listed as `already paused (<pause_text>)`, so `Done: already paused
   (waiting for the user's answer to Anna Smith's question #12).` during a question pause; `Done: ...` lists what was
   done: `wrap-up mode on: every agent was told to finish its tasks with what it has, and no
@@ -3917,6 +4376,7 @@ Results of the team, wait and job flows:
   such runs with background=true, without & and nohup.`` (English like every result; `wait` ends the activation,
   so the agent reads it only after its next wake-up, hence "the next time"; scheduler item 9 wakes such a team
   later). `team_asleep`, `stall_ids` and `triggers` are looked up with getattr (FakeSwarm, §3: the plain text).
+  In a thread session the `stall_ids` condition is dropped and `team_asleep` has its digest clause (§22.7).
 - `goal_complete` appends, while jobs run, `Note: background jobs are still running: j3 (Anna Smith: npm run dev, 25
   min). Stop the ones nobody needs with job_stop; the rest stop with the session.`
 - `shell`, `jobs`, `job_stop`: §7.1.
@@ -3928,6 +4388,12 @@ Results of the team, wait and job flows:
   calls without progress neither use nor move it) and appended as `Board progress:` / `Прогресс на доске:` with `• `
   lines (at most 20, then ``… and N more: see `board` ``), after the incoming header when nothing else is pending.
   Each progress line starts with the time of its journal event (`• 10:50 #2 Parser: todo → in_progress (Ann Lee)`).
+  In a thread session the progress is the feed's (`Feed:` / «Лента:»: new posts, comments, goal and member events,
+  with the tally of #1 when it changed; votes never end the wait, §22.5).
+- In a thread session `wait_for_events` also returns once the caller's `Swarm.digest_deadline` has passed (each
+  sleep is capped at it): an external member that keeps the feed in `digest` gets its digest about every
+  `[agents] digest_seconds` while it waits; on a timeout the digest items gathered so far still come with the
+  result (§22.3 "Digest items").
 - `wait_for_events` renders with `render_wake(actor, incoming=True, stamps=True, since=<oldest progress line>)`
   (§6.3): one result may hold hours of news (progress collected since the last progress call, notifications queued
   while the client was away), so when it spans more than a minute the header shows the range and every notification
@@ -4011,7 +4477,14 @@ it with the question and the swarm goes on; `swarm_control` action=resume goes o
 is live, so external members see `pause_swarm` at once). The user's side also learns `skills`, `skill_attach`,
 `skill_detach` and `skill_approve` (not for a member the client acts as); the members' side that skills (SKILL.md
 folders under `.scratch/_skills/`) are listed by `join_swarm` and `swarm_status`, and that `skill_propose` proposes
-one.
+one; and the members' side the file rule (`write_file` / `edit_file` of an existing file only after reading it, §7.3
+"Texts").
+
+In a thread session (§22.9) `on_list_tools` lists the E∪U tools of that mode only (`hub_specs(mode)`, the schema of
+`spec.parameters_for(mode)`, `_description(spec, language, mode)`), and `instructions=` is `INSTRUCTIONS_THREAD`: the
+feed, posts, comments, votes and subscriptions, the vote on #1 and the user's direct completion instead of the task
+board. `INSTRUCTIONS` keeps its board text. A tool of the other mode is refused by `call_tool` (§22.5), for every
+surface.
 
 ## 14. Web (web.py) — REST for the UI and the console
 
@@ -4056,6 +4529,7 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 | GET `/api/roles` | `{"language": swarm language, "roles": [{key, name, description, instructions, model, builtin, names, skills}], "hidden": [same]}`: the visible roles of the catalog in the swarm's language (§17.3; the board's hire dialog, the TUI's `/roles`), and the hidden ones, which a hire by name still resolves; `names`: every spelling `roles.find_role` resolves to the role (its name and id, a built-in role's name in either language); also for a stopped session; not in the snapshot (several KB) |
 | GET `/api/hub` | {pid, project, name, version, sandbox}: identity of this hub process (checked against hub.json); `sandbox`: inside the Docker sandbox (the host library is a read-only source, folder paths are the container's) |
 | GET `/api/tasks/{id}` | {task, discussion: [...], events: [...]} |
+| GET `/api/posts/{id}?since_id=` | {post, comments, votes, goal_vote?}: a thread session's post (§22.8); else 404 |
 | GET `/api/messages?with=Name&limit=&since=` | conversation USER↔Name; without `with`: all recent messages |
 | GET `/api/inbox?since_message=&since_notification=` | `{"messages","notifications"}` to USER: with since_* > 0 the ones with a larger id (oldest first, ≤ 500); without, the newest 500 (ascending). `since` = alias of since_message. Messages carry `read` |
 | POST `/api/read` | body `{"with"?: name}`: marks USER's messages (from that member) read → {"ok", "unread"} |
@@ -4075,7 +4549,8 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 **The auto-reply header** `X-DreamTeam-Auto-Reply: 1` (`models.AUTO_REPLY_HEADER`) is sent only by the print client
 of `dreamteam -p` while its automatic replies are on (`HubClient.auto_reply`, docs/TUI.md §2), on every request and on
 the WebSocket handshake; the interactive TUI, the web UI, the console and MCP clients never send it. It holds the
-session's auto-reply lease (§3.1): no planning card asks the user first and no question pauses the swarm. The
+session's auto-reply lease (§3.1): no planning card asks the user first (in a thread session no clarify #2 is
+written, §22.8) and no question pauses the swarm. The
 launcher forwards it to the session apps unchanged (`SessionRouter` passes the scope's headers), and reads it itself
 on `POST /api/sessions` and `/start` (§18.1). Only these refresh the lease: those two launcher routes, `POST
 /api/act/{tool}` and the `/ws` event stream (held while open, then `AUTO_REPLY_GRACE`); the GET routes and `/mcp`
@@ -4112,13 +4587,17 @@ stopped check uses `Swarm.started`.
                                        // pending_goal: the goal a never-started session gets at its first start
            "tracing": bool,
            "independent_review": bool,   // Board.independent_review, read live (§4.1)
+           "mode": "board"|"thread",     // the session's work mode (§22.8; not /api/hub's "mode", not network.mode)
+           "goal_rule": "democracy"|"veto",   // the thread mode's rule (§22.4); in a thread session tasks [],
+                                       // counts all 0, independent_review inert, clarify_wait {"name","post_id": 2}
            "workspace": {"path","default","adopted","exists"},    // Swarm.workspace_info(): the folder the
                                        // members work in (same shape as a session summary's "workspace", §17.2)
            "network": {"mode": "on"|"off", "isolation": "docker"|"netns"|"env"|"container"|null}},   // netoff.describe, §7.2
  "tasks": [Task.to_dict() + {"blocked_by","comments"}],
  "agents": [{"name","kind","role","status","model","language","cost_usd","tokens_in","tokens_out","hired_by",
              "created_at","last_active","instructions","context_tokens","open_tasks":[ids],"unread",
-             "jobs": n}],                  // its running background jobs
+             "jobs": n,                    // its running background jobs
+             "subscriptions": [{"id","kind","target","by","mode","auto"}]}],   // §22.3; [] in a board session
  "triggers": [...],
  "jobs": [job...],                         // JobManager.snapshot(): the running jobs (from memory), then those that
                                            // ended in the last hour (one query, at most 50); the public job dict of
@@ -4136,6 +4615,8 @@ stopped check uses `Swarm.started`.
                                            // "commands"?,"node_modules"?,"linked"?,"view"?,"log"?,"error"?,
                                            // "installer"?,"reason"?,"queued"?,"other_process"?,"seconds"?,...}
  "locks": [...],
+ "posts": [...], "goal_vote": {...}|null,   // the thread mode (§22.8): every post without its text, the vote
+                                           // on #1; [] and null in a board session
  "user": {"unread": n}}
 ```
 
@@ -4265,6 +4746,7 @@ commands of a **home** are in §18.3.
 ```
 dreamteam init [DIR] [--lang ru|en] [--provider anthropic|openai|openrouter|ollama|vllm] [--name N] [--goal G] [--force]
 dreamteam run [DIR] [--goal G] [--host H] [--port P] [--no-console] [--open] [--network on|off]
+    [--mode board|thread] [--goal-rule democracy|veto]   # the mode is fixed when swarm.db is first made (§22.8)
     # one swarm, its board at / (web.serve); refuses when a hub already runs for DIR; --goal sets the goal
     # unless the stored one is active with the same title (compared with split_goal(G)[0], so a multi-line
     # --goal does not reset the goal at every restart); after the banner, settings.unpriced_line (§17.1) on stderr
@@ -4392,8 +4874,11 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
 
 ### 16.2 Tool `agent_traces` (tools/trace_tools.py, audience user + external)
 Arguments: `agent` (member name, retired ones too; optional = all members), `trace_id`, `span_id`, `context`
-(bool, with span_id), `status` (a trace status or `"failed"`), `task` (int), `limit` (traces: default 10, max
-50; context messages: default 20, max 100), `offset` (first context message, default 0).
+(bool, with span_id), `status` (a trace status or `"failed"`), `task` (int; board sessions only), `limit` (traces:
+default 10, max 50; context messages: default 20, max 100), `offset` (first context message, default 0).
+In a thread session `agent_traces` has no `task` (its thread variant, §22.5), and a `task` filter of the REST trace
+list is a 400 `a thread session has no tasks`: no thread tool takes a task id, so `traces.tasks` stays empty there
+(§22.1).
 
 Behaviour:
 - No ids: a header and one `trace_line` per trace of `list_traces` (newest first).
@@ -4476,7 +4961,19 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   `pause_swarm` pauses the swarm until the user answers. Read live; session overrides and the partial `settings`
   update apply (`clean_overrides` keeps `false`, so a session can switch off a global `true`); switching it off on a
   running swarm lifts a question pause (`reconfigure`). Under the auto-reply lease of `dreamteam -p` it does not
-  apply. The template has the line `clarify = false` after `network`, with a Russian comment.
+  apply. The template has the line `clarify = false` after `network`, with a Russian comment that covers both modes;
+  in a thread session clarify means §22.4 "Clarify".
+- `[swarm] mode` ("board" | "thread", default "board"; anything else is a ValueError `swarm.mode must be 'board' or
+  'thread', got ...`): the mode of new sessions (§22). An existing session's mode is its database's (kv `swarm_mode`,
+  §22.1): a change here, in a project's dreamteam.toml or in session.json never changes it (`main` and `dreamteam
+  run` projects included; a value that differs logs a warning and is ignored). The template has `mode = "board"`
+  after `clarify`; the settings page's «Новые сессии по умолчанию» section has «Режим работы», the new-session
+  modal `#ns-mode`, and a session's ⚙ dialog shows its mode read-only (§22.8).
+- `[swarm] goal_rule` ("democracy" | "veto", default "democracy"; anything else is a ValueError `swarm.goal_rule
+  must be 'democracy' or 'veto', got ...`): the default rule of new thread sessions, frozen into each at create
+  (§22.4); board sessions ignore it. The template has `goal_rule = "democracy"` after `mode`; the settings page's
+  «Новые сессии по умолчанию» section has «Решение о цели», the new-session modal `#ns-rule`, and the ⚙ dialog of
+  a thread session its group «Тред» (§22.8).
 - `[agents] idle_nudge_seconds = 60` (number ≥ 0): how long the scheduler lets an idle member be before it steps in
   (§3): the spacing of item 1's offers to one member, the stall wakes and liveness marks of items 2-3 (§4.2
   "Finishing"), the review reminders (item 5, §4.1 "Liveness"), ten times over (`CREW_GAP_FACTOR`) the free-place
@@ -4499,6 +4996,13 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   interval for a file that keeps changing. Read at each pass and use; session overrides apply. The template has the
   three lines with Russian comments after `planning_hint_minutes`; the settings page's «Агенты» section and the
   session dialog's «Агенты» group have a field for each.
+- `[agents] digest_seconds = 60` (a number ≥ 10, through `config._MIN`: `[agents] digest_seconds must be >= 10, got
+  5`; §22.3): in a thread session, while the goal is active, an idle AI agent whose oldest undelivered digest item
+  (votes aside) is this old is woken once with what has gathered, and an external member's `wait_for_events` returns
+  then (with no goal or a done goal nothing is batched: digest items wait for the next wake-up). Read at each use;
+  session overrides apply; board sessions ignore it. The template has the line with a Russian comment after
+  `trigger_wake_seconds`; the settings page's «Агенты» section has «Сводка подписок, с», the ⚙ dialog of a thread
+  session its group «Тред» (§22.8).
 - `[shell]` (`ShellSettings`, read at each use, so `reconfigure` and session overrides apply at once; §7, §7.1):
   `program = "auto"` (auto | bash | sh | powershell | pwsh | cmd), `timeout = 120` (seconds a call waits; a command
   still running then continues in the background), `max_timeout = 1800` (the largest `timeout`, and the lifetime of a
@@ -4516,7 +5020,7 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   `copy_max_files = 100000`, the largest copy into a new session (§17.2 "Copying files into a new session"): the
   MB and the files of a folder copy or an unpacked zip (the left-out names `.git`, `node_modules`, `.venv`, `venv`
   and `__pycache__` do not count); `copy_max_mb` also caps a zip file's own size and an upload of `POST
-  /api/uploads` (§18.1). Both are at least 1 (`_MIN_ONE`: 0 would refuse every copy). Read from the global
+  /api/uploads` (§18.1). Both are at least 1 (`_MIN`: 0 would refuse every copy). Read from the global
   settings at each create and each upload (`copyfrom.CopyLimits.from_config`; a hand edit of the file applies at
   once). A session override of them passes validation but has no effect: the copy is made
   before the session exists, and an upload has no session. The template's `[workspace]` block has both lines with
@@ -4669,7 +5173,8 @@ settings; ValueError when they are invalid):
   `backups(sid)`, `import_overrides(overrides, models)`, `async import_add(staged, meta, workspace, *, sid,
   before_swap=None)`, `async import_rewrite(sid, staged, meta, workspace, *, expect=None, before_swap=None)`,
   `async import_settings(sid, meta, *, expect=None)`, `recover_swaps()` and `interrupted_swaps()`; module functions
-  `read_stats(db_path, conn=None, *, clarify=False, running=True, requests=False)`, `read_lists(db_path, conn=None)`,
+  `read_stats(db_path, conn=None, *, clarify=False, running=True, requests=False, mode="board",
+  goal_rule="democracy")` (§22.8), `read_lists(db_path, conn=None)`, `read_posts(db_path, conn=None)` (§22.9),
   `slugify(title)`, `external_workspaces(home)`,
   `new_uid()`, `session_uid(meta)`, `api_meta(meta, *, create=False)` and `api_answers(api)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
@@ -4822,9 +5327,16 @@ settings; ValueError when they are invalid):
   - `api_answers(api)`: the block's `answers`, `API_GIVEN`'s "auto" when it has none; the auto-reply hold,
     `_start_run_watch` and `summary` read it.
   - `summary(sid)` adds `via` and `answers` for such a session only.
-  - `control(sid, *, max_cost_usd=None, max_agents=None, wrap_up=None)` (v1's PATCH, §21.2) does what
+  - `control(sid, *, max_cost_usd=None, max_agents=None, wrap_up=None, complete_goal=None, goal_summary=None)`
+    (v1's PATCH, §21.2; `complete_goal`: `swarm.complete_goal_by_user(goal_summary)` after the limits and before
+    wrap-up, the order of `swarm_control`, thread sessions only, §22.9. Its own rules replace the general ones below.
+    The session must run: v1 checks this before calling `control` (409 `not_running`). Under the lock, a session that
+    no longer runs (it stopped while the call waited for the lock) is 409 `not_running` too; it is never loaded for
+    it. Its goal is checked first under the lock, before the limits. No goal, or a goal already done, is 409
+    `conflict` with the swarm's text, and nothing is written. These are not the 400 below.) does what
     `swarm_control` does with the limits and wrap-up mode, as the user, under the session's lock: `set_limits` (a
-    budget pause the new limit covers is lifted), then `wrap_up` / `end_wrap_up`. A stopped session is loaded for it
+    budget pause the new limit covers is lifted), then `wrap_up` / `end_wrap_up`. For the limits and wrap-up mode, a
+    stopped session is loaded
     (one that never started gets its database) and unloaded again unless it was loaded before (the board views
     it). 400 for a value of the wrong kind (a bool, NaN, a `max_agents` that is no whole number) or one the swarm
     refuses (ToolError), with nothing written; 409 `conflict` for `wrap_up: true` while the session has a pending
@@ -4849,7 +5361,8 @@ settings; ValueError when they are invalid):
 - Session ids are `NNN-slug` from the title (Cyrillic and Ukrainian transliterated, accents dropped; e.g.
   `001-snake-game`) and match `^[a-z0-9][a-z0-9-]{0,63}\Z`. `main` is the legacy session: a home that was a
   single-swarm project (`<home>/.dreamteam/swarm.db`) lives in the home itself, uses the global settings
-  directly (including a `swarm.goal`), cannot get overrides and cannot be deleted from the UI;
+  directly (including a `swarm.goal`; always a board session, §22.1), cannot get overrides and cannot be deleted
+  from the UI;
   `sessions/main/` is ignored. Titles are one line, at most 200 chars (default: the goal's first line,
   shortened to 60 characters at a word by `goal_text.shorten_title`, else "Session"; an empty `title` lets the
   server derive it).
@@ -4863,7 +5376,9 @@ settings; ValueError when they are invalid):
   written (so a session made before uids existed, or a folder copied by hand, has the same identity in every home
   it is in); None without a finite numeric `created_at` and for the legacy `main` session (never matched).
   `summary(sid)` carries `uid` (None for a damaged session). `UID_NAMESPACE` is fixed forever.
-- Effective config of a session = the global settings without `swarm.goal` / `goal_description`, deep-merged
+- Effective config of a session = the global settings without `swarm.goal` / `goal_description` and `swarm.mode` (a
+  session without a `swarm.mode` override is board whatever the home's default; the mode itself is its database's,
+  §22.1), deep-merged
   with its `overrides`. Overrides may only touch the sections swarm, agents, shell, workspace, mcp and tracing
   (`OVERRIDE_SECTIONS`; not models, server, roles or teams: the role catalog and the saved teams are global, and a
   session chooses its starting team with `swarm.starting_roles` / `start_agents`); they are validated at create and
@@ -4875,6 +5390,11 @@ settings; ValueError when they are invalid):
   creation: language, team, model...) stay. Same sections, cleaning (`clean_overrides`, no goal keys) and
   validation as `overrides`; nothing is written when it fails (also not a `title` passed along). Passing both
   `overrides` and `settings`, a non-object, or `main` is a 400. A loaded swarm is reconfigured as for `overrides`.
+- The work mode (§22): `create` writes `swarm.mode` = "thread" and the effective `swarm.goal_rule` into the overrides of
+  a thread session only (a board session stores neither key: missing = board), and makes a thread session's database at
+  once (kv `swarm_mode`, the authority). `update` refuses to change or clear the mode (400 `the mode is chosen when the
+  session is created`) and to clear a thread session's rule, puts both back into a thread session's full `overrides`
+  replacement, and refuses `swarm.goal_rule` in a board session (§22.8 "The mode of a session", "Updating a session").
 - `create` splits the goal as `set_goal` does (`goal_text.split_goal(goal, description)`) and stores it already
   split as `pending_goal` {title, description, actor} (only with a non-empty title); the first `start` sets it
   once the members exist (a failure keeps it). Module function `pending_goal(meta)` → {title, description} | None
@@ -4899,7 +5419,8 @@ settings; ValueError when they are invalid):
   is no conversion, no read-only view and no compatibility mode. `db.made_by_earlier_version(source) -> bool`
   (beside `db.max_tools_revision`, read-only through `_reading`, never creating the file) is true when the
   session database has a kv `tools:<name>` record whose `rev` is an integer below `frozen.OLDEST_OPEN_REVISION`
-  (5, §6.1; retired members count; valid or not), or `history` rows of an agent with no usable record (missing, not
+  (5, §6.1; one numbering for both modes, so a thread record, 6, is never below it, §22.5; retired members count;
+  valid or not), or `history` rows of an agent with no usable record (missing, not
   JSON, or not `frozen.valid`, §6.1, the same test `frozen.read` makes: an agent that ran before tool sets were
   frozen). False without a database file (a session
   never started) and for a database with neither (no LLM member ever ran: only the user, external members, or
@@ -4975,7 +5496,7 @@ settings; ValueError when they are invalid):
   `dreamteam status` are refused (`EarlierVersionError`, exit 1). The tests of an agent on an older revision than
   the code's write a record of `OLDEST_OPEN_REVISION` into an opened swarm while the code builds a simulated later
   revision (the `later_revision` fixture of tests/test_frozen_tools.py, or the same monkeypatch of
-  `frozen.TOOLSET_REVISION` and `frozen.current`); `AgentRuntime` does not check the revision (§6.1 "Oldest
+  `frozen.TOOLSET_REVISIONS["board"]` and `frozen.current`); `AgentRuntime` does not check the revision (§6.1 "Oldest
   revision opened").
 - `delete(sid)` renames the directory to `sessions/.deleted-<sid>-<ns>` first (a session whose files are open
   stays intact: 409), then removes it in a thread; leftovers are purged at the next delete. A workspace folder
@@ -5010,7 +5531,8 @@ settings; ValueError when they are invalid):
    "spent_usd","paused","pause_reason","wrap_up","last_activity","jobs":{"running"},
    "question":{"asker","message_id"}|null,"requests"?:n,"clarify":bool,
    "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names],
-   "copied_from":{"source","files","bytes","at"}|null,"earlier_version":bool,"via"?,"answers"?}
+   "copied_from":{"source","files","bytes","at"}|null,"earlier_version":bool,"via"?,"answers"?,
+   "mode":"board|thread","goal_rule":"democracy|veto"|null,"goal_vote":{...}|null,"posts":n}
   ```
   `earlier_version` (`read_stats`, `db.made_by_earlier_version` on the same read-only connection, in a try of its
   own after the other figures, so a database missing a table they read still reports it; false without a
@@ -5026,6 +5548,8 @@ settings; ValueError when they are invalid):
   sessions page polls, `default_session()`, the routes of §18.1) leave it out: its queries take longer as the
   journal grows (§21.5 "Cost"), and nothing there shows it. `clarify`: the session's `[swarm] clarify`
   setting (its own override, else the global one: `cfg.swarm.clarify`; the auto-reply lease is not counted here).
+  `mode`, `goal_rule`, `goal_vote` and `posts`: the thread mode (§22.8; a summary without `mode`, e.g. an older
+  hub's, is a board session's).
   `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
   on demand, so it never counts as missing at start), `adopted` = a folder that held files before (the user's),
   `exists` = it is a folder now. `jobs.running`: the session's running background jobs (`read_stats` counts the
@@ -5685,6 +6209,8 @@ of a home or a project, never a session override (§17.2).
   (`prompts.DEFAULT_ROLE` is its name). The descriptions are addressed to the agent ("You ...", the same in both
   languages): they go into a new member's system prompt right after "Your role: <name>.". The architect and the
   developer name the contracts file `CONTRACTS.md`, the one the planning task asks for.
+  In a thread session the presets' names and descriptions come from `ROLE_PRESETS_THREAD` (§22.6): `reviewer` is
+  «Критик» / Critic there unless a `[[roles]]` entry has that name (§22.6).
 - **`[[roles]]` entries** (`RoleSettings`): `name` (required: a built-in role's id or its name in either language
   customizes that role, only with the fields given; any other name is a role of the user's own), `description`
   (a non-empty one replaces a built-in description in both languages; required for an own role unless it is
@@ -5715,6 +6241,12 @@ of a home or a project, never a session override (§17.2).
   model profile unless the hirer names one. A catalog edit reaches only members hired afterwards (also in running
   sessions, through `reconfigure`); existing members keep their prompts. Agents see the catalog in the `agents`
   output (§12), a new member's system prompt names it, and the kickoff lists the team (`Team: Name — Role; ...`).
+- **Modes** (§22.6): `catalog(..., mode="board")` and `find_role(..., mode="board")` take the session's mode; in a
+  thread session `find_role`, `close_roles` and `missing_roles` also match the thread names («Критик» / Critic →
+  `reviewer`) unless a `[[roles]]` entry has that name (the reviewer then keeps its board name in the thread
+  catalog, §22.6); `preset_id` and `role_key` do not change. A `[[roles]]` description (a built-in one's replacement
+  or an own role's) and the instructions go into prompts verbatim in both modes, so word them for the mode the role
+  is used in: a thread session has no tasks, reviews or planning task.
 - **Starting team** (no field of its own): `swarm.starting_roles` (ordered; a name repeated per agent; preset ids,
   built-in names in either language or own role names) and `swarm.start_agents`.
   `starting_team(starting_roles, start_agents)`: member i gets `starting_roles[i]`; members beyond the list and
@@ -5849,7 +6381,8 @@ succeeded: either may have changed the library) and everything else to the launc
 `build_launcher_server(manager)`, `LauncherMCPEndpoint(manager, host, extra_hosts=())` (served at `/mcp`) and
 `serve_stdio_launcher(manager)` (stdio, with hub_mcp's `_StdinLines`):
 - Session tools (`LAUNCHER_TOOLS`): `sessions_list`, `session_create(goal, title?, description?, language?,
-  start_agents?, max_agents?, team?, team_name?, max_cost_usd?, model?, network?, clarify?, start?=true, workspace?,
+  start_agents?, max_agents?, team?, team_name?, max_cost_usd?, model?, network?, clarify?, mode?, goal_rule?,
+  start?=true, workspace?,
   copy_from?, skills?)` (unset values come from the global settings; the board URL is shown only when a web server runs;
   `goal`: one line, or several, split as in §17.2; `team`: role names in order, a name repeated per agent (§17.3) →
   `swarm.starting_roles` (normalized) and `start_agents = len(team)` unless `start_agents` is given, `[]` = no team;
@@ -5867,7 +6400,8 @@ succeeded: either may have changed the library) and everything else to the launc
   (`roles.saved_team_in`) → "'coding' is a saved team, not a role: pass it as team_name."; nothing is created on any of
   these; `clarify`: a boolean, `swarm.clarify` (§3.1;
   `false` overrides a global
-  `true`), any other value → "clarify must be true or false." and nothing is created; `workspace`: an absolute
+  `true`), any other value → "clarify must be true or false." and nothing is created; `mode`, `goal_rule`: the
+  thread mode, §22.9 "Launcher MCP"; `workspace`: an absolute
   folder, §17.2; `copy_from`: an absolute folder or .zip path on the hub's computer copied into the new session's
   folder first (§17.2 "Copying files into a new session"; not a string → "copy_from must be an absolute path of a
   folder or a .zip file.", blank = no copy; the reply adds `copy_text(copy_result)`; `copy_from_upload` is not
@@ -5886,7 +6420,10 @@ succeeded: either may have changed the library) and everything else to the launc
   v1 (summary `via` "api", §21.4) has ` | HTTP API` right after the cost, before the marks that follow; a session
   without network ends its first
   line with ` | no network` (summary `network`, §7.2), one in clarify mode with ` | clarify` (summary `clarify`,
-  after ` | no network`); a session made by an earlier version (summary `earlier_version`, §17.2) is `[stopped]`
+  after ` | no network`); a thread session shows ` | thread (<rule>) | posts N` (summary `goal_rule`, democracy or
+  veto) in place of ` | tasks d/t done`, then, while #1 exists, ` | goal vote F/C for (needs K)` (`, A against`
+  before the parenthesis when a counted member dislikes #1; §22.9); a session made by an earlier version
+  (summary `earlier_version`, §17.2) is `[stopped]`
   ending its first line with ` | made by an earlier version: cannot be opened` (`session_start`, `session_cd` and
   every hub tool with it as `session` answer with the message of §17.2); a
   session with skills gets `skills: a, b (waiting for your
@@ -5915,6 +6452,14 @@ succeeded: either may have changed the library) and everything else to the launc
   line: "`session_create(..., copy_from=<folder or .zip>)` copies those files into the new session's folder first:
   the agents work on the copy, the originals stay untouched."), then the hub instructions (they hold
   the answer rule, §13).
+- Thread sessions (§22.9): `session_create`'s `mode` (board | thread → `swarm.mode`) and `goal_rule` (democracy |
+  veto → `swarm.goal_rule`, thread only; with an effective board mode it is refused); `sessions_list` shows
+  ` | thread (<rule>) | posts N` in place of ` | tasks d/t done`, then, while #1 exists,
+  ` | goal vote F/C for (needs K)` (with `, A against` when a counted member dislikes #1); the hub tools are
+  the union of both modes' (`hub_specs(None)`), a tool of one mode marked
+  " [Board sessions only.]" / " [Thread sessions only.]"
+  and refused by a session of the other mode; `INSTRUCTIONS` are mode-neutral, with one paragraph on the modes, and
+  the `clarify` description covers both modes.
 - `/s/{sid}/mcp` keeps the per-session hub MCP (§13).
 
 ### 18.3 CLI (cli.py)
@@ -5923,9 +6468,10 @@ dreamteam [tui|chat] ["PROMPT"] [-c | -r [SID]] [-p [--output-format text|json|s
           [--no-auto-reply]] [--verbose] [--home H] [--lang ru|en] [--model PROFILE] [--agents N]
           [--team "ROLE[*N],..." | NAME] [--max-agents N] [--budget USD] [--title T] [--workspace DIR]
           [--copy-from DIR|ZIP] [--skill REF|PATH|URL ...] [--host H] [--port P] [--network on|off]
-          [--clarify | --no-clarify]
+          [--clarify | --no-clarify] [--mode board|thread] [--goal-rule democracy|veto]
 dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR] [--copy-from DIR|ZIP]
-          [--skill REF|PATH|URL ...] [--network on|off] [--clarify | --no-clarify]] [--no-console] [--no-browser]
+          [--skill REF|PATH|URL ...] [--network on|off] [--clarify | --no-clarify] [--mode board|thread]
+          [--goal-rule democracy|veto]] [--no-console] [--no-browser]
 dreamteam sessions [DIR | --home H]
 dreamteam sessions rm SID [SID ...] [--yes] [--skills save|discard] [--home H]
 dreamteam traces [AGENT] [--home H] [--session SID] [--id N] [--span N [--context]] [--status S] [--limit N] [--json]
@@ -6001,6 +6547,10 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   `--clarify` without `--no-auto-reply` (`dreamteam -p: --clarify needs --no-auto-reply: with automatic replies
   nobody answers the questions, and the session plans as usual.`). Neither a TUI-only nor a serve-only flag;
   `sandbox` does not forward it (the dialog or the ⚙ settings set it).
+- `--mode board|thread` and `--goal-rule democracy|veto` (argparse choices, default None; `tui`, `-p`, `serve` with
+  `--goal`, `run`): the work mode and the goal rule of the session that run creates (FLAT_OVERRIDES `mode`,
+  `goal_rule`); refused with `-p -c` / `-p -r` and for `serve` without `--goal` (exit 2), and for `run` a `--mode`
+  that differs from its swarm.db's mode; `sandbox` forwards neither (§22.8 "CLI").
 - `--workspace DIR` (`tui`, `-p`, and `serve` with `--goal`): the folder the session created by that run works in
   (`create(..., workspace=)`, §17.2: an empty or missing folder becomes its workspace; a folder with files is
   adopted, its repository must be clean). `~` and a relative DIR are resolved against the current directory
@@ -6478,8 +7028,10 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», after the «Без
       интернета» badge (§7.2) a plain badge «API» for a session created through the HTTP API v1 (summary `via`
       "api", §21.4; `apiBadge`), its tooltip by summary `answers`: `api_hint_auto` (the hub itself answers the agents'
-      questions and reviews) or `api_hint_manual` (the API client answers them, or the user on the board), both
-      saying that `dreamteam -c` does not pick it, task progress bar, agents (working), spent/budget, model, last activity (the time of
+      questions and, on the task board, reviews) or `api_hint_manual` (the API client answers them, or the user on
+      the board), both
+      saying that `dreamteam -c` does not pick it, task progress bar (a thread session: the badge «Тред», the vote
+      bar and «объявлений: N», §22.8), agents (working), spent/budget, model, last activity (the time of
       the session's last event, its tooltip «Активность: … · Создана: …»; without an event, the creation time and
       «Создана: …»),
       the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
@@ -6519,9 +7071,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   - New-session modal: title (default: the goal's first line, derived by the server); goal (required,
     multi-line: the first line is the title, the other lines its description, explained by a hint);
     description; the checkbox «Сначала уточнить цель» / "Clarify the goal first" (`#ns-clarify`, in the main grid
-    right after the description, with the hint «планировщик сначала задаст вам вопросы по неясным местам цели,
+    right after «Режим работы» and «Решение о цели» (`#ns-mode`, `#ns-rule`, which follow the description, §22.8),
+    with the hint «планировщик сначала задаст вам вопросы по неясным местам цели,
     остальные агенты подождут план и не потратят токены; важный вопрос агента поставит весь рой на паузу до вашего
-    ответа»; ticked from the saved `swarm.clarify`, sent as `swarm.clarify` only when it differs, §3.1); model
+    ответа» (while «Тред» is chosen, the hint is `f_clarify_thread_hint` instead, §22.8); ticked from the saved
+    `swarm.clarify`, sent as `swarm.clarify` only when it differs, §3.1); model
     profile (from the saved settings; a role with its own profile keeps it); language, max agents, budget; the
     starting team composer (below; from the saved catalog); «Скиллы»: a checkbox per skill of the library and of
     Claude Code (a library skill is sent as its name, Claude Code's as `claude-user:x`;
@@ -6665,10 +7219,12 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     owner completes it, even with a reviewer named."; only here: neither the new-session modal nor the board's ⚙
     dialog has it), and «Сначала уточнять
     цель»,
-    `swarm.clarify`, whose hint says it does not apply to `dreamteam -p` with automatic replies, and «Интернет для
+    `swarm.clarify`, whose hint says it does not apply to `dreamteam -p` with automatic replies, then «Режим работы»
+    and «Решение о цели» (`swarm.mode`, `swarm.goal_rule`, §22.8), and «Интернет для
     команд агентов», `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
     `agents.planning_hint_steps` / `planning_hint_minutes` and their hints, and the triggers' `file_settle_seconds`,
-    `file_max_wait_seconds`, `trigger_wake_seconds` with theirs, §8), «Консоль», «Workspace» (`workspace.git`,
+    `file_max_wait_seconds`, `trigger_wake_seconds` with theirs, §8, then «Сводка подписок, с»,
+    `agents.digest_seconds`, §22.8), «Консоль», «Workspace» (`workspace.git`,
     `lock_ttl_minutes` ≥ 1 and `lock_wanted_minutes` ≥ 0 with its hint, §7 "Lock waiters"; then «Копия в новую сессию,
     МБ», `workspace.copy_max_mb`, whose hint names `--copy-from` and the dialog's copy (`ws_copy_mb_hint`
     «--copy-from и «Копия папки или zip»: предел копии и загружаемого .zip» / "--copy-from and “Copy of a folder or a
@@ -6745,6 +7301,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     библиотеку», `{host}`). The hero has «Удалить неиспользуемые окружения» (`POST /api/skill-envs/cleanup`; the toast
     says how many were removed and kept).
 - **index.html + app.js + traces.js** (session board, `/s/{sid}/`):
+  - A thread session (§22) has the tab «Тред» in place of «Доска», «События» for «Лента», «+ Объявление», post and
+    comment links in `md()`, `#goal-btn` opening #1 and the snapshot fields of §22.8 "Board page of a thread
+    session"; the rest of this bullet is the board session's page.
   - All API/WS/MCP URLs are relative to the session base `/s/{sid}` (`BASE`, the same id pattern as the
     server), with `""` when the page is served at `/` (`dreamteam run`).
   - Texts written by agents, external members or the user are shown as Markdown (`markdown.js`, loaded before
@@ -6800,6 +7359,7 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     and «{asker} покинул(а) рой: …» (why `left`); the feed's `swarm.*` lines are escaped, not linkified, so `#N` (a
     message id) is no task link. The feed also shows a run's start and end (FEED_TYPES `session.*`, §9): «сессия
     запущена», «сессия остановлена: бюджет исчерпан», «сессия не запустилась: <error>»…, escaped like `swarm.*`.
+    In a thread session the tab is «События» and `FEED_TYPES` adds `post.created` (§22.8).
   - Reviews (§4.1): a card waiting for the user's review has the badge «ждёт вашего ревью», another one in review
     names its reviewer; the task card's «Принять» / «Вернуть» (a return needs a comment: what to fix; for a
     task another member reviews, the card says the user may decide instead). Dragging a task from «review» to
@@ -6875,6 +7435,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     model select starts with «— профиль роли или сессии» (`model` is sent only when chosen); instructions are
     optional for a catalog role (sent as "").
   - Goal modal: the goal is a textarea with the split hint (first line = title), sent unchanged (the hub splits).
+    In a thread session it warns that #1 and #2 are rewritten and the goal votes cleared, an active goal has «Цель
+    достигнута» (`swarm_control` `complete_goal`, §22.4), and `#goal-btn` opens #1 instead of it once #1 exists (the
+    goal modal before that, and from #1's «Изменить цель»; §22.8).
   - Settings dialog (⚙ «Настройки роя»): budget and max agents (`swarm_control`, stored in the session's
     database; sent only when changed). On a launcher session other than `main` it loads `GET /api/sessions/{sid}`
     and `GET /api/settings` (launcher routes, without `BASE`) and adds the groups «Фоновые процессы»
@@ -6903,6 +7466,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     disabled while the two requests load, and a modal opened meanwhile is not replaced; if they fail, the dialog
     keeps budget and max agents with a line that the session parameters did not load. The pure parts are
     exported for the Node tests (`parseSessionField`, `sessionSettingsPatch`, `sessionFieldsHtml`, `contextHint`).
+    Every session's dialog starts with the read-only line of its work mode; in a thread session the planning-hint fields
+    carry the clarify asker's hint and the group «Тред» has `swarm.goal_rule` and `agents.digest_seconds`
+    (`SESSION_FIELDS` `modes`, `sessionFields(mode)`, §22.8).
     `main` and a standalone `dreamteam run` board show only budget and max agents, with a line that the other
     parameters are in the general settings.
   - Header: the badge «Без интернета» (`#net-badge`) while the snapshot's `swarm.network.mode` is "off", its
@@ -7531,7 +8097,8 @@ class SecretFound(TransferError)     # .places: where a secret was found, never 
   `[mcp.external]` and without keys (`scrub_settings`, §20.3).
 - `skills`: the skills library (`Config.skills_library_dir`).
 - `mcp`: the MCP library (`Config.library_dir`, approvals included) and `[mcp.external]` without env values.
-- `sessions`: whole sessions (database, `.dreamteam/{mcp,attached-skills,jobs}`, workspace files).
+- `sessions`: whole sessions (database, `.dreamteam/{mcp,attached-skills,jobs}`, workspace files; a thread
+  session's forum tables are in its database, §22.9).
 
 `include` defaults to every category; `sessions` (ids or uids) picks sessions and adds the `sessions` category, the
 others still follow `include`. On import, `include` is intersected with the manifest's `include`; a category named
@@ -7592,15 +8159,18 @@ sessions/<id>/workspace/              copy_tree of the session's own folder or i
   (`_discard`: the temp folder, or the contents of the user's empty folder; retried `DISCARD_TRIES` times), naming
   what could not be removed. `dry_run` measures the same parts without writing (no secret check).
 - **Manifest**: `{format, format_version, dreamteam_version, created_at, source: {machine: platform.node(), os:
-  sys.platform, home, python}, schema: {db_columns: sorted(db.known_columns()), toolset_revision}, include,
+  sys.platform, home, python}, schema: {db_columns: sorted(db.known_columns()), toolset_revision,
+  toolset_revisions}, include,
   settings: {sections, models, roles, omitted} | null, skills: [{name, digest, origin, files, size,
   changed_outside}] | null, mcp: {library: [{name, digest, approved, changed_outside, project_session}], external:
   [{name, env_keys, credentials_removed}]} | null, sessions: [{id, uid, title, created_at, last_event: {id, ts,
   type}, events, max_tools_rev, db_sha256, db_bytes, attached_skills, mcp_servers, running_at_export, workspace:
-  {kind, in_home, path, adopted, files, bytes, tree_digest, compare_digest, carried?}, modes}] | null, left_out:
-  [{what, reason, refused}], warnings, not_copied: [{session, path}]}`. `modes` holds the permission bits worth
-  restoring (`treecopy.mode_record`) by path inside the session; `carried: false` marks a workspace folder that was
-  missing at export (the import keeps the files the target has).
+  {kind, in_home, path, adopted, files, bytes, tree_digest, compare_digest, carried?}, modes, swarm_mode}] | null,
+  left_out: [{what, reason, refused}], warnings, not_copied: [{session, path}]}`. `modes` holds the permission bits
+  worth restoring (`treecopy.mode_record`) by path inside the session; `carried: false` marks a workspace folder
+  that was missing at export (the import keeps the files the target has). `toolset_revision` is
+  `frozen.NEWEST_REVISION`, `toolset_revisions` the current revision of each mode (`TOOLSET_REVISIONS`), and
+  `swarm_mode` the session's mode (`db.session_mode` of the copied database, §22.9).
 - `ExportReport.ok`: nothing asked for was refused (the legacy `main` session left out by rule does not count).
 
 ### 20.3 What never travels, and the secret check
@@ -7724,11 +8294,18 @@ changes. All servers are saved by one `update_settings({"mcp": ...})`.
 - Refused per session (the others go on): an invalid id, an unreadable session.json or one whose uid does not
   match the manifest, a link among its folders, `workspace-move.json` in the export or here, a database that
   `_check_export_db` rejects (no `db_sha256` in the manifest, a different sha256, `-wal`/`-shm`/`-journal` files
-  next to it, `db.unknown_columns`, `db.foreign_objects`, `db.max_tools_revision` > `TOOLSET_REVISION`, and
+  next to it, `db.unknown_columns`, `db.foreign_objects`, `db.max_tools_revision` > `NEWEST_REVISION`, a `tools:*`
+  record of a mode this version does not know (§22.9), and
   `db.made_by_earlier_version` (§17.2), checked last, with the reason `it was made by an earlier version of
   DreamTeam and cannot be opened by this one ({version}); import it with the version that made it`), overrides
   that `import_overrides` or `validate` refuse, a placement that fails (below). A session running here is
   `skip`.
+- A target of the same uid whose mode (`db.session_mode`, §22.1) differs from the export's is refused before the
+  unchanged / settings-only / rewrite decision: `its mode differs here (board/thread): the mode is chosen when a
+  session is created; delete one copy or import it as a new session` (§22.9). `swarm.mode` is no `LOCAL_KEYS` entry:
+  it travels in the overrides; when the exported overrides name another mode than the exported database, the
+  database's mode is kept, with the warning `its settings named another mode than its database; the database's
+  ({mode}) is kept` (§22.9).
 - No target: **add** under the exported id when it is free and not reserved by this import, else `_free_id(title)`
   (`as <id>: <id> is taken here`).
 - A target: **unchanged** when the last events of the work `(id, ts, type)` are equal (a run's `session.started` and
@@ -7868,7 +8445,8 @@ owner listed, 21.10), starts a session with a goal, shows its timeline, answers 
 result as JSON and files. It is the HTTP form of `dreamteam -p` (docs/TUI.md §2), not a mirror of the board:
 everything is said in terms of a session, its goal, events, requests to the user, the result and files, so that a
 session in another mode (a feed instead of a task board) can answer the same routes. The internal routes (§14, §18.1)
-stay as they are and may change; `/api/v1` changes only as 21.1 says.
+stay as they are and may change; `/api/v1` changes only as 21.1 says. What a thread session adds (create, options,
+PATCH, summary, result, timeline, `continue`) is in §22.9.
 
 ### 21.1 Where, who, format
 
@@ -8043,7 +8621,7 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
 
 | method path | answer |
 |---|---|
-| GET `/api/v1/options` | `{"api": 1, "version", "languages": ["ru","en"], "language": the default, "teams": [{name, roles}], "roles": [{key, name, description}], "models": [{name, provider, model}], "default_model", "skills": [{name, description}], "folders": [{name, in_place}], "limits": {"upload_max_mb", "upload_max_files", "files_per_session", "uploads_pending", "max_running", "archive_max_mb"}}`: what a client may choose (below) |
+| GET `/api/v1/options` | `{"api": 1, "version", "languages": ["ru","en"], "language": the default, "teams": [{name, roles}], "roles": [{key, name, description}], "models": [{name, provider, model}], "default_model", "skills": [{name, description}], "folders": [{name, in_place}], "modes": ["board","thread"], "mode": the default, "goal_rules": ["democracy","veto"], "goal_rule": the default (§22.9), "limits": {"upload_max_mb", "upload_max_files", "files_per_session", "uploads_pending", "max_running", "archive_max_mb"}}`: what a client may choose (below) |
 | POST `/api/v1/uploads?filename=<name>[&unpack=true]` | the file as the raw body, `Content-Type: application/octet-stream` or `application/zip` → 201 `{"upload": token, "filename", "bytes", "unpack", "expires_in": 3600}` (21.3) |
 | DELETE `/api/v1/uploads/{token}` | `{"ok": true}`: the caller's upload that no create used is removed, its place under `[api] uploads_pending` free at once (21.3 "Life") |
 | POST `/api/v1/sessions` | 21.4 → 202 `{"session": summary}`; 200 with the existing one for a repeated `client_ref` |
@@ -8097,12 +8675,15 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   with nothing written. Its checks come in this order: the type (415 `unsupported_media_type` unless the
   `Content-Type` is `application/json`, parameters such as a charset aside: `api_v1.check_json_type`), the query and
   the body's fields (`unknown_field`; `api_v1.PATCH_FIELDS`), then the session. A field that is `null` is not given;
-  nothing given changes nothing.
+  nothing given changes nothing. In a thread session PATCH also takes `goal_rule` (the partial settings update,
+  §17.2) and `complete_goal` with `goal_summary` (the user's completion of the goal); §22.9 gives their checks and
+  order.
 - **`continue`** does what `dreamteam -p -r <id> "<text>"` does with its prompt (`instruct.continue_step` on
   `swarm.snapshot()`, shared with `-p`): without a goal the text becomes the goal; a completed goal is reopened with
   the text as the comment; a pending question is answered by it (a message to the asker, which `Mailbox.send` makes
-  the answer: it ends the pause); otherwise it is a message to the coordinator (the planning task's assignee, else the
-  first AI member, else `"all"`). A session paused by the user is resumed as well. A budget pause is lifted only when
+  the answer: it ends the pause); otherwise, in a board session, it is a message to the coordinator (the planning
+  task's assignee, else the first AI member, else `"all"`), and in a thread session a post by USER that every member
+  reads at once (§22.9). A session paused by the user is resumed as well. A budget pause is lifted only when
   the budget now covers what was spent; while it is spent the answer is 409 `budget_exhausted` and nothing is given
   (raise it with PATCH first). `text` is a string with a character that is not whitespace, the body's only field
   (400 `bad_request`, `unknown_field`); the whitespace around it is dropped (`api_v1.continue_text`: a message and a
@@ -8225,6 +8806,7 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
  "model": "profile name",
  "start_agents": 3, "max_agents": 8, "max_cost_usd": 5.0,
  "network": "on | off",
+ "mode": "board | thread", "goal_rule": "democracy | veto",
  "files": ["upload token", "..."],
  "folder": {"root": "jobs", "path": "acme/site", "mode": "copy | in_place"},
  "skills": ["library skill name", "..."],
@@ -8261,6 +8843,10 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   `max_agents` whole numbers of at least 1, `max_cost_usd` a number of at least 0, `language` `ru` or `en`, `network`
   `on` or `off`, `clarify` a bool, a list `team` at least one role (400 `bad_request` otherwise); a refusal is a
   `sessionopts.OptionError` with its code. In the body, a field that is `null` counts as not given.
+- **`mode`, `goal_rule`** (§22.9): `swarm.mode` ("board" | "thread"; the global `[swarm] mode` when not given) and
+  `swarm.goal_rule` ("democracy" | "veto"; thread sessions only: 400 `bad_request` with an effective board mode), in
+  both paths of `sessionopts.overrides_from`; `create` fixes them for the session (§22.8). `mode` has nothing to do
+  with `folder.mode` (21.10).
 - **`start_agents`** is at least 1 and at most the session's `max_agents` (400 `bad_request`), also when a team (a
   saved team's roles or a list) sets it: the starting team ignores `max_agents`, and a session without members never
   finishes. A saved team sets `start_agents` to its size, so a `team` string with `start_agents` is 400
@@ -8278,10 +8864,11 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   source, an absolute path or a Git URL, and a bare name falls back to `~/.claude/skills`.) No skill comes from a
   path, a Git URL or Claude Code.
 - **`answers`**: who answers what the agents ask the user. `auto` (default): the hub itself, as `dreamteam -p` with
-  auto-replies (21.5). `manual`: the client, through `requests`. `clarify: true` (the planner asks first, §3.1) only
-  with `manual` (400 `bad_request` otherwise, as `--clarify` needs `--no-auto-reply`). An `api` meta without the key
-  (a hand edit) counts as `auto`, as one without `stop_when_done` counts as true (`sessions.api_answers(api)`: the
-  hold, the automatic answers and the summary read it alike).
+  auto-replies (21.5). `manual`: the client, through `requests`. `clarify: true` (the planner asks first, §3.1; in a
+  thread session the first AI member asks the goal's forks in one message with `pause_swarm` and comments the answers on
+  #2, §22.4) only with `manual` (400 `bad_request` otherwise, as `--clarify` needs `--no-auto-reply`). An `api` meta
+  without the key (a hand edit) counts as `auto`, as one without `stop_when_done` counts as true
+  (`sessions.api_answers(api)`: the hold, the automatic answers and the summary read it alike).
 - **`stop_when_done`** (default true): when the goal is completed, or the budget pauses the session, the session is
   stopped (its background jobs too), as `dreamteam -p` does with its own launcher, and journals `session.stopped` with
   reason `done` or `budget`; `continue` starts it again. false: it stays running like a board session.
@@ -8415,7 +9002,8 @@ retried answer never lands on a newer one:
   snapshot's `clarify_wait` (§14.1) names a planner that waits for the user's answers, that planner's last message to
   the user (`pauses_swarm: false`; `autoreply.planner_question`, the rule `Swarm.asks_user` uses too). The full text
   comes from the messages table: the snapshot's `question.text` is cut to 600 characters, and `clarify_wait` carries
-  only `{name, task_id}`. Answer `{"text"}`: a message to the asker with `reply_to`, which ends the pause.
+  only `{name, task_id}` (`{name, post_id: 2}` in a thread session: the clarify asker of #2, §22.4, §22.9). Answer
+  `{"text"}`: a message to the asker with `reply_to`, which ends the pause.
 - `message` (`m<message id>`): the last message of an active member to the user that no message of the user to that
   member followed (`Swarm.last_message_id(sender, recipient, since)`, a public form of the private `_LAST_TO` query; a
   message the user sends on the board closes it too). One per member at most. A message already listed as a question
@@ -8514,7 +9102,7 @@ retried answer never lands on a newer one:
   - `_start_locked` starts it when the `api` meta says `auto`, on every start path (the board, the TUI, `-r`, a resume
     when the hub starts, the launcher MCP, v1). There too, `Swarm.hold_auto_reply()` takes the auto-reply lease
     for the whole run before `swarm.start()`, which may itself call `set_goal` from the settings: no planning question
-    first, `pause_swarm` ignored (§3.1).
+    first, `pause_swarm` ignored (§3.1; in a thread session #2 is written without its clarify line, §22.9).
   - Past `AUTO_REPLY_MAX`, messages are no longer answered: they stay requests of kind `message`, and the session
     notifies the user once per run, with a `notification` of the kind `u_auto_reply_limit` {max} (quiet: no
     member is woken; a warning line in the terminal's feed, `render._WARN_NOTES`).
@@ -8560,11 +9148,13 @@ An event is a journal row (§9) with its id, plus a line for people:
   `task.created`, `task.updated`, `task.comment`, `message.sent`, `notification`, `goal.set`, `goal.completed`,
   `goal.reopened`, `agent.hired`, `agent.retired`, `swarm.paused`, `swarm.resumed`, `swarm.wrap_up`, `swarm.limits`,
   `session.started`, `session.stopped`, `job.started`, `job.ended`, `mcp.created`, `mcp.status`, `skill.attached`,
-  `skill.detached`, `skill.proposed`, `skill.library`, `skill.deps`, `file.changed`. In the timeline a `notification`
-  counts only when it is addressed to the user (`swarm.notify` journals one per recipient). `detail=all`: every
-  journaled event (`agent.activity`, `agent.usage`, `agent.status`, `trigger.*`, the locks too). The live-only
-  `trace.*` and `job.silent` (§9) have no id and are never sent. Another `detail` is 400 `bad_request`. The list is
-  `api_v1.TIMELINE`.
+  `skill.detached`, `skill.proposed`, `skill.library`, `skill.deps`, `file.changed`, and the thread mode's
+  `post.created`, `post.updated`, `post.comment` and `files.committed` (§22.9). In the timeline a `notification`
+  counts only when it is addressed to the user (`swarm.notify` journals one per recipient). In a thread session
+  `u_thread_quiet` {vote, elapsed} is the client's signal of a stalled goal vote, which ends by the budget, by `stop` or
+  by PATCH `complete_goal: true` (§22.7, §22.9). `detail=all`: every journaled event (`agent.activity`, `agent.usage`,
+  `agent.status`, `trigger.*`, the locks too). The live-only `trace.*` and `job.silent` (§9) have no id and are never
+  sent. Another `detail` is 400 `bad_request`. The list is `api_v1.TIMELINE`.
 - An event is answered with its `data` as journaled, except a float that is not finite (a model's `NaN` in a tool
   argument is journaled as it came), which reads null there: no JSON answer could carry it, and a stream would fail
   again at every reconnect (`api_v1.safe_json`). Data that is not JSON at all reads `{}`.
@@ -8695,17 +9285,23 @@ null, "language", "model", "cost_usd", "max_cost_usd", "max_agents", "created_at
 - `answers`, `stop_when_done`, `client_ref`, `started_at` and `finished_at` come from the `api` meta; they and `via`
   are null for a session not made through v1. `folder` is the `{root, path, mode}` of 21.10, else null.
 - No absolute path, for any caller: no `dir`, `workspace` or `copied_from` (the board's summary, §17.2, has them).
+- Every summary has `mode` (right after `state`; "board" for a session without the key), `goal_vote` (null in a
+  board session and in a thread one with no #1 yet) and `posts` (0 in a board session), and its `goal` has
+  `decision` (null unless a thread session's goal is done); in a thread session `tasks` is `{}` (§22.9). `done` is
+  then a goal completed by the vote or by the user.
 - `board_url` is `manager.hub_url` + `/s/<name>/`, but only when the hub knows its public address:
   `DREAMTEAM_PUBLIC_URL` is set, or the bind is loopback (`web._loopback_bind`); else null. `manager.hub_url` is set
   for every bind, 0.0.0.0 included, so it alone says nothing. Opening `board_url` takes the hub token, not the API
   token.
 
 Result: `result.build_result(*, status, session, goal, summary, tasks, agents, jobs, cost_usd, duration_s,
-error=None)`, a builder `_PrintRun.report` shares (it passes a monotonic duration). It takes the raw snapshot lists
+error=None, mode="board", posts=None, decision=None)`, a builder `_PrintRun.report` shares (it passes a monotonic
+duration). It takes the raw snapshot lists
 and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
 `session`, `goal`, `summary` (the goal's summary when `status` is `done`, else ""), `tasks`
 (`{id, title, status, assignee}`), `cost_usd`, `duration_s`, `agents` (the names of the members not retired), `jobs`
-(the running ones, `{id, label, owner, command, origin}`), and `error` only when given.
+(the running ones, `{id, label, owner, command, origin}`), `mode`, `posts` and `decision` (§22.9), and `error` only
+when given.
 
 - `-p` passes its own words for `status` (done, budget, timeout, error, interrupted), its sid and its monotonic
   duration.
@@ -9035,7 +9631,8 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   - `eventtext.py`: `event_text`. `uitext.py` and `symbols.py`: the feed's texts and symbols, moved out of
     `tui/i18n.py` and `tui/theme.py` (shims stay there).
   - `result.py`: `build_result`.
-  - `instruct.py`: `coordinator(state)` and `continue_step(state)`: what `-p -r` and v1 `continue` do with a prompt;
+  - `instruct.py`: `coordinator(state)` (board sessions), `continue_step(state)` and `post_parts(text)` (§22.9): what
+    `-p -r` and v1 `continue` do with a prompt;
     `without_api_sessions(sessions)`: the sessions `-c` and the CLI's other unnamed picks choose from (21.4).
   - `models.py`: `API_VIA` ("api"), the `via` the hub writes and the clients read.
   - `sessionopts.py`: `overrides_from(body, config, *, strict)`: team, model and limits → session overrides, shared
@@ -9098,8 +9695,9 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     skills are committed: another create and a `continue` meanwhile are not refused for it); PATCH of a running
     session and of a stopped one followed by its start; `continue` after a
     budget stop, and while a create's start is in flight (counted once in `max_running`, the texts given after it in
-    order, the start tried again when it fails); `continue` on a running session (the coordinator, a pending
-    question, a pause by the user or a budget that covers what was spent), on a done job, on a session without a
+    order, the start tried again when it fails); `continue` on a running session (the coordinator, a post by USER
+    in a thread session, §22.9, a pending question, a pause by the user or a budget that covers what was spent),
+    on a done job, on a session without a
     goal, during the hub's resume of a done job and before a stop sent after it; a stop, then a `continue` (the
     session runs again with the text, whether the stop is unloading the session, waits for its lock, or waits behind
     a create's start); a `continue` whose session is deleted before its start, the folder name taken by a new one
@@ -9468,4 +10066,2957 @@ a settings page section for `[api]` (it is edited by hand, 21.9); CORS; several 
 client with the API token acts as the one user of the hub); a callback URL called when a session ends; automatic
 answers to `mcp` requests; mounting only some roots into the sandbox (it mounts every one, 21.10); paging of file
 listings (`GET files` gives the first `FILES_MAX_ENTRIES` names of a folder with `truncated`, and the archive or the
-listings of its folders have the rest, 21.8); an OpenAPI document.
+listings of its folders have the rest, 21.8); an OpenAPI document; routes to read a thread session's comments, to
+comment and to vote (§22.9, §22.10).
+
+## 22. Thread mode (forum.py)
+
+A session works in one of two **modes**, `"board"` | `"thread"`, chosen when it is created and fixed for its life:
+the new-session modal, `--mode` of the CLI, `mode` of HTTP API v1 and of the launcher MCP's `session_create`, else
+the home's default `[swarm] mode` (§17.1, default `"board"`), which only new sessions read. The session's database
+holds the choice (kv `swarm_mode`, §22.1 "Where the mode lives"); no setting, update or import changes it. The board
+mode is everything in §1–§21: tasks with owners, statuses, dependencies, reviews and crews. The **thread mode**
+imposes no structure: the members post to a shared **feed**, discuss the posts in **comments**, show what they think
+of each other's work with **likes and dislikes**, follow what they choose through **subscriptions** (§22.3), and
+decide together, by a vote on the system post `#1`, that the goal is reached (§22.4). Self-organization is the point
+of the mode and its difference from the board: there is no planning task, no planner, no coordinator and no leader;
+nobody claims, assigns, reviews or plans for the others unless the members agree to it in the feed. The plan is a
+discussion by everyone in the system post `#2`.
+- Shared with the board mode: members, hiring and retiring, messages (the user's chat, a member's `pause_swarm`
+  question, §3.1), the workspace and its `.scratch/` folders, the shell and background jobs (§7.1), triggers without
+  their task functions and actions (§22.5), MCP servers (§11), skills (§19), the budget and its notice, pause, wrap-up
+  mode, traces (no task attribution, §22.9), export and import (§20, §22.9) and HTTP API v1 (§21, §22.9).
+- Not in a thread session: tasks, the board, the planning card, independent review, crew tasks, `goal_complete`; the
+  task tools are refused there (§22.5) and no scheduler item of the board runs (§22.7).
+- The goal's **artifacts** are the shared workspace (not the members' `.scratch/`, which is never committed). No member
+  writes a summary: a goal decided by the vote gets its summary generated from the decision, and a goal the user
+  completes directly (§22.4) gets the user's optional summary or a generated one; v1's result keeps `changed_files`
+  (§21.7).
+- Names. The mode is «тред» / "thread" for the user, «доска задач» / "board" the other one. In code the module is
+  `forum.py` (`Forum`, `swarm.forum`), because "thread" means OS threads there. The feed is «лента» / "the feed" in
+  the agents' texts and the UI; a post is «объявление» / "post" (the board page's button «+ Объявление»), shown as
+  `#9`; a comment is «комментарий» / "comment", shown as `c31`; the votes are «нравится» / "like" and «не нравится» /
+  "dislike". The board page's event log, the tab «Лента» / "Feed" of a board session, is «События» / "Events" in a
+  thread session (§22.8). The system posts are `#1` «Цель достигнута?» / "Goal reached?" (kind `goal`) and `#2`
+  «Спланируем работу» / "Let's plan the work" (kind `plan`). The goal rules are `democracy` «демократия» and `veto`
+  «вето» (`user` appears only inside a decision record, §22.1).
+- Sections: §22.1 the data model and where the mode lives; §22.2 the `Forum` API, its rules and events; §22.3
+  subscriptions and delivery; §22.4 the goal and its vote; §22.5 the thread tool set (revision 6); §22.6 the agents'
+  texts; §22.7 liveness (the scheduler); §22.8 the surfaces of a home: settings, sessions, the web UI, the CLI, the
+  TUI and print mode; §22.9 the outside: hub MCP, launcher MCP, external members, instructions from outside, HTTP API
+  v1, export and import, traces; §22.10 what is not in v1; §22.11 read before write: a member writes to a post or
+  the feed only while it has read its current state (read marks, the refusals that show what is new); the same
+  rule for files holds in both modes (§7.3).
+- Where the texts live: the `f_*` items in §22.3; the system posts, the vote lines, the decision summaries and
+  `u_goal_decided` in §22.4; the quiet check's, the wrap-up's and the money notice's texts and `u_thread_quiet` in
+  §22.7; the forum's read-before-write refusals and the rule's prompt sentences in §22.11 (the file refusals and
+  `wait_refused`: §7.3); every other agent text in §22.6.
+
+### 22.1 Data model
+- **Where the mode lives.** kv `swarm_mode` → `"board"` | `"thread"` is the database's authority on its mode:
+  - Written once. `SessionManager.create` of a thread session creates the session's database at once,
+    `Database(path, forum=True)` (the forum tables below), and writes kv `swarm_mode` = "thread", so every thread
+    session has its forum tables and its mode, even one that never ran. Any other database gets the key at its first
+    open by `Swarm` (right after `Database(...)`, before any row is written): a database that already has a row in
+    `tasks`, `messages` or `events` (made before the thread mode existed, or by a board run) gets "board" whatever
+    the config says; an empty one gets the effective `config.swarm.mode`.
+  - Read once at open: `Swarm.mode` comes from kv only. `config.swarm.mode` is replaced by the stored value
+    (`dataclasses.replace`), and `reconfigure()` pins it the same way, as it pins the workspace folder and git (§3),
+    so `update_settings` and a session's settings update never switch a running swarm. A config that names the
+    other mode logs one warning, `the session's mode is thread, chosen when it was created; [swarm] mode is
+    ignored`, and is ignored, never an error. A stored value other than "board" or "thread" (a newer DreamTeam) is
+    refused at open with a ValueError naming it (`the session's mode 'x' is unknown: it was made by a newer
+    DreamTeam`).
+  - The overrides of a thread session carry a cache, `swarm.mode` = "thread", which `create` always writes, with
+    `swarm.goal_rule` (§22.4 "The rule is frozen"). A board session never stores the key (missing = board, `_merged`
+    below), so its session.json stays as 0.4.x knows it: 0.4.x keeps an unknown override, and `config._fill` refuses it
+    (`Unknown keys for [swarm]: mode`). Listings and badges show the database's mode: `summary` passes the cache to
+    `read_stats`, which replaces it with kv `swarm_mode` whenever the file has one (§22.8). The cache's own job is
+    the 0.4.x refusal above, which is why `update` and the import (§22.9) keep it equal to the database's value.
+    `update` keeps the cache equal to the database's value: a change or a removal is a 400, a full `overrides`
+    replacement of a thread session gets it put back, and "board" given to a board session is a no-op that is never
+    stored (§22.8). Wherever the database is read (a start, `read_stats`, an export), the database wins.
+  - `SessionManager._merged` also removes `mode` from the global `[swarm]` base, as it removes `goal`: a missing
+    override falls to the dataclass default `"board"`, never to the home's default, so an older session, a session
+    of a 0.4.x archive and a session an import rewrites from one stay board in any home. The legacy `main`
+    (`LEGACY_ID`, §17.2) is always board (`_config_from` sets `swarm.mode = "board"` after `validate`). A `dreamteam
+    run` project has its mode fixed by kv `swarm_mode` at its first start (`--mode` when given, else the project's
+    `[swarm] mode`); a later run with another `--mode` exits 2 (§22.8).
+  - `db.session_mode(source) -> str`: the pure reader of kv `swarm_mode` from a file path (read-only), a sqlite3
+    connection or a Database, "board" when the file, the kv table or the key is missing; used by `read_stats`, the
+    export and the import plan (§22.9) and v1 on stopped sessions.
+  - `Swarm.mode` (str), `Swarm.is_thread` (bool), `Swarm.forum` (`Forum` in a thread session, None in a board one)
+    and `Swarm.goal_rule` (`config.swarm.goal_rule`, read live; board sessions ignore it) are properties. Modules
+    that may get a fake swarm (tools, renderers) read `getattr(swarm, "mode", "board")`.
+- **The forum tables** are `db.FORUM_SCHEMA`, apart from `SCHEMA`:
+  ```sql
+  CREATE TABLE IF NOT EXISTS posts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, author TEXT, kind TEXT NOT NULL, title TEXT NOT NULL,
+      text TEXT NOT NULL DEFAULT '', data TEXT, created_at REAL, edited_at REAL, active_at REAL);
+  CREATE INDEX IF NOT EXISTS posts_active ON posts(active_at);
+  CREATE TABLE IF NOT EXISTS post_comments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL, author TEXT NOT NULL, text TEXT NOT NULL,
+      reply_to INTEGER, ts REAL);
+  CREATE INDEX IF NOT EXISTS post_comments_post ON post_comments(post_id, id);
+  CREATE TABLE IF NOT EXISTS votes (
+      target TEXT NOT NULL, voter TEXT NOT NULL, value INTEGER NOT NULL, ts REAL, PRIMARY KEY (target, voter));
+  CREATE TABLE IF NOT EXISTS subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, member TEXT NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL DEFAULT '',
+      by_member TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, created_at REAL,
+      UNIQUE (member, kind, target, by_member));
+  CREATE INDEX IF NOT EXISTS subscriptions_match ON subscriptions(kind, target);
+  CREATE TABLE IF NOT EXISTS read_marks (
+      member TEXT NOT NULL, target TEXT NOT NULL, version TEXT, ts REAL, PRIMARY KEY (member, target));
+  INSERT INTO sqlite_sequence(name, seq) SELECT 'posts', 2
+      WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'posts');
+  ```
+  - `posts`: `author` a member name or USER, NULL for a system post; `kind` `goal` | `plan` | `post`; `title` one line
+    of at most 200 characters (`board.MAX_TITLE`), `text` at most 20000 (`board.MAX_POST`; Markdown, may be empty: a
+    title-only post) for the posts of members and the user; a system post's text holds the goal's whole description,
+    never cut nor refused (`ensure_system_posts` skips the checks of `create`, §22.2); `created_at`; `edited_at` (NULL
+    until an edit); `active_at` (the last create, edit or comment: the feed's order; a vote does not touch it). `data`
+    (json) is used by `#2` only: `{"clarify": bool, "asker": name | null}`, the clarify decision of the current goal's
+    kickoff (§22.4 "Clarify"); NULL for every other post.
+  - **Reserved ids.** Ids 1 and 2 belong to the system posts: the last statement seeds the posts sequence at 2, and
+    `ensure_system_posts` inserts `#1` and `#2` with explicit ids, which leaves the sequence at 2. Every ordinary post
+    is `#3` or later, whoever writes it (the user, an AI agent, a member that joined through MCP) and whether it comes
+    before the first goal or after. While no goal was ever set there is no `#1` or `#2`: `post_read 1` is `No post
+    #1`, and ordinary posts work as usual.
+  - `post_comments`: `text` at most 20000; `reply_to` a comment of the same post or NULL; `ts`.
+  - `votes`: `target` `p<id>` (a post) | `c<id>` (a comment); `value` +1 like, −1 dislike; one row per (target,
+    voter), the primary key; a withdrawal deletes the row.
+  - `subscriptions`: `kind` `feed` | `post` | `file` | `reactions`; `target` "" for `feed` and `reactions` and for a
+    `file` subscription to the whole workspace, a post id as decimal text (`"7"`), or a normalized workspace-relative
+    posix path (no `./`, no trailing `/`); `by_member` "" = anyone, else a canonical member name or `user` (the column
+    is `by_member` because BY is an SQL keyword; the tools and the dicts call it `by`); `mode` `wake` | `digest`;
+    `auto` 1 for the rows the system made (§22.3). Never NULL in the unique key, so SQLite's NULL-distinct rule
+    cannot duplicate a row: `subscribe` is one upsert `ON CONFLICT (member, kind, target, by_member) DO UPDATE SET
+    mode = excluded.mode`, the automatic rows `ON CONFLICT DO NOTHING`, and a member's feed row stays unique under
+    repeated calls and races.
+  - `read_marks`: what each member has read, for the read-before-write rule (§22.11): `target` `p<id>` (a post, at
+    the `version` it read, NULL = known by its title only) or `c<id>` (a comment); one row per (member, target).
+    File read marks are not here: they are kv rows in both modes (§7.3).
+  - **When they are created.** `Database(path, *, forum: bool = False)` runs `SCHEMA`, then `FORUM_SCHEMA` when
+    `forum` is true, then `_add_columns`; `Database.ensure_forum()` runs `FORUM_SCHEMA` on an open database (every
+    statement is `IF NOT EXISTS` or guarded, so it is idempotent). `SessionManager.create` of a thread session uses
+    `forum=True`, and a thread swarm calls `ensure_forum()` at every open (also a `dreamteam run` project whose mode
+    was just fixed as thread). Nothing that opens a database without the thread mode creates them, and nothing ever
+    drops them.
+  - **Why not in `SCHEMA`.** A table in `SCHEMA` is created in every database this version opens. 0.4.x refuses a
+    database with columns it does not know (`db.unknown_columns`, §20.4: "made by a newer DreamTeam"), so forum tables
+    in every file would make every board session this version exports unimportable into 0.4.x. Kept apart, a board
+    session's file stays as 0.4.x knows it (its tool records stay revision 5, §22.5) and imports there, while a thread
+    session's file carries the forum tables from its creation and is refused there as intended, by `db.unknown_columns`
+    before its settings are read (its `swarm.mode` override would fail 0.4.x's settings check too). The other 0.4.x
+    behaviours are in §22.9.
+  - `db.known_columns()` and `db.known_objects()` also run `FORUM_SCHEMA`: this version accepts exports of both
+    modes, and the manifest's `schema.db_columns` lists the forum columns (§20.2). They are ordinary tables (no
+    virtual or FTS table), so the export's credential strip and secret scan (§20.3) read the posts and comments like
+    any other text. No `ADDED_COLUMNS` entry (they are whole new tables), no `FORMAT_VERSION` bump.
+- **kv `goal`** keeps its keys (§2) and in a thread session gains:
+  - `decision` `{"rule": "democracy" | "veto" | "user", "for": [names], "against": [names], "counted": n,
+    "wrap_up": bool}`: how the goal was completed (the vote, or `user` for the user's own completion, §22.4), written
+    with status done in the one `db.set` of `complete_goal`. `reopen_goal` pops it (and clears `summary`), and a new
+    goal writes a fresh dict without it. Anything that shows it shows it only while the status is done.
+  - `completed_by`: the voter whose vote met the rule; None when a retire, a rule change or a start met it;
+    USER for the user's completion. It is never shown as a name when None.
+  - There is no `artifacts` list, no `base_commit` and no `set_at`: the artifacts are the shared workspace, and v1
+    computes `changed_files` from its own `api.base_commit` (§21.7).
+- **kv `tools:<agent>`** records gain `"mode"`: `{"rev", "language", "tools", "mode"}`, a record without it is board;
+  thread records are revision 6 (§22.5). `wait_progress:<actor>` is the same cursor for the thread progress of
+  `wait_for_events` (§22.5). There is no kv read mark for the forum (no `forum_seen:<member>`): what a member has
+  not been told yet is its undelivered notifications (§22.3), and what it has read, which gates its writes and never
+  its news, is the table `read_marks` for posts and comments (§22.11) and, for files, the kv rows
+  `file_read:<member>:<path key>` (§7.3, both modes).
+- Unchanged tables: `tasks`, `comments`, the review and crew columns stay empty in a thread session. The traces keep
+  their schema: no thread tool takes `task_id` or `parent_id` (`tracing.TASK_ARG_KEYS` unchanged), so a thread
+  session's `traces.tasks` stays empty and `trace_line` shows no tasks; the `task` filter is refused there (§22.9).
+
+### 22.2 Forum (forum.py) and events
+```python
+class Forum:                                         # swarm.forum in a thread session (None in a board one)
+    def __init__(self, swarm): ...
+    def feed(self, *, by: str | None = None, since: float | None = None, query: str | None = None,
+             limit: int = 30) -> list[dict]          # system posts first, then by active_at desc
+    def get(self, post_id: int) -> dict              # a post dict; ToolError "No post #N"
+    def comments(self, post_id: int, since_id: int = 0, limit: int = 200) -> list[dict]   # ascending ids
+    def create(self, actor: str, title: str, text: str) -> dict
+    def update(self, actor: str, post_id: int, *, title: str | None = None, text: str | None = None) -> dict
+    def comment(self, actor: str, post_id: int, text: str, reply_to: int | None = None) -> dict
+    def vote(self, actor: str, target: str, value: str) -> dict     # "like" | "dislike" | "none" (withdraw)
+    def subscriptions(self, member: str) -> list[dict]
+    def subscribe(self, actor: str, kind: str, target: str | None = None, by: str | None = None,
+                  mode: str = "wake") -> dict        # creates it, or changes the mode of the same (kind, target, by)
+    def unsubscribe(self, actor: str, subscription_id: int) -> None
+    def auto_subscribe(self, member: str) -> None    # at member creation (hire, the starting team; §22.3)
+    def drop_subscriptions(self, member: str) -> int # at retire: every row, the feed one too
+    def goal_vote(self) -> dict | None               # goal_tally of the session's rule; None while there is no #1
+    def recheck_goal(self, actor: str | None) -> bool   # completes the goal when the vote meets the rule (§22.4)
+    def ensure_system_posts(self, goal: dict) -> bool   # True: created #1/#2; False: rewrote them (§22.4)
+    def rewrite_goal_rule(self) -> bool             # #1's text for Swarm.goal_rule; True when it changed (§22.4)
+    def reset_goal_votes(self, actor: str | None, reason: str) -> None
+        # reason "new_goal" | "reopened" | "wrap_up_end"
+    def reopen(self, actor: str, comment: str) -> int | None  # the thread part of reopen_goal (§22.4); the id of
+                                                     # the comment it posted on #1, None when none (§22.11)
+    def similar_open(self, post: dict) -> list[dict]
+    def mark_read(self, member: str, marks: dict[str, str | None]) -> None   # read marks p<id>/c<id> (§22.11);
+                                                     # nothing for USER or a non-member
+    def note_shown(self, member: str, rows: list) -> None   # render_wake: the `_read` of the rows it shows
+    def drop_reads(self, member: str) -> int         # at retire: every read mark of the member
+
+def goal_tally(conn, rule: str) -> dict             # pure: the one vote rule (§22.4), also sessions.read_stats
+def post_version(post: dict) -> str                 # pure: a post's content version (§22.11)
+```
+- **Dicts.** A post: `{"id", "kind", "title", "text", "author", "created_at", "edited_at", "active_at", "likes",
+  "dislikes", "comments"}` (`comments` a count; `data` stays internal). A comment: `{"id", "post_id", "author",
+  "text", "reply_to", "ts", "likes", "dislikes"}`. A subscription: `{"id", "member", "kind", "target", "by", "mode",
+  "auto", "created_at"}`, `target` and `by` as stored ("" = none / anyone). `vote` returns `{"target", "value",
+  "likes", "dislikes"}`, on `p1` also `"goal_vote"` (after the vote) and `"decided"` (this vote completed the goal);
+  `subscribe` returns the subscription with `"op"`: `created` | `changed` | `unchanged`. The tools word them (§22.5).
+- **Ids** as members, the user and the tools write them: posts `#9` (`post_id` arguments are integers: the registry's
+  integer coercion already takes `"#9"` and `"9"`), comments `c31`, vote targets `#9` or `p9` (a post) and `c31` (a
+  comment), subscriptions `s12`. The parsing of prefixed ids lives in `tools/forum_tools.py`, never in the registry's
+  `_as_int`, which keeps coercing board arguments as now:
+  - `_comment_id` (`comment` `reply_to`, `post_read` `since_id`; string arguments, so an integer an LLM sends still
+    arrives as a string): 31, `"31"`, `"c31"`, `"C31"`, `" c31 "`; anything else is a ToolError naming the form,
+    `reply_to must be a comment id such as c31`.
+  - `_vote_target`: `"#5"`, `"p5"`, `"P5"` a post, `"c31"` a comment; a bare number is ambiguous: `target must be
+    '#5' for a post or 'c31' for a comment`.
+  - `_sub_id`: 12, `"12"`, `"s12"`; results always print `s12`.
+  - What parses but does not exist: `No post #9`, `No comment c31 on #9` (also a comment of another post),
+    `No subscription s12 of yours`.
+- **Actors.** Every method that writes takes the actor: an active member (an AI agent or a member that joined through
+  MCP) or USER. The user may do what an author may, except that the user has no subscriptions (§22.3); the swarm
+  itself writes the system posts. Texts are stripped. Every write runs in one `db.transaction()` and emits its event
+  after it (below); who is told is §22.3. A member's `create`, `update` and `comment` first pass the read check of
+  §22.11 inside that transaction (USER's never do): a write to a post or the feed with news the member has not read
+  is refused, with the news shown and counted as read.
+- **`feed`**: the system posts first (`#1`, then `#2`, pinned; nobody else is pinned), then the other posts by
+  `active_at` descending (then id descending); `limit` is clamped to 1..100 and counts the system posts. `by` (a
+  member name, a retired one too, or the user: `resolve_member(by, allow_user=True, allow_retired=True)`) keeps the
+  posts of that author, so the system posts drop out; `since` (a `time.time()` value; the tool takes minutes) keeps
+  the posts active since then; `query` keeps the posts whose title or text contains it, case-insensitively
+  (`str.casefold`, in Python: SQLite's `lower` knows only ASCII).
+- **`create`**: kind `post`; the title must not be empty (`Post title must not be empty.`) nor longer than 200 (`Post
+  title is too long (N chars, max 200). Keep it short and put details into the text.`); a line break in it is a
+  ToolError (`The title is one line; put the rest into the text.`); a text longer than 20000 is `Post is too long (N
+  chars, max 20000). Put long content into a workspace file and post its path.` The text may be empty (a title-only
+  post). `created_at` = `active_at` = now.
+  Posting needs no goal: before the first goal the posts simply start at `#3`.
+- **`update`**: by the post's author or USER; another member gets `#9 is Anna Smith's post: only its author edits it;
+  comment on it instead.`; the system posts are written by the swarm alone (`ensure_system_posts`;
+  `rewrite_goal_rule` for `#1`'s rule), so a call on `#1` or `#2` is `#1 is a system post: the swarm writes it from
+  the goal; comment on it instead.` for everyone, the user
+  included. At least one of `title` / `text` (`Pass title or text.`), with the checks of `create`; values equal to the
+  current ones change nothing (no event, no `edited_at`). Otherwise `edited_at` = `active_at` = now and
+  `post.updated` {post, changes} lists the fields that changed. There is no deletion: the record stays, and its
+  author may say in it that it is obsolete. Comments are not edited (Not in v1).
+- **`comment`**: on any existing post, the system posts included, also while the goal is done; text not empty
+  (`Comment text must not be empty.`) and at most 20000 (`Comment is too long (N chars, max 20000). Put long content
+  into a workspace file and comment its path.`); `reply_to` a comment of the same post.
+  Sets the post's `active_at`.
+- **`vote`**: value `like` (+1) | `dislike` (−1) | `none` (withdraw). An actor (a member or USER) cannot vote on
+  its own post or comment (`You cannot vote on your own post.` / `… comment.`); the system posts have no author, so
+  everyone may vote on them. A second vote replaces the first; the same value again or `none` without a vote changes
+  nothing (no event).
+  Votes on `#1` are refused while the goal is not active: `The goal is already reached: #1 is closed for votes until
+  the goal is reopened.` (with no goal there is no `#1`: `No post #1`). Members that joined through MCP and the user
+  may vote: their votes are shown (`likes`, `dislikes`) and never counted for the goal; a retired member's rows stay.
+  A vote on `p1` is followed by `recheck_goal` (§22.4). Votes never wake anyone (§22.3).
+- **Subscriptions.** `subscriptions(member)`: the member's rows by id. `subscribe` and `unsubscribe` act on the
+  caller's own rows only (a member's subscriptions are its own business: the user sees them read-only, §22.8, and no
+  tool changes another's); the kinds, the target and `by` checks and the automatic rows are §22.3. `by` resolves with
+  `resolve_member(by, allow_user=True, allow_retired=False)` (`by=user` follows the user's posts and comments; a
+  retired name is `Unknown member`). `unsubscribe` of another member's id is `No subscription s12 of yours`; the
+  member's own automatic `feed` row (no `by`) cannot be removed (§22.3), only its mode changed. `auto_subscribe`
+  inserts the automatic rows with `ON CONFLICT DO NOTHING` and emits `subscription.changed` for each row it created;
+  `drop_subscriptions` deletes every row of the member (the only way the feed row goes) and emits one
+  `subscription.changed` {member, op: removed, count}. Other members' rows `by=<retired name>` stay: names are never
+  reused (§3), so they match nothing, and `subscriptions` marks the name as a former member's.
+- **The goal vote.** `goal_tally(conn, rule)` → `{"rule", "counted": n, "for": [names], "against": [names],
+  "needed": n, "met": bool}`, the one shape everywhere (the snapshot, the summaries, v1, `-p`): the counted voters
+  are the active LLM members (`Swarm.agent_count()`'s rows), `for` / `against` their likes / dislikes on `p1` (names
+  in members order), `needed` = ⌊counted/2⌋+1 (democracy) or counted (veto), and `met` also requires counted ≥ 1
+  and at least one counted like. `goal_vote()` applies `Swarm.goal_rule`. When it is re-evaluated, what completes the
+  goal, and the decision: §22.4.
+- **System posts.** `ensure_system_posts(goal)` creates `#1` and `#2` (author NULL, explicit ids, texts in the swarm
+  language, whole, with no length check) when the forum has none, else rewrites their texts for the new goal;
+  `rewrite_goal_rule()` rewrites only `#1`'s text for the current `Swarm.goal_rule` (§22.4);
+  `reset_goal_votes(actor, reason)` deletes every vote on `p1` and emits `post.updated` of `#1` with `["votes"]`, for
+  "new_goal" and "wrap_up_end" only when it deleted a row, for "reopened" always; `reopen(actor, comment)` resets the
+  votes and posts the user's comment on `#1` (unless "" or "-"). Their texts, `#2`'s `data` and the notices: §22.4.
+- **Mentions.** `@Full Name` (and `@user` / `@пользователь` for USER) in a post's title or text, in a comment, and in
+  what an edit adds, found with `board.find_mentions(text, [m["name"] for m in swarm.members(include_retired=True)])`
+  as the board does (§4 `post`): retired names take part in the matching, so "@Old Timer" never reaches an active
+  "Old", and are then dropped with non-members and the actor. An edit mentions only the names its new title and text
+  have and the old ones did not, so an existing mention does not fire again at every edit. A mentioned member gets
+  `f_mention` {by, post, title, comment, text} (`comment` "" when the mention is in the post itself): it always
+  wakes, whatever the member's subscriptions, cannot be turned off, and is that member's one notification for the
+  event, in place of its `f_post`, `f_comment` or `f_reply` (§22.3). USER gets the same `f_mention`. The board's
+  `n_mention` (a task discussion, `task_comment`) is never sent in a thread session.
+- **Similar posts.** After `post_create` by an AI agent or a member that joined through MCP (not the user, as with
+  `task_create`, §12), `similar_open(post)` compares the new post with the 200 most recent posts by `active_at` of
+  kind `post` (not the system posts, not the post itself, not the caller's own: a member splits its work into alike
+  posts on purpose), through `board.similar_items(title, goal, candidates, limit=SIMILAR_MAX)`: the generalized
+  `similar_tasks` (which stays as its wrapper) over any item with `.id`, `.title` and `.goal`. A post's "goal" is the
+  first paragraph of its text (up to the first blank line), cut to 300 characters; `similar_open` passes
+  `types.SimpleNamespace(id=, title=, goal=)` built this way from each candidate row (and takes the new post's own
+  title and goal the same way), and maps the hits back to the candidates' post dicts in the ranking's order (best
+  first, then the lower id): it only confirms a title match
+  between 0.5 and 0.75 and keeps `_distinct`'s digit-marker test away from long texts; `similarity` and its thresholds
+  are §12's. At most 3, best first, then the older; the result text is `similar_posts` (§22.5), never
+  `similar_tasks`, which tells the agent to cancel a task.
+- **Events** (§9), data and actor:
+  - `post.created` {post}: the author (USER for the user's post); None for the system posts.
+  - `post.updated` {post, changes: a list of `"title"`, `"text"`, `"votes"`}: the editor; None for the swarm's
+    rewrites; the reopen's actor (the user) for its `["votes"]`.
+  - `post.comment` {post_id, comment}: the author.
+  - `post.vote` {target, voter, value: `like` | `dislike` | `none`, likes, dislikes}: the voter.
+  - `subscription.changed` {member, subscription, op: `created` | `changed` | `removed`, count?}: the member; None for
+    the automatic rows and for a retire (which carries `count` and no `subscription`).
+  - `files.committed` {kind: `shell` | `job j<N>` | `jobs j<N>, j<M>` (a session's stop, one owner's jobs, §7) |
+    `held`, commit, files: [{path, change: `A` | `M` | `D` | `R`}], more?, suspects: [names]}: the autocommit's actor
+    (the command's member, the job's owner, the held file's owner).
+  - `post` is always the post dict with its current counts, so a client updates a post from any of its events; a
+    vote reset has no type of its own: a `post.updated` whose `changes` holds `"votes"` (counts 0/0 on `#1`) tells
+    clients to reset `#1`'s counts. A goal decided by the vote is `goal.completed` (its name unchanged; its `goal`
+    carries `decision`, §22.1).
+  - `files.committed` makes the shell's and the jobs' changes visible, which `file.changed` (only `write_file` and
+    `edit_file`, §7) never shows. It is emitted only in thread sessions (`Workspace.commit_events`, set by the thread
+    swarm): after a successful whole-tree commit of `_commit_locked` (rel None: the shell's and the jobs' autocommits,
+    §7), built from the entries it staged, and after each per-owner commit of `commit_held` / `_hold_new` (kind
+    `held`, §7 "Held new files"); never for a single-path commit, which has `file.changed`, left as it is (the
+    triggers' `file_changed()` counting and its own-edit rule do not change). At most 200 `files`, then `more` (the
+    rest's count); a rename (`R`) names the new path; nothing under `.scratch/` is ever committed, so none is listed.
+    `suspects` = the actor and every other member whose command was running when the commit was made (the set
+    `HELD_OTHERS` names, §7): git cannot tell who wrote a file. With `[workspace] git` off there is no commit and no
+    event.
+  - The six types are appended to §9's list together, and each goes into `tui/render.py` `EVENT_TYPES` and
+    `_HANDLERS`, `eventtext._HANDLERS` (§21.6; tests/test_eventtext.py `JOURNALED`), and the `ev_*` strings of
+    `static/app.js` (en/ru). `post.created`, `post.updated`, `post.comment` and `files.committed` are in v1's
+    `TIMELINE` (§22.9); `post.vote` and `subscription.changed` are `detail=all` only (votes are frequent, and a goal
+    decided by votes shows as `goal.completed`).
+  - `eventtext` lines (en/ru): `post.created` `#9 "title" — Anna` (title only, never the text); `post.comment` `Anna
+    on #9 (c31): "…"` (the text quoted short, as for `task.comment`); `post.updated` `#9 edited — Anna`, a votes-only
+    update `#1: votes reset`; `post.vote` `Anna likes #9` / `dislikes c31` / `withdrew the vote on #9`;
+    `subscription.changed` `Anna follows #9 (wake)` / `… changed to digest` / `… unfollows s12`; `files.committed`
+    a line next to `_ev_file`'s: the files' count, the first path, the kind and the actor; `goal.completed` with a
+    `decision` adds "by vote (democracy)" / «голосованием (демократия)», with rule `user` "by the user" /
+    «пользователем». Names follow eventtext's rules for people (first names in the short form, no absolute path).
+  - Forum events are no trigger input in v1 (§22.5): `triggers.DIRTY_PREFIXES` gains no `post.` prefix.
+
+### 22.3 Subscriptions and delivery
+Every change of the forum (a new post, a comment, an edit, a vote) and every change of the workspace is an **event**
+for the members whose subscriptions match it. Delivery turns it into at most one notification row per recipient
+(§3 `notify`): a **waking** item, or a **digest** item that waits for a batch. The fan-out lives in `forum.py`
+(`Forum._deliver`) and runs right after the event's emit, as `Board._notify_post` does for a task discussion (§4).
+The file events (`file.changed`, `files.committed`) reach it through one bus listener (`Forum._on_event`,
+`swarm.bus.listen`), which schedules the fan-out with `call_soon` on the running loop, so that with a loop no
+notification is emitted inside another event's dispatch; without a running loop (a test without one) it runs inline,
+the only case where the fan-out runs inside the file event's dispatch.
+
+| kind | target | matches (only the actor named by `by`, when set) |
+|---|---|---|
+| `feed` | `''` | a new post: the feed's only event |
+| `post` | a post id (`'9'`) | the comments and edits of that post: a comment belongs to its post, not to the feed |
+| `file` | a path; `''` = the whole workspace | changes of the files at the path or under it |
+| `reactions` | `''` | comments on its posts, replies to its comments, others' edits of its posts, votes on both |
+
+**Rows, automatic subscriptions, ownership**
+- One row per (member, kind, target, by) in `subscriptions` (§22.1), shown as `s12`; `by_member` `''` = anyone, else
+  a canonical member name or `user` (the tool argument is `by`); mode `wake` | `digest`.
+- **Automatic** (`Forum.auto_subscribe`, called by `Swarm._create_member`, so by `hire` (before `n_hired_thread`) and by
+  the first `start()`'s starting team, for every kind of member, an AI agent or one that joined through MCP): `feed`
+  `''`, `reactions`, `post` `1` and `post` `2`, all in `digest` with `auto` 1 (`ON CONFLICT DO NOTHING`). The two `post`
+  rows exist before the system posts do (their ids are reserved, §22.1). A welcome back through `join_swarm(name=...)`
+  keeps the rows the member had and adds none; `ensure_system_posts` adds none either: a member that cancelled its `#2`
+  subscription keeps its choice (a new goal reaches every LLM member through `n_goal_updated_thread`, §22.4). The system
+  posts have no author, so their comments are followed through these `post` rows: without them nobody would read the
+  planning discussion in `#2`.
+- The automatic `feed` row (kind `feed`, target `''`, by `''`) is never removed, only its mode changed: `unsubscribe`
+  of it raises `The feed cannot be unsubscribed: change its mode (subscribe what=feed mode=digest|wake), or add
+  narrower subscriptions.` (ru `Подписку на ленту нельзя отменить: смени ее режим (subscribe what=feed
+  mode=digest|wake) или добавь более узкие подписки.`). Every other row can be removed, the automatic ones and a
+  `feed` row with `by` included.
+- `Forum.subscribe(actor, kind, target, by, mode)` creates the row, or changes the mode of the caller's row with the
+  same (kind, target, by) (`ON CONFLICT DO UPDATE SET mode`; `auto` is kept). It validates: `kind` one of the four;
+  `mode` `wake` | `digest`; for `post` an existing post (`9`, `#9` or `p9`; else `No post #9`), stored as decimal
+  text; for `file` a path checked by `Workspace.resolve` (outside the workspace or inside `.git`: its ToolErrors; a
+  path that does not exist yet is accepted, e.g. a folder about to be made) and stored as the normalized posix
+  `Workspace.rel` of it, `''` for the root (`''`, `.` and `/` all mean the whole workspace); for `feed` and
+  `reactions` no target (`target is only for what=post or what=file`); `by` through `resolve_member(by,
+  allow_user=True, allow_retired=False)` (an unknown or retired name: its usual error), never the caller itself
+  (`You never get your own events: by cannot be yourself.`). Each change emits `subscription.changed` (§22.2).
+- A subscription is changed only by its own member: `subscribe` and `unsubscribe` act on the caller's rows, and
+  `unsubscribe` of another member's id raises `No subscription s<N> of yours`. The three subscription tools have
+  audience LE and no member argument (§22.5); the user sees every member's subscriptions read-only in the agent
+  drawer (snapshot `agents[].subscriptions`, §22.8) and steers a member with an @mention, which always wakes. USER
+  has no subscriptions (below).
+- **Retire**: `Swarm.retire` calls `Forum.drop_subscriptions` next to the triggers' deactivation: every row of the
+  member, the `feed` one included (the only way it goes), with one `subscription.changed` {member, op `removed`,
+  count} (actor None). Its undelivered notifications are never delivered (it has no runtime, and the fan-out never
+  addresses a non-member). Other members' rows with `by` = the retired name stay and match nothing (names are never
+  reused, §3 `hire`); `subscriptions` marks the name as former, so their owners can cancel them. Next to it
+  `Forum.drop_reads` deletes the member's read marks (§22.11).
+
+**Fan-out: who gets what.** For an event of actor A:
+1. The candidates are the active members (`is_member`) other than A, plus USER by its own rules (below). The members
+   the same MCP client also acts as (§5 `sent_as_seen_by`, read with `mailbox.seen_as(A)`, below) get nothing for
+   A's events: the client knows them already, as it knows its own messages. `mailbox.seen_as(sender) ->
+   frozenset[str]` (new, `mailbox.py`): the members of `_SEEN_BY` when its sender is `sender`, else `frozenset()`.
+   `Mailbox.send` uses it in place of its inline read of `_SEEN_BY`, with the same behaviour. `Forum._deliver` reads
+   it while the event's actor call runs: `create`, `comment`, `update` and `vote` run their fan-out inline. For a file
+   event, `call_soon` copies the current context, and the fan-out runs inline when there is no loop, so the rule
+   holds there too. A is the event's actor. A `files.committed` is the one exception: A stays a candidate unless it
+   is the commit's sole suspect (File subscriptions, "Own changes"); the other suspects are candidates as usual.
+2. **Mentions** come first (found as §22.2 "Mentions" says, `@user` / `@пользователь` reaching USER): a mentioned
+   recipient gets one waking `f_mention` and nothing else for that event, whatever its subscriptions: a mention is
+   no subscription and cannot be turned off.
+3. Otherwise a member gets an item when at least one of its subscriptions matches the event (the table; `by` is
+   `''` or the event's actor, for a file event the actor or one of its suspects). The key follows the event:
+   `post.created` → `f_post`; a comment → `f_reply` when it replies to a comment of the recipient, else `f_comment`;
+   an edit → `f_edit`; a vote → `f_vote`; a file event → `f_file`.
+4. The item **wakes** when any matching subscription is in `wake`, else it is a **digest** item; the exceptions are
+   below (votes, quiet new posts, settling file items, the user's posts and comments). A member thus asks to be
+   woken by narrower subscriptions: e.g. the feed in `digest`, and `post` `7` or `feed` by="Anna Smith" in `wake`.
+- The actor never gets its own events, except a `files.committed` whose suspects include other members (File
+  subscriptions, "Own changes"): then it gets `f_file` like any matching member, with the suspects as `{by}`. One
+  event gives a recipient at most one notification, whatever number of its subscriptions match.
+- No fan-out for the system's own changes: the creation of `#1` and `#2` and the swarm's rewrites of them (actor None;
+  the kickoff and `n_goal_updated_thread` carry them, §22.4) and a reset of the votes on `#1` (`post.updated` with
+  `["votes"]`). The comment `Forum.reopen` posts on `#1` gives the LLM members no `f_*` item, an `@mention` in it
+  included (their waking `n_goal_reopened_thread` carries its text); external members get it as the waking `f_comment`
+  every USER comment gives (`f_mention` when it names them, §22.4). The members' comments on `#1` and `#2` fan out as
+  on any post, through the `post` `1` / `2` rows, and votes on those comments reach their authors' `reactions` rows.
+  Nobody edits `#1` or `#2` (§22.2 `update`), and a vote on either post reaches nobody: they have no author, so no
+  `reactions` row matches (the wake-up's vote line shows the votes on `#1`, below). A withdrawn vote (`none`) tells
+  nobody; a changed vote is a new `f_vote`.
+- **The user's posts and comments** reach every member as a waking item, whatever its subscriptions and the
+  mode of its feed: `f_post` for a post, `f_comment` / `f_reply` for a comment (`f_mention` when it names the
+  member). They are never deferred, like every message of the user (§5).
+- **Votes never wake anyone.** `f_vote` is always written with `notify(..., wake=False, batch=True)`, whatever the mode
+  of the `reactions` row, and never counts for the digest clock (below): a digest of votes alone never wakes its member;
+  it comes with the member's next wake-up, incoming render or `wait_for_events` result. A `reactions` row in `wake`
+  wakes for comments, replies and edits only; every `subscribe` result for a `reactions` row in `wake` says so (`s2
+  (reactions to your posts and comments): mode changed to wake (votes always come in your digest).` for the automatic
+  row, §22.5), and so does the tool's description (§22.5). Votes on `#1` are nobody's reactions (it has no author): the
+  vote line of every wake-up shows them (§22.6), and the decision comes as the quiet `n_goal_decided` (§22.4). Reactions
+  to a member's own posts and comments reach it only through its `reactions` row (a digest by default, nothing once it
+  removed the row): the wake-up keeps no list of its posts and no "since the last wake-up" mark (§22.6). The read
+  marks of §22.11 are no such mark: they gate the member's writes and never select or hold back its news.
+- **Quiet new posts** (as §5 "Quiet broadcasts"): a `post.created` of a member (not USER) reaches a member X that
+  matched only through `feed` rows in `wake`, without a mention, while `swarm.waits_for_job(X)`: the item is stored
+  waking but not signalled (`notify(..., defer=True)`: `has_pending` is true, then `defer_wake(X)`), so the job's
+  end shows the post in the same wake-up, and `_wake_deferred` wakes X should that wait end otherwise (§3
+  scheduler). Comments, edits, file items, reactions and mentions wake as usual: they are what the member chose to
+  follow closely. In a thread session `JobManager._works_on(name)` (goal active, or `_holds_in_progress`) stands
+  for "holds an in_progress task" in `busy` and `wakes` (§7.1), so `waits_for_job` holds for a member waiting for
+  its own job there too (§22.7).
+
+**USER** has no subscriptions. It is told only of: a mention of it (`f_mention`, by anyone but itself); a
+comment on a post it wrote (`f_comment`); a reply to a comment it wrote (`f_reply`); and its own `u_*` items
+(`u_goal_decided`, `u_thread_quiet`, `u_jobs_running`, `u_budget_low`, `u_agent_error`...; never `u_goal_done`, since
+every thread completion is a decision, §22.4). It is never
+told of votes, edits, new posts or file changes: the thread tab shows them, its dot marking news (§22.8). The system
+posts have no author, so a comment on `#1` or `#2` reaches USER only through a mention or as a reply to one of its
+own comments (e.g. the one `reopen_goal` posts). Its items are notification rows like every USER notification (§3
+`notify`: never quiet; the signal ends a user MCP client's `wait_for_events`), with the waking 1500-character cut;
+the TUI and print mode show them (§22.8, §22.9). The user's `/api/act` calls and TUI commands act as USER, so the
+user never gets its own events.
+
+**Texts** (prompts.py `THREAD_KEYS`, en/ru; ru texts address the member as «ты», like the board's). `{post}` is the
+post's number, `{title}` its current title, `{comment}` / `{reply_to}` comment ids as `c31`; `{text}` is the post's
+or the comment's text cut with `board._clip` to 1500 characters for a waking item or 200 for a digest item (the rest
+through `post_read`). The row stores its text rendered at insert (§3 `notify`), so a digest item the scheduler later
+turns waking keeps its 200 characters. `{by}` is the actor's name (`user` for USER), for `f_file` the editors. Every
+`f_*` row of a member but `f_file` also holds `_read` in its data (data only): the read marks its text carries whole,
+applied when it is shown (§22.11 "What moves a mark").
+- `f_post` {by, post, title, text}: `{by} posted #{post} "{title}": {text}` / `{by} опубликовал(а) #{post}
+  «{title}»: {text}`.
+- `f_comment` {by, post, title, comment, text}: `{by} commented on #{post} "{title}" ({comment}): {text}` / `{by}
+  прокомментировал(а) #{post} «{title}» ({comment}): {text}`.
+- `f_reply` {by, post, title, comment, reply_to, text}: `{by} replied to your comment {reply_to} on #{post}
+  "{title}" ({comment}): {text}` / `{by} ответил(а) на твой комментарий {reply_to} к #{post} «{title}» ({comment}):
+  {text}`.
+- `f_edit` {by, post, title}: ``{by} edited #{post} "{title}"; read it with `post_read`.`` / ``{by} изменил(а)
+  #{post} «{title}»; прочитай через `post_read`.``.
+- `f_vote` {by, value, target, title}: `{by} rated your {target} "{title}": {value}.` / `{by} оценил(а) твой
+  {target} «{title}»: {value}.`; `{target}` `#9` for a post or `c31 (#9)` for a comment, `{title}` the post's,
+  `{value}` `vote_like` / `vote_dislike` in the recipient's language ("like" / «нравится», "dislike" / «не
+  нравится»).
+- `f_file` {by, files, more, paths, editors}: `Files changed ({by}): {files}.` / `Изменены файлы ({by}): {files}.`;
+  `paths` is the list of distinct changed workspace paths in order of first change, capped at 200 (the first ones
+  kept); `editors` is the list of distinct editor names (the actor and the suspects, `user` for USER). `{files}` is
+  `workspace.shown_list(paths, 5)` (`src/a.py, src/b.py (+7)`); `more` is the number of changed paths not named,
+  counting the ones past the 200 cap; `{by}` is `workspace.shown_list(editors, 5)`. `paths`, `editors` and `more` are
+  data only. An `f_file`, like `files.committed`, moves no file read mark: it carries no content (§7.3).
+- `f_mention` {by, post, title, comment, text}: ``{by} mentioned you on #{post} "{title}"{comment}: {text}\nIf it
+  needs your answer, comment on #{post} with `comment` (reply_to the comment when it was one).`` / ``{by}
+  упомянул(а) тебя в #{post} «{title}»{comment}: {text}\nЕсли нужен твой ответ, напиши комментарий к #{post} через
+  `comment` (с reply_to, если это был комментарий).``; `{comment}` is ` (c31)` for a mention in a comment, `''` for
+  one in the post. USER gets the same key (as the board sends USER `n_mention`); the board's `n_mention` stays
+  board-only.
+
+**Digest items**
+- A digest item is a member notification whose data has both `_quiet` and `_digest` (`swarm.DIGEST_KEY`, next to
+  `QUIET_KEY`). Only the forum's delivery writes one, through `notify(..., wake=False, batch=True)`. Every other
+  quiet notice (`n_goal_decided`, `n_network_*`, `n_job_gone`, the skills notices, `n_trigger_held`,
+  `n_wrap_up_end`, `n_wrap_up_votes_cleared`, `n_user_answer_thread`...) keeps its §3 meaning: news for the next
+  wake-up that never starts a digest wake-up and is rendered under `reasons`.
+- `has_pending` is unchanged: digest rows are quiet and do not count. A due digest wakes a member only by becoming
+  waking news: the scheduler drops `_quiet` from the member's undelivered `_digest` rows in one UPDATE
+  (`json_remove`), then calls `signal(name)`. A bare signal would not do it (§6.2: an activation is skipped when
+  nothing is pending).
+- `Swarm.digest_deadline(name)`: None unless the goal is active; else, over the undelivered `_digest` rows of `name`
+  other than `f_vote`, the earliest `max(ts, _digest_floor) + [agents] digest_seconds` (read at each use, ≥ 10,
+  session overrides apply), None when there is none. `_digest_floor` (in memory) is the time of the last `start()`
+  or `resume()`: time spent stopped or paused does not age a digest. One rule for both kinds of member:
+  - **AI agents**: `_deliver_digests` (§22.7 T1), unless paused and only while the goal is active, wakes each member
+    of `_idle_llm_members` (idle, a runtime, nothing pending, not `jobs.busy`) whose `digest_deadline` has passed,
+    while `_timers` is empty (§22.7 T1), once, with all it has gathered. A working member gets its digest items in
+    the incoming render between its steps (§6.2), a member waiting for its own job with that job's end, one with
+    other news with that wake-up: those rows are delivered and never fall due. So a member that keeps the feed in
+    `digest` still takes part, in rounds of about `digest_seconds` instead of at every comment.
+  - **External members**: `wait_for_events` (§12) also caps each sleep at the caller's `digest_deadline` and returns
+    once it has passed. Waking items return at once, as now; when the timeout comes first, the result still holds
+    the digest items gathered so far (an incoming render delivers every undelivered row). With `progress=true` the
+    progress lines come on top (§22.5): they never replace the digest.
+- While there is no goal or the goal is done, nothing is batched: digest rows wait for the member's next wake-up,
+  incoming render or `wait_for_events` result, so a decided goal costs no wake-up for the comments that follow it.
+  Mentions, the user's posts and comments, `wake` rows and messages still wake. After `reopen_goal` or a new goal the
+  old rows are past due; each AI agent gets them with its staggered notice (T1 waits while `_timers` holds one,
+  §22.7).
+- After a start or a resume a member whose only news is digest items gets no `n_restart` / `n_resumed` (§3): the
+  batch wakes it at most `digest_seconds` later. While the goal is active and an idle AI agent holds an undelivered
+  digest row other than votes, the team is not asleep (§22.7 `team_asleep`), so `n_thread_quiet` never comes ahead
+  of a due digest.
+- **Rendering**: `render_wake` splits the undelivered rows by `_digest`; the digest rows form the wake-up's `digest`
+  group, at most 30 lines: the rows other than `f_vote` first, then the `f_vote` rows, each part in (ts, id) order
+  (votes never start a batch, so they can pile up and must not hide the comment that woke the member), after the
+  news (§22.6 "Wake-up"), and every one of them is marked
+  delivered, the ones left out too. The same holds for an incoming render and a `wait_for_events` result. A board
+  session writes no `_digest` row, so its wake-up does not change. Only the rows shown move read marks
+  (`forum.note_shown`, §22.11): a digest row left out is delivered but not read.
+
+**File subscriptions**
+- They see two events: `file.changed` {path, op} (write_file / edit_file, the editor as actor, §7) and
+  `files.committed` (§22.2), which a thread session's workspace (`Workspace.commit_events`) emits after a whole-tree
+  autocommit (a `shell` call, a job's end) and after each per-owner commit of held new files (§7 "Held new files"),
+  never for a single-path commit of write_file / edit_file (it has its `file.changed`). `file.changed` itself is
+  unchanged, so the triggers' `file_changed()` counting and own-edit rule stay as in §8.
+- A path matches a target `''` always, else when its `workspace.path_key` equals the target's or lies under it
+  (folder prefix with `/`). Paths under `.scratch/` (only `file.changed` has them: nothing there is committed) are
+  skipped unless the target itself is inside `.scratch/` (`in_scratch`).
+- Own changes: a `file.changed` of X is never X's news; a `files.committed` is skipped for X only when X is its sole
+  suspect, else it is delivered with the suspects as `{by}`. `by` = Y matches when Y is the event's actor or one of
+  its suspects. The attribution of shell and job changes is approximate (git cannot tell who wrote a file: the
+  suspects are the commit's actor and the members whose commands were running then, §7). With `[workspace] git` off
+  there is no `files.committed`, and only write_file / edit_file changes are seen; the `subscribe` description says
+  both (§22.5).
+- **Coalescing**: while the member has an undelivered `f_file` row of the same delivery (digest, or waking), a new
+  matching change is merged into it in place (the row's data `paths` and `editors` extended by the change's new
+  ones, `paths` up to 200, with every path past the cap added to `more`; `files`, `by` and `more` recomputed from them
+  and `text` rendered again with `prompts.t`; `ts` and any `_settle.first` kept, so the digest clock and the settle
+  cap count from the first change; `_settle.last` set to the new change's time) instead of a row of its own.
+- **Settling**: a waking `f_file` waits until the run of changes settles, by the rule of §8 `file_changed()`: no
+  new matching change for `[agents] file_settle_seconds` (0: at the next pass), or `file_max_wait_seconds` (0: no
+  cap) after the first one. It is stored quiet with `_settle` {first, last} in its data (no `_digest`), and the
+  thread scheduler (§22.7 T1), unless paused and whatever the goal's state (a `wake` row is the member's own choice),
+  drops `_quiet` and `_settle` from it once settled and signals its member, an AI agent or an external one. While
+  such a row is undelivered the team is not asleep (a wake is set). A digest `f_file` follows the digest rules
+  above.
+
+### 22.4 The goal and its vote
+
+A thread session has the same goal as the board (kv `goal`, `set_goal` / `complete_goal` / `reopen_goal`, §3), with
+no planning task and no `goal_complete`: the plan is a discussion by everyone in `#2`, and the goal is decided by the
+votes on `#1`, or by the user directly. Every text below is in prompts.py `TEXTS` (en/ru; ru alike, «ты» in the
+agents' notices, «вы» in the posts, е, never its dotted form); the agents' notices are THREAD_KEYS (§22.6) and name
+only tools of the thread tool set (§22.5, R0′).
+
+- **The system posts.** `Forum.ensure_system_posts(goal) -> bool` writes `#1` and `#2` in the swarm's language
+  (`Swarm.language`), author NULL, with the explicit ids 1 and 2 (§22.1: ordinary posts start at `#3`, so a post
+  made before the first goal never takes them). True when it created them (the forum had none: the session's first
+  goal), False when it rewrote them.
+  - `#1`, kind `goal`: title `post_goal_title` «Цель достигнута?» / "Goal reached?", text `post_goal_text` {title,
+    description, rule}: `**Goal:** {title}`, the description, then ``The goal is decided by the votes on this post,
+    rule: {rule}. Democracy: more than half of the team's own AI agents like it; veto: all of them like it and none
+    dislikes it. Votes of members who joined through MCP and of the user are shown, not counted. Like this post only
+    after checking the result yourself against the goal (open the files, run the code); otherwise dislike it and say
+    in a comment what is missing. Change your vote when things change.`` (ru «**Цель:** {title} … Цель решается
+    голосами под этим объявлением, правило: {rule}. …»); `{rule}` is `rule_democracy` «демократия» / "democracy" or
+    `rule_veto` «вето» / "veto".
+  - `#2`, kind `plan`: title `post_plan_title` «Спланируем работу» / "Let's plan the work", text `post_plan_text`
+    {title, description}: `**Goal:** {title}`, the description, then ``Discuss here, in the comments, how to split the
+    work and who does what. Nobody plans for the others and nobody is in charge: propose, agree, take a part yourself
+    and say so here. Post findings, results and questions as posts of their own.`` (ru «Обсудите здесь, в
+    комментариях, как разделить работу и кто что делает. Никто не планирует за других и никто не главный: …»), and,
+    when the session clarifies (below), `post_plan_clarify` ``First one member asks the user about the goal's open
+    points and comments the answers here; plan after them.`` (ru «Сначала один участник уточняет у пользователя
+    открытые вопросы цели и пишет ответы здесь в комментарии; планируйте после них.»). `#2`'s `data` is `{"clarify":
+    bool, "asker": name | null}` (§22.1).
+  - Creating them emits `post.created` for each (actor None). Every member, the ones hired later too, follows both
+    through its automatic digest `post` subscriptions (§22.3), so nobody misses the planning discussion or the vote.
+  - A rewrite (a new goal on a forum that has them) sets both texts from the new goal (titles are fixed), `edited_at`
+    and `active_at` now, one `post.updated` {changes: ["text"]} each with actor None, then `reset_goal_votes(None,
+    "new_goal")`: every vote row on `p1` is deleted, and when there was one, one more `post.updated` of `#1` with
+    changes ["votes"] (§22.2). Comments of both posts stay (the history of the earlier goal); votes on `#2` and on
+    comments stay. `#2`'s data and its `post_plan_clarify` sentence are decided again at that moment by the rule of
+    "Clarify" below (`Swarm.clarifying`; `asker` the first LLM member or null), so a new goal set while the session
+    clarifies is clarified like the first one. A rewrite by the swarm makes no `f_edit` items: the goal notices below
+    carry it.
+  - `rewrite_goal_rule()` (a rule change, "The rule is frozen per session" below): with no `#1` it does nothing
+    (False). Otherwise it formats `post_goal_text` from the current goal's title and description and
+    `Swarm.goal_rule`. If the text equals the stored one it does nothing (False, no event). Else it sets `#1`'s text,
+    `edited_at` and `active_at` to now in one `db.transaction()`, then emits one `post.updated` {changes: ["text"]}
+    with actor None and returns True. It makes no `f_edit` items and finds no mentions. The votes on `p1`, `#2` (its
+    text, its `data`, its `edited_at`) and all comments stay as they are. A done goal's `#1` is rewritten too: the
+    vote stays closed.
+- **`set_goal`** in a thread session (§3): the goal dict, `goal.set` and `end_wrap_up` as on the board; no planning
+  task is created, ever. Then, whether or not the swarm is started, `first = forum.ensure_system_posts(goal)`, and
+  only when `_started`: `_kickoff_thread(actor, goal, first)`. A new goal writes a fresh dict, so `decision` and
+  `completed_by` go with the old one.
+- **`_kickoff_thread(actor, goal, first)`** sends, through `notify_later` (so `team_asleep`'s `_timers` check covers
+  the stagger), to every LLM member, in an order shuffled once per notice round
+  (`random.Random(goal["updated_at"]).shuffle` of the LLM members list; members order plays no part, so no member is
+  always the first to read #2), the `i`-th of that order as `i`:
+  - `first`: `n_kickoff_thread` {by, title, description, team} (team = "Name — Role; ..." of all members, as
+    `n_kickoff`), after `i × agents.stagger_seconds`, waking;
+  - not `first`: `n_goal_updated_thread` {by, title, description}, staggered the same way, waking;
+  - `#2`'s data `clarify` true (the first goal or a new one): only the asker gets the waking `n_kickoff_thread_clarify`;
+    the others get their notice (`n_kickoff_thread` when `first`, else `n_goal_updated_thread`) quietly (`wake=False`);
+    see "Clarify" below. The asker stays the first LLM member in members order ("Clarify" below) and gets its notice
+    at once, whatever the shuffle; the quiet notices of the others are not staggered.
+  - No `_nudged` and no `_considering` entry: there is no card to offer. A swarm with no LLM member sends nothing.
+    The texts of these notices and of every other agent notice below are in §22.6.
+- **The first start.** `start()`'s branch "the goal was set before the very first start" (goal active, no members
+  before this start, not paused) calls `_kickoff_thread(USER, goal, True)` in a thread session, never `_kickoff`:
+  the system posts were written by that earlier `set_goal` (one called before `start()`), but nobody has been told.
+  The `swarm.goal and not goal` branch, a session's pending goal and `run --goal` call `set_goal` after `_started`,
+  so they need nothing more. A start of a thread session also calls `forum.rewrite_goal_rule()` and then
+  `forum.recheck_goal(None)` once, after the starting team exists and before the restart notices, so a goal that a
+  rule change or a retire met while the session was stopped is completed before anyone is woken for it.
+- **The rule and the counted voters.** `Swarm.goal_rule` (`config.swarm.goal_rule`, frozen per session: below):
+  `democracy`: more than half of the counted voters like `#1`; `veto`: every counted voter likes `#1` and none
+  dislikes it. The counted voters are the swarm's own active AI agents (`agent_count()`, §3): members who joined
+  through MCP and the user may vote on `#1`, their votes are shown (§22.8) and never counted; a retired member's vote
+  row stays and is not counted. Only likes count for the rule: each voter has one vote on `#1`, so under veto "none
+  against" follows from "all for", and a dislike or a withdrawal only keeps a voter out of `for`.
+  `forum.goal_tally(conn, rule)` is the one rule (pure, also `sessions.read_stats` on a stopped session's file; its
+  shape and `needed`: §22.2); `met` requires counted ≥ 1 and at least one counted like, so there is no vacuous veto:
+  with every AI agent retired only the user can complete the goal. `Forum.goal_vote()` returns it, None while there
+  is no `#1`.
+  - The vote line (the wake-up's goal line, `#1` in `post_read`, `feed`, `vote`'s result on `#1`, the quiet notices):
+    `goal_vote_line` {rule, for, counted, against, needed} ``Goal vote (#1, {rule}): {for} of {counted} for,
+    {against} against; needs {needed}.`` (ru «Голосование по цели (#1, {rule}): за {for} из {counted}, против
+    {against}; нужно {needed}.»), under veto `goal_vote_line_veto` ``… {against} against; needs all {needed} and none
+    against.`` (ru «…; нужны все {needed} и никого против.»); here `for` and `against` are counts.
+  - The agents' tool descriptions and the system prompt stay rule-neutral ("the session's rule, on #1", as for
+    independent review, §4.1); `#1`'s text and the vote line name the rule.
+- **Re-evaluation.** `Forum.recheck_goal(actor) -> bool` takes `goal_vote()` and, when it is `met` and the goal is
+  active, completes the goal (below) and returns True. It runs after every vote on `#1` (`Forum.vote`, a withdrawal
+  included: a withdrawal never meets a rule, since only likes count, but the check runs on every vote), with actor =
+  the voter when it is a counted voter, else None; after every `retire` (actor None; a hire never meets the rule: it
+  adds a counted voter with no vote, since a name is never reused, or nobody counted, so it runs no re-check); after
+  a rule change (`_goal_rule_changed`, actor None); and once at every start (above). Votes on `#1` are refused while
+  the
+  goal is not active (§22.2), so a decided vote stays as it was until a reopen or a new goal.
+- **Completion by the vote.** `complete_goal(actor: str | None, summary, *, decision=None)` (§3): `decision` =
+  `{"rule", "for": [names], "against": [names], "counted": n, "wrap_up": bool}` (`wrap_up` = `wrapping_up` at that
+  moment) is stored in kv `goal` with status done, `summary` and `completed_by` = actor, in the one `db.set`;
+  `goal.completed` keeps its name and carries the goal with its `decision` (`stop_when_done`, §21.4, and the v1
+  timeline depend on it); its actor is the decisive voter, or None (eventtext, the progress lines and the web Events
+  tab, §22.8, show "by vote (rule)" / «голосованием (rule)» when the goal has a `decision`, §22.2, never "None").
+  - `summary` is generated in the swarm's language, never written by a member: `goal_decided` {rule, n, counted,
+    names, against} ``The goal is reached by vote ({rule}): {n} of {counted} for — {names}; against: {against}. The
+    artifacts are the shared workspace.`` (ru «Цель достигнута голосованием ({rule}): за {n} из {counted} — {names};
+    против: {against}. Артефакты — общая рабочая папка.»), or, with `wrap_up` true, `goal_decided_wrap_up` ``The team
+    finished the work by vote in wrap-up mode ({rule}): {n} of {counted} for — {names}; against: {against}. What was
+    done and what is left is in the feed; the artifacts are the shared workspace.`` (ru «Команда завершила работу по
+    голосованию в режиме завершения ({rule}): за {n} из {counted} — {names}; против: {against}. Что сделано и что
+    осталось — в ленте; артефакты — общая рабочая папка.»); names joined with ", ", `against` "—" when nobody.
+  - USER gets the waking `u_goal_decided` {rule, for, against, counted, summary} ``The team's vote on #1 completed
+    the global goal: {summary}`` (ru «Голосование команды на #1 завершило глобальную цель: {summary}») in place of
+    `u_goal_done`, which formats `{by}` and is never sent for a decision; the data's name lists serve the surfaces.
+    `u_jobs_running` follows as on the board. `u_goal_decided` is in `tui/render.py` `_QUIET_SKIP_NOTES` next to
+    `u_goal_done`.
+  - Every active LLM member gets the quiet `n_goal_decided` {rule, for, against} (names, "—" when none; §22.6);
+    `{rule}` here may also be `rule_user` «решение пользователя» / "the user's decision". External members read
+    `goal.completed` from their events.
+  - After the decision nothing wakes a member for the forum but mentions, the user's posts and comments, wake-mode
+    subscriptions and messages: digest batching and the quiet check run only while the goal is active (§22.7), so a
+    done goal costs no rounds.
+- **The user completes the goal.** The user is the only one who completes a thread goal directly (no surface did
+  before; agents and MCP-joined members complete it only through the vote; `goal_complete` is board-only, §22.5).
+  `Swarm.complete_goal_by_user(summary: str = "") -> dict`: a board session raises `In a board session the members
+  complete the goal with goal_complete.`; no goal / already done raise `complete_goal`'s errors; else
+  `complete_goal(USER, text, decision={"rule": "user", "for", "against", "counted", "wrap_up"})` with the counted
+  votes as they stand (`goal_tally`), text = the user's summary stripped, or `goal_completed_by_user` {vote} ``The
+  user marked the goal reached. {vote} The artifacts are the shared workspace.`` (ru «Пользователь отметил цель
+  достигнутой. {vote} Артефакты — общая рабочая папка.»; `{vote}` the vote line). With rule `user` USER gets no
+  `u_goal_done` nor `u_goal_decided` (the caller's result says it is done; `u_jobs_running` still comes), and every
+  LLM member gets the quiet `n_goal_decided` with rule `user`. The independent-review check of `goal_complete` does
+  not apply (a thread session has no reviews). The votes on `#1` stay frozen until a reopen.
+  - The tool: `swarm_control` (audience user, the live registry, so no frozen set changes, §22.5) gains, in its
+    thread variant only (§22.5: a board session keeps its schema, where both are ignored arguments), `complete_goal`
+    (boolean) and `goal_summary` (string, optional). Checked first, nothing applied: `complete_goal` with
+    `reopen_goal_comment` in one call is
+    refused `Pass either complete_goal or reopen_goal_comment, not both.`; `goal_summary` without `complete_goal` is
+    refused `goal_summary goes with complete_goal.` Then the limits, then the completion (its errors name what was
+    applied, as `reopen_goal_comment`'s do), then `action`, then `wrap_up`; `Done: ...` lists `goal marked reached`.
+  - Surfaces (§22.8, §22.9): the board's `#1` card and `goalModal` of an active goal in a thread session: «Цель
+    достигнута» / "Mark goal reached", with a confirm and an optional summary field; the TUI's `/done [summary]`;
+    the hub MCP and the launcher MCP's per-session tools as the user (`swarm_control`); HTTP API v1 PATCH
+    `complete_goal` / `goal_summary` (thread only; 409 `not_running` on a session that does not run, 409 `conflict`
+    when its goal is not active, §22.9). `dreamteam -p` and v1 `continue` never complete a goal.
+- **Reopen.** `reopen_goal(actor, comment)` (only a done goal, else ToolError, as now): status active, `goal.reopened`
+  {goal, comment} and `end_wrap_up` as on the board; in a thread session also `decision` popped and `summary` "" in
+  the same `db.set` (anything that shows `decision` shows it only while the status is done), then
+  `forum.reopen(actor, comment)`:
+  - every vote on `p1` is deleted (`reset_goal_votes(actor, "reopened")`: one `post.updated` of `#1`, changes
+    ["votes"], actor USER for the user's reopen);
+  - the comment, stripped, is posted on `#1` as a comment by USER unless it is empty or exactly "-" (the board's "no
+    comment" filler, static/app.js `goalModal`, and the TUI's): `post.comment` is emitted. The LLM members get no `f_*`
+    item for it, an `@mention` in it included: the waking notice below carries its text, one notification each. External
+    members get the waking `f_comment` every USER comment gives (`f_mention` when it names them, §22.3), so a member
+    that joined over MCP learns of the reopen and its comment from `wait_for_events`; a reopen without a comment reaches
+    it only as the `goal.reopened` progress line (§22.5). The comment is never refused: `Forum.reopen` stores it cut
+    with `board._clip` to `board.MAX_POST` (20 000) characters, not through `comment`'s length check, so a reopen never
+    fails after its `db.set` (a `continue` text may hold 50 000); `goal.reopened` and `n_goal_reopened_thread` carry the
+    comment as given. The text of `-p -r` and v1 `continue` on a done goal is such a comment.
+  - every active LLM member, in the shuffled order of the kickoff (seeded with the reopened goal's `updated_at`), the
+    `i`-th as `i`, gets the waking `n_goal_reopened_thread` {title, comment} (comment "-" when none, §22.6), through
+    `notify_later` after `i × agents.stagger_seconds`, as the kickoff does. `completed_by`
+    chooses nobody in a thread session: it is only the last voter. There is no scheduler offer (board item 1).
+  - The digest rows left from before the decision come with each member's `n_goal_reopened_thread` wake-up (T1 runs
+    no batch while the staggered notices are pending, §22.7); no re-arm step is needed.
+- **The rule is frozen per session.** `SessionManager.create` writes the effective `swarm.goal_rule` into a thread
+  session's overrides next to `swarm.mode` = "thread", also when it equals the default (§22.8), so `[swarm] goal_rule`
+  of the settings is only the default for new thread sessions and a global save never changes a session's rule (nor
+  completes its goal). Only that session's own settings change it: its ⚙ dialog, a partial update (`update(sid,
+  settings=...)`, §17.2), the TUI's `/rule`, v1 PATCH `goal_rule`; clearing it (null or "") is a 400 `the goal rule of a
+  thread session cannot be cleared`. A running session gets it through `reconfigure` (§3): its hook
+  `_goal_rule_changed()` (thread session, started, not stopping, `old.swarm.goal_rule != config.swarm.goal_rule`)
+  calls `forum.rewrite_goal_rule()` ("The system posts" above: `#1`'s text only, votes and `#2` untouched) and then
+  `forum.recheck_goal(None)`; a stopped session's change only writes its overrides, and its next start rewrites `#1`
+  and re-evaluates it (above). A board session ignores `goal_rule` (create writes none for it, nothing reads it).
+- **Wrap-up mode** (`swarm_control` wrap_up, §3) keeps the rule and `#1`; while it is on, a like on `#1` means
+  "finish with what we have", not "the goal is reached", and the thread system prompt says so (§22.6).
+  `_check_all_done` and `n_all_done_wrap_up` do not exist in a thread session (§22.7): the vote, or the user,
+  completes the goal; the mode itself ends as on the board (`end_wrap_up`).
+  - `wrap_up()` sends `n_wrap_up_thread` in place of `n_wrap_up`, waking every LLM member once, and every wake-up
+    then carries `wrap_up_line_thread`: post the results so far and what is left, stop the jobs nobody needs, start
+    nothing new, then like `#1` (dislike only while finishing something nearly done, saying what in a comment); the
+    texts, the jobs' refusal and the quiet check in wrap-up are §22.7's.
+  - Votes cast before the wrap-up are kept (no reset; `n_wrap_up_thread` asks to vote again); a decision met during
+    it has `wrap_up` true and the summary `goal_decided_wrap_up`. In wrap-up `u_thread_quiet` comes with the first
+    quiet nudge, not the second (§22.7).
+  - `end_wrap_up(actor, clear_votes=True)` (§3): `set_goal` and `reopen_goal` pass `clear_votes=False`, since they
+    reset the votes themselves; the user's switch-off (`swarm_control` wrap_up=false, as the TUI's `/wrapup off` and
+    v1 PATCH call it) keeps the default. In a thread session, when `clear_votes` is true and the goal is active, it
+    also calls `forum.reset_goal_votes(actor, "wrap_up_end")` (one `post.updated` of #1 with ["votes"], only when it
+    deleted a row), so the likes cast to mean "finish with what we have" are never counted as "the goal is reached",
+    and every LLM member gets the quiet `n_wrap_up_votes_cleared` in place of `n_wrap_up_end`: `Wrap-up mode is off:
+    background jobs are allowed again. The votes on #1 were cleared: a like there means "the goal is reached" again;
+    like it only after checking the result yourself.` / `Режим завершения выключен: фоновые процессы снова
+    разрешены. Голоса на #1 сброшены: «нравится» там снова значит «цель достигнута»; ставь его, только проверив
+    результат сам.` Otherwise (a new goal, a reopen, or a switch-off with no goal or a done goal, whose votes stay
+    frozen until a reopen) it sends the quiet `n_wrap_up_end` as on the board.
+- **Clarify** (§3.1) in a thread session: no card; the decision is `#2`'s data, written whenever `ensure_system_posts`
+  creates or rewrites them: `{"clarify": Swarm.clarifying, "asker": the first LLM member or null}` (null while the
+  session has no member yet: `_kickoff_thread` then writes the first LLM member into it). Never rewritten when the
+  setting changes later, only with the posts for a new goal (above). Every bound below counts from `#2`'s last write by
+  the swarm, `since` = `#2`'s `edited_at`, else its `created_at` (only `ensure_system_posts` writes `#2`, §22.2; the
+  asker `_kickoff_thread` writes into the data leaves `edited_at` as it is), so messages and comments from an earlier
+  goal do not end a new goal's clarify phase.
+  - Kickoff: only the asker gets a waking `n_kickoff_thread_clarify` {by, title, description, team}, at once; the others
+    get their kickoff notice (`n_kickoff_thread`, or `n_goal_updated_thread` for a new goal) quietly (`wake=False`) and
+    wake on the asker's comment on `#2` through their automatic `#2` subscription (digest batching, §22.3) or on a new
+    post through the feed. The asker finds the goal's forks; with none it comments on `#2` that there are no questions;
+    else it sends ONE `send_message` to ["user"] with pause_swarm=true (numbered questions, at most seven, each with its
+    options and the default), waits, posts and researches nothing before the answer, then comments on `#2` the decisions
+    and the defaults it takes; from then on the planning in `#2` is everyone's and the asker leads nothing (the text:
+    §22.6).
+  - The guards of §3.1 re-target from "the holder of a clarify card" to "the kickoff asker of a clarify `#2`":
+    `asks_user(name, task=None)` holds when `config.swarm.clarify` is on, `#2`'s data has `clarify` true and `asker` =
+    `name`, and `autoreply.planner_question(scalar, name, 2, since, plans=autoreply.PLANS_THREAD)` is not None;
+    `PLANS_THREAD` (`SELECT 1 FROM post_comments WHERE author = ? AND post_id = ? AND ts >= ? LIMIT 1`; its parameters
+    are (asker, 2, since)) is the thread's "plans already" bound: the asker has commented on `#2` since its last
+    write. `_awaits_user_answer` is the same without the setting. `planner_question(scalar, name, task_id, since, *,
+    plans=PLANS)` gains the keyword `plans` (default `PLANS`, the board's) and runs `scalar(plans, (name, task_id) if
+    plans is PLANS else (name, task_id, since))`, so the board's call is unchanged, and so the guard, the snapshot's
+    `clarify_wait` = `{"name": asker, "post_id": 2}` (§14.1) and the requests of §21.5 (read from `#2`'s data in a
+    thread session's file) cannot drift apart. The quiet check stands down while `asks_user` holds (§22.7), as item 9
+    does for a clarify planner.
+  - **The clarify phase**: the asker is in it while it has neither messaged USER since `#2`'s last write (the `_LAST_TO`
+    query with that `since`: the flag is written only then) nor commented on `#2` since then (a comment on `#2` is the
+    thread counterpart of `_plans`: it said there is nothing to ask, or the team plans already). The guards below, the
+    hint and the quiet check's choice of whom (§22.7) use this one bound.
+  - `hint_planner(name)`, the agent's call after each step (§6.2), runs only this branch in a thread session (the
+    scheduler does not call it, §22.7): one watch, `_planning_watch["p2"]`, on the asker (an LLM member with a
+    runtime) while it is in its clarify phase. It gets `n_clarify_hint_thread` {steps, elapsed} after
+    `agents.planning_hint_steps` steps or `planning_hint_minutes` since the swarm first saw it after its kickoff,
+    once more at twice either value after at least one step since the first, never a third time (the
+    `n_clarify_hint_thread` rows to the asker since `goal.updated_at` are counted when the watch starts), with the
+    guards of §3 item 4: `[swarm] clarify` on, two members at least, goal active, not paused, not in wrap-up, and
+    `asks_user` drops the watch; `resume` moves its start on by the pause's length (§3 `resume`). There is no
+    `n_planning_hint` in a thread session: once the asker has asked, nothing hints it. An asker that went idle
+    without asking is not caught by this step trigger: the quiet check wakes it first (§22.7).
+  - `[swarm] clarify` switched off (live or at start, §3.1): `_clarify_switched_off` gives the asker that is in its
+    clarify phase or `_awaits_user_answer` a waking `n_clarify_off_thread` (once per write of `#2` with `once`: not when
+    a `notifications` row of kind `n_clarify_off_thread` to the asker has `ts` ≥ `since`); then `_drop_question(USER,
+    "clarify_off")` as on the board.
+  - Answers and unanswered questions (any member's question, §3.1) use `n_user_answer_thread`,
+    `n_user_answer_seen_thread` and `n_question_unanswered_thread` (§22.6), which say to comment the answers or the
+    assumptions on `#2`; no text names CONTRACTS.md or tasks. After an answered question the resume's `n_resumed`
+    wakes the members with pending news or a cut activation (a thread session has no tasks): the asker, whose answer
+    is unread; the others got `n_user_answer_thread` quietly and wake when the asker comments the answers and the
+    defaults on `#2`, through their automatic `post` subscription to `#2` (digest, so T1 delivers it, §22.7) or a
+    wake subscription of their own. A manual resume gives the asker the waking `n_question_unanswered_thread`; its
+    comment wakes the others the same way.
+- **Artifacts.** The goal's artifacts are the shared workspace, never the members' `.scratch/` folders (never
+  committed, §7); no member writes a summary (only the user may, when completing the goal directly) and there is no
+  stored list: kv `goal` has no `artifacts`, `base_commit` or `set_at`, and the generated summaries above end with
+  «Артефакты — общая рабочая папка.» / "The artifacts are the shared
+  workspace.". What changed is read where it is read already: the board's and the TUI's workspace views, the
+  `files.committed` events (§22.2), and v1's `result.changed_files` against `api.base_commit` (§21.7), unchanged.
+- **Tests** (tests/test_forum.py, ScriptedLLM, no network):
+  - `set_goal` before the first start writes `#1` (kind goal) and `#2` (kind plan) with ids 1 and 2, so a later post is
+    `#3`, and creates no planning task; the first `start()` then sends every LLM member `n_kickoff_thread`, staggered by
+    `agents.stagger_seconds` through `notify_later` (the order is the seeded shuffle of §22.4; a test pins `time.time`
+    or checks the set of recipients and the delays {0, s, 2s, ...}, not who gets which delay), and no member gets
+    `n_kickoff`, `n_goal_updated` or
+    `n_goal_updated_thread`; the same with a session's pending goal and `run --goal`;
+  - the first start's starting team, made by `_create_member` and not by `hire`, gets the automatic subscriptions (feed,
+    reactions, `#1`, `#2`, all digest), the thread system prompt and the thread role texts (a reviewer starts as
+    «Критик» / "Critic");
+  - with `[swarm] clarify` off, a new goal while running rewrites `#1` and `#2` (one `post.updated` {changes: ["text"]}
+    each, actor None, then one `post.updated` of `#1` with ["votes"] when it had votes), deletes every vote on `p1` and
+    keeps the votes on `#2` and on comments, makes no `f_edit` items, sets `#2`'s data to `{"clarify": false, "asker":
+    null}` and sends every LLM member the waking `n_goal_updated_thread`, never `n_goal_updated`; still no planning
+    task;
+  - with `[swarm] clarify` on, for the first goal and for a new one, `#2`'s data is `{"clarify": true, "asker": <the
+    first LLM member>}`, only the asker gets the waking `n_kickoff_thread_clarify` and the others get `n_kickoff_thread`
+    (a new goal: `n_goal_updated_thread`) with `wake=False`; `asks_user` holds for the asker after its question and
+    stops holding once it has commented on `#2`; a message to the user or a comment on `#2` from before a new goal's
+    rewrite does not end the new clarify phase;
+  - `goal_tally` under both rules, with likes and dislikes from AI agents, MCP-joined members, USER and a retired member
+    (only active AI agents are counted); `met` is never true with counted 0 or with no counted like (no vacuous veto);
+  - `recheck_goal` completes the goal after a like on `#1` (never after a withdrawal or a dislike), after a retire,
+    after a rule change through `reconfigure`, and at a start; a hire leaves an unmet vote unmet and runs no re-check;
+    `decision` and the
+    `goal_decided` / `goal_decided_wrap_up` summary as above;
+  - `complete_goal_by_user` stores decision rule `user` with the votes as they stand, sends no `u_goal_done` and no
+    `u_goal_decided`, and sends every LLM member a quiet `n_goal_decided`; a board session refuses it;
+  - `reopen_goal` pops `decision`, deletes the votes on `p1`, posts the comment on `#1` as USER unless it is empty or
+    exactly "-" (cut to 20 000 characters when longer), gives the LLM members no `f_*` item for it and an external
+    member the waking `f_comment`, and wakes every LLM member with `n_goal_reopened_thread`, staggered (in the
+    seeded shuffle of §22.4, checked as above);
+  - under democracy with 5 counted agents, 2 like `#1` in wrap-up mode and the user switches wrap-up off: `#1` then
+    has no votes, every LLM member has a quiet `n_wrap_up_votes_cleared`, and a single later like does not complete
+    the goal; `set_goal` and `reopen_goal` in wrap-up mode each emit exactly one `post.updated` of `#1` for votes;
+    switching wrap-up off after a decision leaves the done goal's votes in place and sends `n_wrap_up_end`.
+
+### 22.5 Tools: the thread tool set (revision 6)
+A thread session has its own LLM tool set: the 23 tools of board revision 5 that are not about tasks, six of them in
+a thread wording (below), then the 9 forum tools of `tools/forum_tools.py`. It is released as **revision 6**
+(`tools/snapshots/llm_thread_r6.json`) in the one numbering both modes share (below); the board keeps revision 5
+(`llm_r5.json`, never changed). External members and the user use the live registry of the session's mode. Every
+surface refuses a tool of the other mode, so no task is ever created in a thread session and no post in a board one.
+
+**Registry modes** (tools/__init__.py; §12 holds the rest of the registry):
+```python
+MODES = ("board", "thread")
+@dataclass
+class ToolVariant:                            # a tool's texts and schema in one mode; None = the base one
+    description: dict[str, str] | None        # {"en","ru"}
+    parameters: dict | None                   # a whole JSON schema {"type":"object","properties","required"}
+@dataclass
+class ToolSpec:                               # (as in §12, plus)
+    modes: frozenset[str]                     # the session modes that have the tool; default frozenset(MODES)
+    variants: dict[str, ToolVariant]          # per mode, default {}; only "thread" is used in this version
+    def describe(self, language: str, mode: str = "board") -> str     # the variant's text, else the base one
+    def parameters_for(self, mode: str) -> dict                        # the variant's schema, else `parameters`
+@dataclass
+class ToolContext:                            # (as in §12, plus)
+    @property mode -> str                     # getattr(swarm, "mode", "board"): the session's mode (§22.1)
+def tool(name, en, ru, properties, required=(), audience=AUDIENCES, allow_empty=(), modes=MODES,
+         thread=None): decorator              # thread={"en", "ru", "properties", "required"}, each key optional:
+                                              # `properties` replaces the schema's properties (`required` then
+                                              # defaults to the base one, asserted a subset); a thread variant
+                                              # needs "thread" in `modes`
+def tools_for(kind: str, mode: str | None = None) -> list[ToolSpec]   # None: no mode filter (both modes)
+def schemas_for(kind: str, language: str, mode: str = "board") -> list[dict]   # describe/parameters_for(mode)
+def prepare_args(spec, args, usage=None, mode="board") -> dict                 # validates parameters_for(mode)
+```
+- `_MODULE_ORDER` gains `"forum_tools"` last (after `"skill_tools"`), so the registry order of every board tool is
+  what it was; `_load()` imports `forum_tools`. `schemas_for(kind, language)` without a mode still builds the board
+  array, byte for byte revision 5.
+- `call_tool(ctx, name, args)`: after the REGISTRY lookup and before the audience check, a spec whose `modes` lack
+  `ctx.mode` is refused, in the caller's language (`ctx.lang`; it reaches the user's surfaces): `Tool 'task_create'
+  is for board-mode sessions; this session works in the thread mode (no tasks): post to the feed with
+  post_create.` / «Инструмент 'task_create' — для сессий с доской задач; эта сессия работает в режиме треда (задач
+  нет): публикуй в ленту через post_create.»; for `goal_complete` the last clause is `the goal is decided by the
+  votes on #1 (vote target=#1 value=like), and the user may complete it with swarm_control complete_goal=true.` /
+  «о цели решают голоса на #1 (vote target=#1 value=like), а пользователь может завершить ее через swarm_control
+  complete_goal=true.»; the mirror in a board session: `Tool 'post_create' is for thread-mode sessions; this session
+  uses the task board: task_create.` / «Инструмент 'post_create' — для сессий в режиме треда; эта сессия работает с
+  доской задач: task_create.» (the last clause names the nearest board tool: `task_create` for `post_create` and
+  `post_update`, `task_comment` for `comment`, `board` for the others). An LLM agent never reaches it: its frozen
+  set holds only its mode's tools, and a tool it lacks is "Unknown tool" as now. The ignored-argument drop keeps its
+  rule with the mode's schema as the fallback (`params = frozen_params or spec.parameters_for(ctx.mode)`: an LLM agent's
+  own frozen schema first, so a key only a later revision has is still dropped and reported for it), and `prepare_args`
+  validates against `spec.parameters_for(ctx.mode)` (`usage=params`), so a thread caller's `mcp_create` `scope="task"`
+  is an enum error and its `task_id` an ignored argument.
+- `ToolContext.has_tool(name)`: an LLM agent's own frozen set as now; for other callers REGISTRY, audience and
+  `ctx.mode in spec.modes`. `_unknown_tool(name, kind, names=None, mode=None)` suggests `tools_for(kind, mode)`
+  (call_tool passes `ctx.mode`). `frozen.member_tool_names` uses `tools_for(kind, swarm.mode)` for non-LLM
+  members.
+- **Board-only** (`modes={"board"}`): the 9 tools of board_tools.py (`board`, `task_get`, `task_create`,
+  `task_claim`, `task_update`, `task_complete`, `task_review`, `task_comment`, `task_discussion`; `crew` and
+  `directions` go with them) and `goal_complete` (swarm_tools.py): 10 of revision 5's 33 LLM tools, hidden from
+  every audience in a thread session (all LEU, except `task_claim` and `goal_complete`, LE). **Thread-only**
+  (`modes={"thread"}`): the forum tools. Every other tool is shared, `set_goal`, `file_unlock`, `join_swarm`,
+  `mcp_approve`, `wait_for_events`, `swarm_status`, `swarm_control`, `agent_traces` and the skills tools included.
+  The `variants` of a tool outside the `llm` audience (`wait_for_events`, `swarm_status`, `swarm_control`,
+  `agent_traces`) are live texts, never frozen.
+- Hub MCP and launcher MCP listings per mode (`hub_specs(mode)`, `parameters_for`, the launcher's union with
+  `[Board sessions only.]` / `[Thread sessions only.]`): §22.9.
+
+**Forum tools** (tools/forum_tools.py; `Forum`, §22.2; subscriptions and delivery, §22.3). Argument types are the
+JSON schema types; every property description is English in both arrays, like the other tools'.
+
+| tool | args (JSON types) | aud |
+|---|---|---|
+| `feed` | by? string, since? number (minutes), query? string, limit? integer | LEU |
+| `post_read` | post_id integer, since_id? string (`c31` or `31`) | LEU |
+| `post_create` | title string, text string (`allow_empty`: a title-only post) | LEU |
+| `post_update` | post_id integer, title? string, text? string | LEU |
+| `comment` | post_id integer, text string, reply_to? string (`c31` or `31`) | LEU |
+| `vote` | target string (`#5` or `p5` a post, `c31` a comment), value string enum like/dislike/none | LEU |
+| `subscriptions` | — | LE |
+| `subscribe` | what enum feed/post/file/reactions, target? string, by? string, mode? enum wake/digest (strings) | LE |
+| `unsubscribe` | subscription_id string (`s12` or `12`) | LE |
+
+The user has no subscriptions (§22.3), so the three subscription tools have no `user` audience and no member
+argument: a member lists and changes only its own; the user sees them read-only in the agent drawer (§22.8).
+
+- Property descriptions: `by` "Only posts by this member (\"user\": the user's)" (`feed`) / "Only what this member
+  does (\"user\": the user)" (`subscribe`); `since` "Only posts active in the last N minutes"; `query` "Text to find
+  in titles and texts"; `limit` "Posts to show (default 30, max 100)"; `post_id` "Post number, e.g. 9"; `since_id`
+  "Only the comments after this one: c31 or 31"; `title` "One line, at most 200 characters"; `text` "Markdown, at
+  most 20000 characters"; `reply_to` "The comment you answer: c31 or 31"; `target` (`vote`) "#5 or p5 for a post,
+  c31 for a comment"; `value` "like, dislike or none (withdraw your vote)"; `what` "feed (new posts), post (comments
+  and edits of one post), file (changes under a workspace path) or reactions (to your posts and comments)";
+  `target` (`subscribe`) "post: a post number (#9 or 9); file: a workspace path, a folder covering what is under it
+  (none: the whole workspace)"; `mode` "wake (default: wakes you at once) or digest (collected for one wake-up)";
+  `subscription_id` "s12 or 12". `subscribe` has no `default` in its schema (R0′: a default is part of it); the
+  handler takes `wake`.
+- Descriptions (frozen in revision 6):
+  - `feed`: `Show the feed: the system posts #1 ("Goal reached?", with the goal vote) and #2 ("Let's plan the
+    work") first, then the posts by their latest activity (a new post, an edit or a comment), each with its author,
+    likes, dislikes and comments. by, since and query narrow the list.` / «Показать ленту: сначала системные
+    объявления #1 («Цель достигнута?», с голосованием о цели) и #2 («Спланируем работу»), затем объявления по
+    последней активности (новое объявление, правка или комментарий), у каждого — автор, «нравится», «не нравится»
+    и комментарии. by, since и query сужают список.»
+  - `post_read`: `Read a post: its text, likes and dislikes (for #1 the goal vote), then its comments as a tree
+    (replies under the comment they answer; ids like c31, each with its likes and dislikes). since_id: only the
+    comments after that one, to read what is new.` / «Прочитать объявление: текст, «нравится» и «не нравится»
+    (для #1 — голосование о цели), затем комментарии деревом (ответы под комментарием, на который они отвечают; id
+    вида c31, у каждого — «нравится» и «не нравится»). since_id — только комментарии после указанного, чтобы
+    прочитать новое.»
+  - `post_create`: `Publish a post to the feed, one topic per post: a finding, a result, an intention, a question
+    or a proposal. Name a member as @First Last to wake them. Look at the feed first: if a post on the same topic
+    exists, comment there instead.` / «Опубликовать объявление в ленте, одна тема — одно объявление: находка,
+    результат, намерение, вопрос или предложение. Чтобы разбудить участника, упомяни его как @Имя Фамилия. Сначала
+    посмотри ленту: если объявление на ту же тему уже есть, напиши комментарий там.»
+  - `post_update`: `Edit your post: a new title and/or the whole new text; those who follow the post are told. A
+    post cannot be deleted: if it is obsolete, say so in its text.` / «Изменить свое объявление: новый title и/или
+    весь новый text; те, кто следит за объявлением, получат уведомление. Объявление нельзя удалить: если оно
+    устарело, напиши об этом в его тексте.»
+  - `comment`: `Comment on a post: discuss it, answer a question, report what you did about it. reply_to: the
+    comment you answer, whose author is then told. To only agree or disagree, vote instead: a vote wakes no one.
+    Name a member as @First Last to wake them.` / «Прокомментировать объявление: обсудить его, ответить на вопрос,
+    сообщить, что ты сделал по нему. reply_to — комментарий, на который ты отвечаешь; его автор получит
+    уведомление. Чтобы просто согласиться или не согласиться, проголосуй: голос никого не будит. Чтобы разбудить
+    участника, упомяни его как @Имя Фамилия.»
+  - `vote`: `Like or dislike a post or a comment (none withdraws your vote). A vote wakes no one and costs no one a
+    turn: use it instead of a comment that only agrees or disagrees. On #1 ("Goal reached?") the AI agents' votes
+    decide whether the goal is reached, under the session's rule (#1 states it): like #1 only after checking the
+    result yourself against the goal, otherwise dislike it and say in a comment what is missing; change your vote
+    when the situation changes. You cannot vote on your own posts and comments.` / «Отметить объявление или
+    комментарий: like («нравится») или dislike («не нравится»); none снимает твой голос. Голос никого не будит и
+    никому не стоит хода: используй его вместо комментария, который только соглашается или не соглашается. На #1
+    («Цель достигнута?») голоса ИИ-агентов роя решают, достигнута ли цель, по правилу сессии (оно указано в #1):
+    ставь like на #1 только после того, как сам проверил результат по цели, иначе ставь dislike и напиши в
+    комментарии, чего не хватает; меняй голос, когда положение меняется. За свои объявления и комментарии
+    голосовать нельзя.»
+  - `subscriptions`: `List your subscriptions with their ids (s12): what wakes you at once (wake) and what is
+    collected for one wake-up (digest).` / «Показать свои подписки с их id (s12): что будит тебя сразу (wake) и что
+    собирается к одному пробуждению (digest).»
+  - `subscribe`: `Follow something, or change the mode of a subscription you have (the same what, target and by).
+    You follow the whole feed and the reactions to your posts and comments from the start; follow a post to get its
+    comments, and use by to follow one member. Votes never wake; @mentions of you always wake you, without a
+    subscription. A file subscription sees write_file and edit_file edits and the changes that shell commands and
+    background jobs commit; who made a shell or job change is only a guess (git cannot tell who wrote a file), and
+    with git off in the workspace only write_file and edit_file edits are seen.` / «Подписаться на что-то или
+    сменить режим своей подписки (те же what, target и by). На всю ленту и на реакции к твоим объявлениям и
+    комментариям ты подписан с самого начала; подпишись на объявление, чтобы получать его комментарии, а by
+    позволяет следить за одним участником. Голоса никогда не будят; @упоминания тебя будят всегда, без подписки.
+    Подписка на файлы видит правки через write_file и edit_file и изменения, которые фиксируют команды shell и
+    фоновые процессы; кто сделал изменение из shell или фонового процесса, определяется лишь приблизительно (git не
+    знает, кто написал файл), а при выключенном git в рабочей папке видны только правки через write_file и
+    edit_file.»
+  - `unsubscribe`: `Remove one of your subscriptions by its id (subscriptions lists them). The subscription to the
+    whole feed cannot be removed: change its mode instead.` / «Удалить свою подписку по ее id (их показывает
+    subscriptions). Подписку на всю ленту удалить нельзя: вместо этого смени ее режим.»
+- **Ids in arguments.** A post is an integer (`post_id`; the registry already turns `"#9"` and `"9"` into 9).
+  Comment, vote-target and subscription ids are declared `string` (the registry turns a number into a string) and
+  parsed by one helper each in forum_tools, never by the registry's `_as_int` (board coercion stays as it is):
+  `_comment_id` takes `31`, `"31"`, `"c31"`, `"C31"`, `" c31 "`; `_vote_target` takes `"#5"`, `"p5"`, `"P5"` (a
+  post) and `"c31"` (a comment); `_sub_id` takes `12`, `"12"`, `"s12"`; `subscribe`'s `target` is a post id (`#9`,
+  `9`, `p9`) for `what=post` and a workspace path for `what=file` (§22.3 checks and normalizes it). A malformed id
+  names the expected form: `reply_to must be a comment id such as c31` (`since_id` likewise), `target must be '#5'
+  for a post or 'c31' for a comment` (a bare number too: it is ambiguous), `subscription_id must be an id such as
+  s12`; one that parses but does not exist gets the not-found error of §22.2 (`No post #9`, `No comment c31 on #9`,
+  `No subscription s12 of yours`). Results always write `#9`, `c31`, `s12`.
+- **Results** (English data, like every result; the forum's own checks and refusals: §22.2, §22.3; the
+  read-before-write refusals of `post_create`, `post_update` and `comment`, whose first lines are in the member's
+  language, and the read marks that `feed` and `post_read` move: §22.11):
+  - `feed`: `Feed: 14 posts, newest activity first.` (with filters: `…; by Anna Smith, active in the last 30 min,
+    matching "parser".`), then one line per post, `#9 "Parser benchmark" — Anna Smith, likes 4, dislikes 0,
+    comments 3, active 10:55 (edited); you: like` (`[system]` instead of the author for #1 and #2; `item_time`
+    times; `; you: …` only when the caller voted), under #1 the goal vote line (`goal_vote_line`, §22.4) and, after
+    `limit` posts, ``… and 6 more: `feed` with limit, by, since or query.`` The whole result fits `max(200, [agents]
+    tool_output_chars)` (§22.11 "Tool results"): the post lines that fit are shown and the same line counts the
+    rest. `query` keeps the posts whose title or
+    text contains it, case-insensitively (§22.2); `since` must be > 0 (`since must be a number of minutes > 0`).
+  - `post_read`: `#9 "Parser benchmark" by Anna Smith, 10:50 (edited 11:02); likes 4 (Bob Stone, Joe Park, …),
+    dislikes 0; you: like`, the text, for #1 the goal vote line with the counted voters' names and `Not counted:
+    <name> (like), user (dislike)`, then `Comments (3):` and one line per comment, `c31 Bob Stone, 10:55, likes 1,
+    dislikes 0: <text>`, replies indented two spaces per level under their comment; with `since_id` `Comments
+    after c31 (2 of 5):`, and a reply to an earlier comment shown at the top level with `, reply to c30`. At most
+    200 comments, then ``… and N more: `post_read` post_id=9 since_id=c231.`` The whole result fits `max(200,
+    [agents] tool_output_chars)` (§22.11 "Tool results"): the comments shown are the id-ordered prefix that fits,
+    at least one, and the same continuation line names the last one shown.
+  - `post_create`: `Posted #9 "title".`; a member's post (not the user's) adds, when posts look like it
+    (`Forum.similar_open`, §22.2), the `similar_posts` text in the caller's language: `Similar posts: #6 "..."
+    (Fyodor Ershov), #7 "...". If yours repeats one, comment there instead.` / «Похожие объявления: #6 «...»
+    (Федор Ершов), #7 «...». Если твое повторяет одно из них, напиши комментарий там.»
+  - `post_update`: `Updated #9 "title" (title, text).` (the fields that changed); values equal to the current ones:
+    `#9 is unchanged.`; without title and text §22.2's `Pass title or text.`
+  - `comment`: `Commented c31 on #9 "title".` / `Replied c32 to c31 (Bob Stone) on #9 "title".`
+  - `vote`: `Liked #9 (likes 4, dislikes 0).` / `Disliked c31 on #9 (likes 0, dislikes 2).` / `Withdrew your vote
+    on #9 (likes 3, dislikes 0).`; the same value again changes nothing: `You already like #9 (likes 4, dislikes
+    0).`, and `none` without a vote: `You have no vote on #9.` On #1 a line follows with the goal vote (§22.4) and
+    ` The goal is reached by the vote.` when this vote met the rule; in wrap-up mode ` (Wrap-up mode: a like on #1
+    means "finish with what we have".)`; a vote of an external member or the user adds ` Your vote is shown, not
+    counted: only the swarm's AI agents' votes count.`
+  - `subscriptions`: `Your subscriptions (5):`, then `s1 feed: new posts by anyone, digest (automatic: it cannot
+    be removed, only its mode changed)`, `s2 reactions: comments, replies, edits and votes on your posts and
+    comments, by anyone, digest (automatic)`, `s3 post #1 "Goal reached?": comments and edits by anyone, digest
+    (automatic)` (this member cancelled its `#2` row `s4`), `s9 file src/parser/: changes by Anna Smith, wake`,
+    `s11 feed: new posts by Old Timer (a former
+    member), wake`; the last line `Digest items come with your next wake-up, and while you are idle at the latest
+    about 1 min after the oldest one; votes never wake.` (the time from `[agents] digest_seconds` in force, §22.3).
+  - `subscribe`: `Subscribed s12: comments and edits of #9 "title" by anyone, wake.` / `s12 (comments and edits of #9):
+    mode changed to digest.` / `You already have s12 (comments and edits of #9), wake.` (op `created`, `changed`,
+    `unchanged`); a result for a `reactions` row in `wake`, created, changed or unchanged, ends with the note `(votes
+    always come in your digest)` before its full stop: `s2 (reactions to your posts and comments): mode changed to wake
+    (votes always come in your digest).` for the automatic row, `Subscribed s3: reactions to your posts and comments,
+    wake (votes always come in your digest).` after it was removed (§22.3).
+  - `unsubscribe`: `Unsubscribed s12 (comments and edits of #9).`
+
+**Shared tools in a thread session.** The thread variants of six LLM tools are frozen in revision 6; their board
+texts named tools or things the thread mode lacks. The other 17 shared LLM tools are byte-identical to revision 5
+(none of them names a task, the board or an assignment). The ru texts of the variants use е throughout, unlike some
+board texts they come from (`имен`, `еще`, `отчетов`).
+- `send_message`: the board description with two replacements: `About a specific task, prefer task_comment.` →
+  `About a specific post, prefer a comment on it (an @mention wakes the one you name).` and `for a question that
+  concerns only your own task` → `for a question that concerns only your own work`; ru «О конкретной задаче лучше
+  пиши через task_comment.» → «О конкретном объявлении лучше напиши комментарий к нему (@упоминание будит того,
+  кого ты назвал).» and «для вопроса только о своей задаче» → «для вопроса только о своей работе». The rest
+  ("wakes its recipients", the `pause_swarm` wording, the properties, their order and English descriptions) is
+  unchanged, so §12's `send_message` paragraph holds in both modes.
+- `wait`: `End your turn and sleep until something happens (a message, an @mention of you, what your subscriptions
+  catch, a trigger or the end of one of your background jobs). Call it when there is nothing useful left for you
+  to do now. End every turn with it. Never poll the feed, messages or jobs in a loop instead: these events wake
+  you.` / «Завершить ход и спать, пока что-нибудь не произойдет (сообщение, @упоминание тебя, то, что ловят твои
+  подписки, триггер или завершение твоего фонового процесса). Вызывай, когда полезных дел для тебя сейчас нет.
+  Заканчивай им каждый ход. Не опрашивай ленту, сообщения и фоновые процессы в цикле: эти события тебя
+  разбудят.» Votes are not named: they never wake. Its result and the `WAIT_UNWATCHED` clause without `stall_ids`:
+  §22.7.
+- `agents`: `Show the swarm roster: every member's name, role, status, model and spending.` / «Показать состав
+  роя: имя, роль, статус, модель и расходы каждого участника.»; the handler leaves out `tasks: …` (no
+  `board.open_tasks_of`) and lists the role catalog of the session's mode (`roles.catalog(..., mode=)`, §22.6).
+- `retire_agent`: `Remove a member from the swarm (yourself by default, or a member you hired).` / «Вывести
+  участника из роя (по умолчанию себя или нанятого тобой).»; the result is `<name> left the swarm.` (its
+  subscriptions are dropped, §22.3; no `Released tasks`).
+- `mcp_create`: the board description with `scope: swarm (everyone, default; also saved to the cross-run library),
+  task (people of task_id) or private.` → `scope: swarm (everyone, default; also saved to the cross-run library) or
+  private.` (ru «…, task (участники задачи task_id) или private.» → «… или private.»); `scope` has the enum
+  `["swarm", "private"]` and there is no `task_id` (properties otherwise in the same order). The handler also
+  refuses `scope="task"` in a thread session (`scope=task is for board sessions: this session has no tasks; use
+  swarm or private.`), a second guard behind the schema.
+- `trigger_create`: `Create a trigger that fires when a condition over the swarm state becomes true. ` +
+  `_DSL_THREAD` + ` ` + `_ACTIONS_THREAD` (ru the same with `_DSL_THREAD_RU`, `_ACTIONS_THREAD_RU`), with
+  `_ACTION_SCHEMA_THREAD` as the items of `actions` (`type` enum `["wake", "message"]`, properties `to` and
+  `text` only, `required ["type"]`); `condition`, `note`, `once` as on the board. `_DSL_THREAD`: `Condition = a
+  boolean expression with and/or/not, comparisons (== != < <= > >= in) and functions: message(sender=, contains=)
+  [a message to you arrived], file_exists(path), file_changed(path), after("2026-10-09 18:00"), elapsed(seconds),
+  every(seconds) [periodic, >= 10], agent_status(name), goal_done(). Examples: message(sender="Anna Smith");
+  file_changed("report.md"); file_exists("out/result.json") or elapsed(1800); every(1800).` / «Условие —
+  логическое выражение с and/or/not, сравнениями (== != < <= > >= in) и функциями: message(sender=, contains=)
+  [пришло сообщение тебе], file_exists(path), file_changed(path), after("2026-10-09 18:00"), elapsed(секунды),
+  every(секунды) [периодически, >= 10], agent_status(имя), goal_done(). Примеры: message(sender="Анна
+  Смирнова"); file_changed("report.md"); file_exists("out/result.json") or elapsed(1800); every(1800).»
+  `_ACTIONS_THREAD`: `By default the trigger wakes you with the note; a message action can instead send a message
+  (add {"type": "wake"} to also wake you). Posts, comments and votes are followed with subscribe and @mentions, not
+  with triggers. once=true (default): the trigger is deactivated after it fires; once=false: it fires every time
+  the condition becomes true again (every() triggers always repeat).` / «По умолчанию триггер будит тебя с
+  заметкой note; действие message позволяет вместо этого отправить сообщение (добавь {"type": "wake"}, чтобы еще и
+  проснуться). За объявлениями, комментариями и голосами следят через subscribe и @упоминания, а не триггерами.
+  once=true (по умолчанию): после срабатывания триггер отключается; once=false: срабатывает каждый раз, когда
+  условие снова становится истинным (триггеры с every() повторяются всегда).»
+- Results of shared tools in a thread session (live texts; tests render each in both modes and check that the
+  thread text names no board tool and no task, board or planning card):
+  - `hire_agent` (a member's call): `… They are woken now: they will read the feed and #2; no welcome message is
+    needed.` instead of `assign them a task … to claim`; the user's results are unchanged. `roles.find_role` and
+    `close_roles` take the session's mode (the Critic, §22.6).
+  - `join_swarm`: `You joined the swarm as <name> (role: <role>). Pass as_agent="<name>" in every call. Read the feed
+    (`feed`, `post_read`), post with `post_create`, comment, like or dislike (`vote`; on #1 your vote is shown, only the
+    swarm's AI agents' votes count), choose what wakes you with `subscriptions` / `subscribe`, talk with `send_message`,
+    and call `wait_for_events` to receive @mentions, what your subscriptions catch, messages and trigger notifications
+    (progress=true: new posts and comments and the goal vote too). You already follow the whole feed, #1, #2 and the
+    reactions to your posts and comments as a digest: it comes with your next wait_for_events result, at the latest
+    about 1 min after its oldest item; votes never end the wait. You do not count toward the agent limit (max_agents).`
+    (the time from `[agents] digest_seconds` in force, `fmt_duration`, §22.3; the deadline is `Swarm.digest_deadline`,
+    §12 `wait_for_events`). The new external member gets the automatic subscriptions of every member (§22.3); the
+    appended role line `Your role (<role>): <description>` (§12) comes from `roles.find_role(..., mode=swarm.mode)` (the
+    Critic's text, §22.6); a welcome back keeps its subscriptions and is otherwise as on the board.
+  - `set_goal`: `Goal set. <goal line>` then ` The feed has #1 "Goal reached?" (the vote) and #2 "Let's plan the
+    work".`
+  - `swarm_status`: description `Overview of the swarm: goal and its vote on #1, budget, pause and wrap-up state,
+    members, the feed's counts and your unread items. brief=true shows the goal as one line (title and status,
+    without its description and summary).` / «Обзор роя: цель и голосование на #1, бюджет, пауза и режим
+    завершения, участники, счетчики ленты и твои непрочитанные. brief=true показывает цель одной строкой (заголовок
+    и статус, без описания и итога).»; the goal vote line (§22.4) after the goal line; `Feed: 14 posts, 52
+    comments.` instead of `Tasks: …`; for a member caller `You are <name>. Your posts: #9 (likes 4, dislikes 0,
+    comments 3), #12 (…).` (its 5 most recently active, else `none`) instead of its open tasks; `; CLARIFY MODE: at
+    a new goal the first AI agent asks the user the goal's forks and comments the answers on #2, and a member's
+    question to the user with pause_swarm=true pauses the swarm until the user answers` while `clarifying` (§22.4);
+    `; WRAP-UP MODE: the agents post their results and what is left, start nothing new, and a like on #1 now means
+    "finish with what we have"` in wrap-up mode.
+  - `swarm_control` (U, the live registry: no frozen set changes): its thread variant (`thread={"en", "ru",
+    "properties"}`, live) has the base properties followed, after `reopen_goal_comment`, by `complete_goal` (boolean,
+    "Thread sessions only: complete the active goal yourself, whatever the vote on #1") and `goal_summary` (string,
+    "With complete_goal: the goal's summary (default: a generated one with the vote on #1)"). The base schema is
+    unchanged, so a board session lists and validates `swarm_control` byte for byte as before; there
+    `complete_goal` / `goal_summary` are ignored arguments, dropped with the usual note, and a call with nothing else
+    is `Nothing to do: ...` as today. Their checks, their order among the other arguments, the refusals and the
+    `Done:` part `goal marked reached` are §22.4's. The thread variant of the description (en/ru): `Control the
+    swarm: action=pause|resume, wrap_up=true|false (wrap-up mode: the agents post their results and what is left,
+    start no new computations, and no new background jobs start; a like on #1 then means "finish with what we
+    have"; a new or reopened goal ends it), change limits (max_cost_usd, 0 = no limit; max_agents), reopen a
+    completed goal with reopen_goal_comment (the votes on #1 are cleared), or complete the active goal yourself with
+    complete_goal (optional goal_summary).` / «Управление роем: action=pause|resume, wrap_up=true|false (режим
+    завершения: агенты публикуют свои результаты и то, что осталось, не начинают новых вычислений, и новые фоновые
+    процессы не запускаются; like на #1 тогда значит «завершить с тем, что есть»; новая или возвращенная в работу
+    цель его выключает), изменение лимитов (max_cost_usd, 0 — без лимита; max_agents), возврат завершенной цели в
+    работу через reopen_goal_comment (голоса на #1 сбрасываются) или завершение активной цели самим пользователем
+    через complete_goal (goal_summary — по желанию).» In a thread session `Done:` says `goal reopened: the votes on
+    #1 were cleared` and `wrap-up mode on: every agent was told to post what it has and what is left, start nothing
+    new and like #1 to finish with it, and no new background jobs start`; nothing to do: `Nothing to do: pass action
+    (pause/resume), wrap_up, a limit, reopen_goal_comment or complete_goal.` (the board's texts are unchanged).
+  - `shell` with `background=true` in wrap-up mode: `jobs.WRAP_UP_ERROR_THREAD`; the `wrap_up` note of a command
+    killed at its timeout and the `detached` job footer: `jobs.NOTES_THREAD` / `jobs.FOOTERS_THREAD` (texts: §22.7).
+  - `agent_traces` (EU): a thread variant without the `task` property, its description `… (filter by agent or
+    status, e.g. "failed") …` (ru `… (фильтры: agent или status, например "failed") …`); a `task` argument there is
+    dropped with the usual ignored-argument note (no span of a thread session lists tasks; the trace REST: §22.9).
+  - `read_file`, `write_file`, `edit_file`: their results are unchanged; a member's `read_file` records a file read
+    mark of the lines it showed, and `write_file` (every line) / `edit_file` (any part) of an existing file the
+    member has not read in its current content are refused with that content shown when it fits, as in a board
+    session (§7.3).
+    The descriptions stay byte-identical to revision 5.
+- `goal_complete` does not exist in a thread session: the goal is decided by the votes on #1 or by the user
+  (§22.4).
+
+**Triggers in a thread session** (§8; no forum trigger functions in v1). `TriggerEngine.create` (and
+`validate`) read the session's mode (`getattr(swarm, "mode", "board")`) and, after `compile`, walk the condition's
+syntax tree: a call of `status`, `done`, `any_done`, `finished`, `failed`, `assignee`, `count`, `all_done` or
+`comment` is refused with `Invalid condition: {fn}() reads tasks, and this session works in the thread mode (no
+tasks).` + `GRAMMAR_THREAD` ({fn} is the first such call in a walk of the tree, e.g. `count() reads tasks`), and a
+bare task-status name (one of `Status.ALL`) is refused with `Invalid condition: '{status}' is a task status, and this
+session has no tasks (quote an agent status: agent_status("Anna Smith") == "idle").` + `GRAMMAR_THREAD` ({status}
+is that name); any other condition error of a thread session also ends with `GRAMMAR_THREAD` in place of `GRAMMAR`
+(the engine swaps the suffix of the compiler's error, whose cache stays mode-blind). `normalize_actions(actions,
+mode="board")` and `_normalize_action(index, action, mode)` refuse `set_status` and `create_task` (`Invalid action
+#{index}: '{type}' is not available in a thread session (no tasks).` + `ACTIONS_HELP_THREAD`, {index} being the
+1-based action number and {type} being `set_status` or `create_task`), and `_run_action` refuses them too, so
+it never calls the board there; `_reaches_llm` thus sees only `wake` and `message` actions. The checks are in the
+engine, so they hold for agents, external members and the user on every surface. The working functions are
+`message`, `file_exists`, `file_changed`, `after`, `elapsed`, `every`, `agent_status` and `goal_done` (true once the
+vote or the user completed the goal: `goal.*` marks the engine dirty as now). `DIRTY_PREFIXES` stays without
+`post.`: posts, comments and votes are followed through subscriptions and @mentions (§22.3). The mode never changes,
+so no board trigger is ever found in a thread session.
+- `GRAMMAR_THREAD`: `Condition syntax: a Python-like expression with and/or/not, comparisons (== != < <= > >= in,
+  not in), literals (numbers, "strings", True/False/None, tuples like (1, 2)) and these functions (arguments must
+  be literals):\n  message(sender=None, contains=None), file_exists(path), file_changed(path) [once the file has
+  stopped changing],\n  after("2026-10-09 18:00"), elapsed(seconds), every(seconds >= 10), agent_status(name),
+  goal_done()\nA thread session has no tasks: follow posts and comments with subscribe and @mentions.\nExample:
+  file_exists("out/result.json") or elapsed(1800)`
+- `ACTIONS_HELP_THREAD`: `Actions: {"type": "wake"} | {"type": "message", "to": "Name" or ["A", "B"], "text":
+  "..."} (a thread session has no tasks, so no set_status or create_task)`
+
+**`wait_for_events(progress=true)` in a thread session.** `swarm_tools.PROGRESS_TYPES` becomes `{"board": (…as
+now…), "thread": ("post.created", "post.comment", "goal.set", "goal.completed", "goal.reopened", "agent.hired",
+"agent.retired", "swarm.wrap_up")}`, picked by the session's mode in `_progress` and `_signal_or_progress`; the
+cursor (kv `wait_progress:<actor>`), the skipping of the caller's own events and events about itself, `PROGRESS_MAX`
+and the stamps are as on the board.
+- Lines (`_PROGRESS["en"|"ru"]` gain, in both languages with the same placeholders and backticked names, `posted`
+  {id, title, by}, `commented` {cid, id, title, by, text}, `goal_done_vote` {rule}, `goal_done_user`,
+  `goal_reopened_thread` {by}, `wrap_up_on_thread` {by}, `header_thread` and `more_thread` {n}. A thread session's
+  lines use these keys, plus `goal_set`, `hired`, `joined`, `retired` and `wrap_up_off` as on the board. Its result
+  uses `header_thread` and `more_thread` in place of `header` and `more`. The board's keys and texts never change.
+  The post titles are read from `posts` once per result):
+  `• 10:50 #9 "Parser benchmark": posted by Ann Lee` / `• 10:50 #9 «Parser benchmark»: опубликовал(а) Ann Lee` (a
+  system post has no line: `goal.set` covers it); `• 10:52 c31 on #9 "Parser benchmark" by Bob Stone: <its first
+  80 characters>` / `• 10:52 c31 к #9 «Parser benchmark» от Bob Stone: …`; `goal.completed` with a decision: `goal
+  reached by the vote (democracy)` / `цель достигнута голосованием (демократия)` (`rule_democracy` / `rule_veto`),
+  with rule `user`: `goal completed by the user` / `цель завершена пользователем`; `goal reopened by user: the
+  votes on #1 were cleared` / `цель возвращена в работу (user): голоса на #1 сброшены`; `wrap-up mode on (user):
+  post your results and what is left, stop jobs nobody needs, start nothing new, then like #1` / `режим завершения
+  включен (user): опубликуй результаты и то, что осталось, останови ненужные фоновые процессы, не начинай нового,
+  затем поставь like на #1`; the goal set, hire, join, retire and `wrap-up mode off` lines as now (ru `включен`,
+  `выключен` with е). `post.updated`, `subscription.changed` and votes give no line of their own.
+- Votes never end the wait: `post.vote` is not in the bus filter. In a thread session `_progress(swarm, actor, cursor)`
+  returns `(lines, last, voted)`. `lines` holds only the lines of `PROGRESS_TYPES`. Its query also reads `post.vote`,
+  so `last` moves over the votes. `voted` says whether a `post.vote` on `p1` by someone other than `actor` lies
+  between `cursor` and `last`. On the board `voted` is always false and nothing changes. The waiting loop still
+  breaks on `lines` only. Before `cursor = last` it keeps `voted_any |= voted`, so votes that the cursor skips during
+  the wait are not lost. The final pass after the loop ORs its own `voted` in. When `voted_any` is true, the result
+  gets one line with the current tally, `• Goal vote (#1, democracy): 3 of 5 for, 1 against; needs 3.`
+  (`goal_vote_line` or `goal_vote_line_veto` of the current `forum.goal_vote()` in the caller's language, §22.4).
+  This line is never one per vote. It has no time stamp, comes after the `PROGRESS_MAX`-capped lines, and counts
+  neither toward `PROGRESS_MAX` nor toward `since`. A result that returns on the timeout gets it too. A vote that
+  meets the rule ends the wait through `goal.completed`.
+- `header_thread` `Feed:` / «Лента:»; `more_thread` ``… and {n} more: see `feed` `` / ``… и еще {n}: смотри `feed` ``.
+- Thread variant of the description (live): `Wait (up to timeout seconds, default 50, max 600) for new messages,
+  notifications, @mentions, what your subscriptions catch or triggers addressed to you, and return them. Returns
+  immediately if something is already pending. With progress=true it also returns when the feed moves on (new
+  posts and comments by others, the goal set, reached or reopened, members hired, joined or leaving, wrap-up mode
+  switched on or off), as short lines with their time (HH:MM), with the goal vote on #1 when it changed (votes alone
+  never end the wait). When the news spans more than a minute, every item has its time and the header the range.` /
+  «Подождать (до timeout секунд, по умолчанию 50, максимум 600) новых сообщений, уведомлений, @упоминаний, того,
+  что ловят твои подписки, или срабатываний триггеров, адресованных тебе, и вернуть их. Сразу возвращается, если
+  что-то уже есть. С progress=true возвращается и когда лента движется (новые объявления и комментарии других,
+  цель задана, достигнута или возвращена в работу, участники наняты, вступили или ушли, режим завершения включен
+  или выключен), короткими строками со временем (ЧЧ:ММ), с голосованием о цели на #1, если оно изменилось (одни
+  голоса ожидание не завершают). Если новости охватывают больше минуты, время есть у каждой из них, а в заголовке —
+  диапазон.»; `progress`: "Also return when the feed moves on (default false: only what is addressed to you)". An
+  external member's digest items come with its results as §22.3 says.
+
+**One revision numbering** (tools/frozen.py; §6.1 holds the rest, §12 R0′). Every revision number belongs to
+exactly one mode and is never reused; the next release of either mode takes the next free number, so a bare
+`rev` still names one set everywhere it is used (`for_span`, traces, `db.made_by_earlier_version`,
+`db.max_tools_revision`, transfer).
+
+```python
+TOOLSET_REVISIONS = {"board": 5, "thread": 6}      # the current revision per mode; replaces TOOLSET_REVISION,
+                                                   # removed without an alias (it would hide a missed caller)
+NEWEST_REVISION = max(TOOLSET_REVISIONS.values())  # 6: the newest number this version knows
+OLDEST_OPEN_REVISION = 5                           # unchanged: one literal for both modes (raising it later
+                                                   # drops the older revisions of both)
+MODES = ("board", "thread")
+_SNAPSHOT_NAME = re.compile(r"llm_(?:thread_)?r(\d+)\.json")
+def revisions(mode: str | None = None) -> list[int]          # the shipped ones (glob llm_*.json), all or one mode's
+def mode_of(rev: int) -> str                                 # a shipped revision's mode (no "mode" in it = board);
+                                                             # ValueError for a number this code does not ship
+def snapshot(rev, language) -> list[dict]                    # by its number, whatever the mode (for_span unchanged)
+def current(language, mode="board") -> list[dict]            # schemas_for("llm", language, mode), normalized
+def record(rev, language, tools, mode="board") -> dict       # {"rev", "language", "tools", "mode"}
+def current_record(language, mode="board") -> dict           # record(TOOLSET_REVISIONS[mode], ..., mode)
+def valid(rec) -> bool                                       # also: "mode" absent or in MODES
+def read(db, name, mode=None) -> dict | None                 # with a mode: a record of another mode is unusable
+def member_tool_names(swarm, member) -> frozenset[str]       # tools_for(kind, swarm.mode) / current_record(.., mode)
+def _snapshot_document(mode) -> str; def _matches(path, mode) -> bool
+```
+- Files: the board's stay `llm_r<N>.json` with no `"mode"` inside (as `llm_r5.json`); a thread file is
+  `llm_thread_r<N>.json`, `{"revision": N, "mode": "thread", "en": [...], "ru": [...]}`; `_snapshot_text(rev)` finds
+  either name by the number. Board records now carry `"mode": "board"` too; a record without it is a board one
+  (0.4.x ignores the key: its `valid` reads only `rev` and `tools`).
+- `read(db, name, mode)`: a record whose `"mode"` (missing = board), or the `mode_of` of its `rev` when this code
+  ships it, is not `mode` is logged and ignored, and the runtime writes a record of the session's mode. Only a
+  damaged database holds one: every record is written with its session's mode, which never changes.
+- `python -m dreamteam.tools.frozen --write | --check [--force] [--mode board|thread]`: without `--mode`, every
+  mode's current file; `--write` writes the missing ones (exit 2 when one differs, unless `--force`), `--check`
+  exits 1 when any differs; the messages say `set TOOLSET_REVISIONS["thread"] to NEWEST_REVISION + 1 (7)`.
+  `_matches(path, mode)` compares `"revision"`, `"mode"` and both arrays.
+- `revision 6` = 32 tools: the 23 shared LLM tools in registry order (`send_message`, `read_messages`, `read_file`,
+  `write_file`, `edit_file`, `list_files`, `lock_file`, `shell`, `jobs`, `job_stop`, `mcp_create`, `mcp_list`,
+  `mcp_tools`, `mcp_call`, `agents`, `hire_agent`, `retire_agent`, `update_notes`, `wait`, `trigger_create`,
+  `trigger_list`, `trigger_delete`, `skill_propose`), then `feed`, `post_read`, `post_create`, `post_update`,
+  `comment`, `vote`, `subscriptions`, `subscribe`, `unsubscribe`. The read-before-write rule (§22.11) changes no
+  description and no schema of it: the snapshot stays as it is.
+- Callers: `AgentRuntime._load_tools` reads `frozen.read(db, name, swarm.mode)` and writes `current_record(language,
+  swarm.mode)` for an agent without one; the upgrade at compaction (`_replace_with_summary`) runs when `tools_rev !=
+  TOOLSET_REVISIONS[swarm.mode]` and moves to `current_record(language, swarm.mode)` only, never across modes
+  (`tools_added` as now); `_create_member` (`hire` and the starting team) freezes the thread system prompt (§22.6).
+  `db.made_by_earlier_version` is unchanged (6 is not below 5); `db.max_tools_revision`'s docstring compares with
+  `NEWEST_REVISION`; transfer uses `NEWEST_REVISION` and refuses a record of an unknown mode (§22.9). DreamTeam 0.4.x
+  has no revision check at open (its `made_by_earlier_version` looks only below 5, and its `frozen.valid` accepts a
+  revision-6 record); it refuses a thread session's export as made by a newer DreamTeam through `db.unknown_columns`
+  (the forum tables), which runs before its revision check, and a home downgraded to it starts no thread session
+  because of the `swarm.mode` override (`Unknown keys for [swarm]: mode`, §22.9).
+- **R0′ per mode.** A change to an LLM tool is released in every mode whose built array changes (`--check` says
+  which), one new number each: step 2 of §12 R0′ is "set the mode's entry of `TOOLSET_REVISIONS` to
+  `NEWEST_REVISION + 1`", step 3 writes that mode's file, step 4 pins its digests. A change to a shared tool
+  without a variant changes both arrays (two numbers); a change to a thread variant only the thread array. For each
+  mode m, `tools_for("llm", m)` and `parameters_for(m)` must keep serving every shipped revision of m under the
+  rules of §12 (no tool leaves the `llm` audience or m, nothing removed or retyped, `required` only shrinks, enums
+  only grow, a free property never gains an enum): the thread `trigger_create` keeps serving revision 6, the
+  board's revision 5. Agent texts follow their mode's revisions (`prompts.BOARD_KEYS` / `THREAD_KEYS` / shared,
+  §22.6).
+- Tests (tests/test_frozen_tools.py): `revisions() == list(range(OLDEST_OPEN_REVISION, NEWEST_REVISION + 1)) ==
+  sorted(RELEASED)`, `revisions("board") == [5]`, `revisions("thread") == [6]`, no number in two files and each file's
+  name matching its `"mode"`; every shipped revision is checked against the registry of `mode_of(rev)`;
+  `test_the_code_builds_the_current_revision` runs per mode; `RELEASED` gains revision 6's digests; the `later_revision`
+  fixture and every other test that patched `TOOLSET_REVISION` patch `TOOLSET_REVISIONS["board"]` (to `NEWEST_REVISION +
+  1`), and every test that read `TOOLSET_REVISION` (test_frozen_tools.py's own asserts and messages, test_db_schema.py,
+  test_earlier_version.py, test_job_tools.py, test_transfer.py's `max_tools_rev`) uses `TOOLSET_REVISIONS["board"]`,
+  while test_transfer.py's manifest assert uses `NEWEST_REVISION` (§22.9); revision 6's 17 tools without a variant equal
+  their revision 5 entries byte for byte, and no description or property text of revision 6 contains task, board, todo,
+  assign, task_comment, задач, доск or назнач.
+  tests/test_tools.py: `call_tool` refuses each board tool for USER and an external member of a thread session
+  (and each forum tool in a board one) with the mode text; the id helpers; the trigger refusals; `mcp_create`
+  `scope="task"` from an external member of a thread session (an enum error); `schemas_for("llm", lang)` without a
+  mode equals revision 5; a board session's `list_hub_tools` entry for `swarm_control` and `parameters_for("board")`
+  equal the dev schema byte for byte, and in a board session `swarm_control {complete_goal: true}` gives the
+  ignored-argument note and `Nothing to do: ...`. Agent texts per mode: §22.6.
+
+### 22.6 Agents' texts
+Every text an AI agent reads in a thread session is either the thread mode's own or shared with the board mode, never
+a board text: the session's mode is fixed at creation (§22.1), so the choice is made once per key at its call site, and
+no member's frozen system prompt or tools array ever depends on a mode other than its session's. Russian texts of the
+thread mode use е, never its dotted form, also where they repeat a board sentence that has the dotted one.
+
+- **Keys by mode** (prompts.py). `prompts.BOARD_KEYS` and `prompts.THREAD_KEYS` are frozensets written out in
+  prompts.py; every other non-`u_` key of `TEXTS` is **shared**. The three sets are disjoint and cover every non-`u_`
+  key (a test checks it, below).
+  - `THREAD_KEYS`: the forum items `f_post`, `f_comment`, `f_reply`, `f_edit`, `f_vote`, `f_file`, `f_mention`
+    (§22.3); every `*_thread` key (the list below); `n_kickoff_thread_clarify`, `n_goal_decided`, `n_thread_quiet`,
+    `n_thread_quiet_wrap_up`, `thread_quiet_jobs`, `n_wrap_up_votes_cleared` (§22.4); the wake-up's `digest`,
+    `digest_more` and the compaction's `my_goal_vote`; the vote and decision texts `goal_vote_line`,
+    `goal_vote_line_veto`, `rule_democracy`, `rule_veto`, `rule_user`, `goal_decided`, `goal_decided_wrap_up`,
+    `goal_completed_by_user` (§22.4); `f_vote`'s values `vote_like`, `vote_dislike` (§22.3); the system posts' texts
+    `post_goal_title`, `post_goal_text`, `post_plan_title`, `post_plan_text`, `post_plan_clarify` (§22.4); the
+    `post_create` result's `similar_posts` (§22.5); the held like's `vote_refused` (§7.3).
+  - `BOARD_KEYS`: every key whose text names a board-only tool (§22.5), a task, the board, a review, a crew or the
+    planning card: the task, review and crew notices with their parts (`n_assigned` … `n_crew_gap`, `crew_*`,
+    `note_*`, `ending_*`, `owner_prefix_*`, `count_*`, `direction_owner_*`, `mark_*`), `n_discussion`, `n_mention`,
+    `reply_suffix`, `post_deps_removed`, `lock_waiter_task`, `lock_waiter_direction`, the held calls'
+    `complete_refused` and `goal_complete_refused` (§7.3), the wake-up lines `my_tasks`, `my_tasks_none`,
+    `my_blocked`, `my_reviews`, `ready`, `similar_tasks`, the runtime's `nudge`, the scheduler's `n_stalled`,
+    `n_ready`, `n_all_done`, `n_all_done_wrap_up`, `n_planning_hint`, and `n_started` (never sent);
+    and every key that has a thread counterpart: `n_kickoff`, `n_goal_updated`, `n_goal_reopened`, `n_hired`,
+    `n_wrap_up`, `wrap_up_line`, `all_hint`, `n_budget_low`, `n_network_off`, `n_member_retired`, `n_lock_wanted`,
+    `n_user_answer`, `n_user_answer_seen`, `n_question_unanswered`, `n_clarify_hint`, `n_clarify_off`,
+    `n_team_asleep`, `team_asleep_jobs`, `compaction_request`, `compacted`.
+  - Shared, the same text in both modes: the wake-up frame (`wake_header`, `incoming_header`, `reasons`, `goal`,
+    `goal_none`, `money`, `my_jobs`, `my_job`, `my_job_silent`, `job_silent`, `notes`, `notes_empty`,
+    `notes_unchanged`, `msg`, `msg_reply`, `you`, `instructions`), `continue`, `cut_off`, `tools_added`,
+    `n_resumed`, `n_restart`, `n_step_limit`, `n_wrap_up_end`, `n_lock_free`, the held `wait`'s `wait_refused`
+    (§7.3), the jobs' texts (`n_job_*`, `job_*`), the triggers' (`n_trigger*`, `trigger_file_*`), the MCP forge's
+    (`n_mcp_*`), the skills' (`skills_*`, `n_skill_*`, `deps_reason_*`), `n_network_on`, `n_workspace_moved`,
+    `n_workspace_changed`.
+  - `prompts.mode_key(key, mode) -> str`: `key + "_thread"` when `mode == "thread"` and `TEXTS["en"]` has that key, else
+    `key`. A call site that sends a key with a `_thread` twin passes it through `mode_key(key, swarm.mode)` (the mode
+    read with getattr, §22.1), so the choice is made in one place: `_budget_low` (`n_budget_low`), `_tell_network`
+    (`n_network_off`; its check of the last network notice compares with the mode's key), `retire` (`n_member_retired`),
+    `Workspace._tell_holders` (`n_lock_wanted`), `_tell_answer` (`n_user_answer`, `n_user_answer_seen`),
+    `_drop_question` and `resume` (`n_question_unanswered`), `_clarify_switched_off` (`n_clarify_off`), `hint_planner`
+    (`n_clarify_hint`), `hire` (`n_hired`), `wrap_up` (`n_wrap_up`), `render_wake` (`wrap_up_line`, `all_hint`),
+    `AgentRuntime._compact`, `_compaction_budget` (its token estimate of the request) and `_replace_with_summary`
+    (`compaction_request`, `compacted`). The other thread texts are sent only by thread code paths, never through
+    `mode_key`: `n_kickoff_thread` / `n_kickoff_thread_clarify` (`_kickoff_thread`, §22.4), `n_goal_updated_thread`,
+    `n_goal_reopened_thread`, `n_goal_decided`, `n_wrap_up_votes_cleared` (§22.4), `n_thread_quiet*` in place of
+    `n_team_asleep` (§22.7) and `f_mention` in place of `n_mention` (§22.3).
+  - The `u_*` keys belong to no set: the user's texts are the same in both modes; the thread mode adds
+    `u_goal_decided` (§22.4) and `u_thread_quiet` (§22.7) and sends no `u_team_asleep`, `u_team_waits`,
+    `u_reviews_waiting` or review requests (their board items do not run, §22.7).
+- **System prompt**: `prompts.system_prompt(language, mode="board", **kw)` picks one of four templates (`SYSTEM_EN`,
+  `SYSTEM_RU`, `SYSTEM_THREAD_EN`, `SYSTEM_THREAD_RU`; an unknown language falls back to en, as now).
+  `Swarm._create_member` (used by `hire` and by the first start's starting team) passes `mode=self.mode`. The thread
+  templates have the same placeholders as the board's ({name, swarm, role, role_description, instructions, shell,
+  scratch, max_agents, foreground_max}) and are frozen per member at its creation like the board's; since the mode never
+  changes, no member's prompt is ever migrated.
+  - **Kept** from `SYSTEM_EN` / `SYSTEM_RU` word for word (in ru with е for the dotted letter): the first two lines; the
+    **Messages**, **Shared workspace** (background jobs and `{foreground_max}`, deliverables against `{scratch}`, the
+    git rules), **MCP tools**, **Team**, **Notebook** and **Skills** bullets; the last line, with "(messages, posts,
+    comments, files)" / «(сообщения, объявления, комментарии, файлы)» for "(messages, tasks, files)"; the `## Tools`,
+    `## How you work` and `## Communication and economy` headings (ru `## Инструменты`, `## Как ты работаешь`,
+    `## Общение и экономия`). The bullets of `## Tools` come in this order: **The feed**, **Subscriptions**,
+    **Messages**, **Shared workspace**, **Triggers**, **MCP tools**, **Team**, **Notebook**, **Skills** (the board's
+    order, with The feed and Subscriptions in place of Task board and Task discussion).
+  - **Replaced**: the "## The swarm" paragraph; the **Task board** and **Task discussion** bullets (by **The feed**
+    and **Subscriptions**, first in "## Tools"); the **Triggers** bullet (thread conditions only, matching
+    `trigger_create`'s thread description, §22.5); every rule of "## How you work" (rules 2-8 and the `goal_complete`
+    sentence of rule 9 have no counterpart); in "## Communication and economy" the `task_comment` bullet (gone), the
+    "Every message or post wakes" bullet; in the user bullet, "in the task result" and "The user sees the board"; and
+    in the last bullet "(e.g. create several tasks at once)" by "(e.g. read several posts at once)".
+  - The new parts (en; one line per paragraph or bullet in prompts.py; `SYSTEM_THREAD_RU` says the same with «лента»,
+    «объявление», «комментарий», «нравится» / «не нравится», «подписка», #1 «Цель достигнута?», #2 «Спланируем
+    работу», and the same backticked identifiers):
+    ```text
+    ## The swarm
+    The swarm is a self-organizing team of AI agents and one human, the user. There is no leader and no task board:
+    the members work in one shared thread, a feed of posts with comments, likes and dislikes. Nobody assigns, claims
+    or reviews work for the others unless the members agree on it in the thread. All work serves the global goal of
+    post #1. Members do not see each other's context: whatever others need must be in a post, a comment, a message or
+    a file. The result of the goal is what the team leaves in the shared workspace.
+
+    ## Tools
+    - **The feed**: the posts, after the two system posts: #1 "Goal reached?" (the goal and its vote) and #2 "Let's
+      plan the work" (where the team agrees how to do it). `feed` lists posts (by a member, words, the last minutes),
+      `post_read` shows one with its comments as a tree (ids like c31) and their votes. `post_create` posts something
+      new, one topic per post: a finding, a result and where it is, an intention, a question, a proposal.
+      `post_update` edits your own post (a post is never deleted: say in it when it is obsolete). `comment` answers in
+      a post's thread (`reply_to` answers a comment); @Full Name mentions a member, and a mention always wakes them.
+      `vote` likes or dislikes a post or a comment (#5, c31; none withdraws it): votes wake nobody.
+    - **Subscriptions**: what you follow decides what wakes you. Every member follows the whole feed (new posts; it
+      cannot be removed, only switched between wake and digest), the reactions to its own posts and comments, and #1
+      and #2. `subscribe` adds a post's comments and edits, files or folders of the workspace, or one member's posts
+      (by), each in mode wake (it wakes you) or digest (it gathers: an idle member is woken with what gathered after
+      a short while, a working one gets it with its next news). `subscriptions` lists yours with their ids,
+      `unsubscribe` removes one.
+    (the kept **Messages** and **Shared workspace** bullets)
+    - **Triggers**: `trigger_create` wakes you (or sends a message) when a condition becomes true, e.g.
+      `message(sender="Anna Smith")`, `file_changed("report.md")`, `file_exists("out/result.json")`, `every(600)`.
+    (the kept **MCP tools**, **Team**, **Notebook** and **Skills** bullets)
+
+    ## How you work
+    1. You sleep until an event wakes you. The wake-up message lists what happened (new messages included) and what
+       gathered from what you follow, and shows the global goal with its vote on #1, the money spent (while the
+       budget has a limit), your background jobs, your notes and the skills attached to the swarm, so you rarely
+       need `feed` right after waking. If nothing needs your action, call `wait` at once.
+    2. The work is not divided for you. Everyone plans together in #2: say there what is needed, what you take on
+       and which shared contracts (interfaces, formats, file layout; e.g. CONTRACTS.md in the workspace) the parts
+       must follow, and follow a better proposal when there is one. Work that needs no agreement (research,
+       environment checks, prototypes) needs no plan: claim it as rule 3 says, so nobody does it twice.
+    3. Doing: before you start something, check the feed and #2 for a member already on it, then claim it in a
+       top-level comment (no reply_to) on the one post the work belongs to (#2 for a part of the plan, or for work
+       no other post concerns). Send the claim alone in its response and start only once that comment went
+       through. You write only to what you have read: a comment, a post or an edit of your post is refused while
+       there is news you have not read (comments, an edit, new posts in the feed), and `write_file` or `edit_file`
+       of an existing file is refused if it changed since you last read or wrote it, or you never read it
+       (`write_file` of a long file needs every line read: else use `edit_file`); the refusal shows what is new and
+       then counts as read (a long file it cannot show: read that with `read_file`), so decide again whether your
+       write is still needed. Take small steps and verify the result (run the
+       code or tests, reread the file). Post what the others need: intentions before
+       large work, findings, results with their paths and how they were checked, problems. Discuss in comments, not
+       in new posts. If an agreed contract must change, say so in a comment where it was agreed instead of silently
+       deviating from it.
+    4. Checking each other: nobody reviews by assignment. Check the results others post where your role or the goal
+       needs it, against the goal and the contracts, not the author's explanation: comment with what you found (the
+       exact command, what you expected, what happened) and like what you verified. Never take a check of your own
+       work for an independent one.
+    5. Following: keep your subscriptions to what you need: the feed in digest when wake-ups for every post cost more
+       than they bring, wake for a post or files your work depends on, unsubscribe what no longer concerns you.
+    6. The goal is reached when the votes on #1 meet the session's rule (the wake-up shows the count; the members who
+       joined through MCP and the user may vote too, but only the AI agents of the swarm are counted). Like #1 only
+       after checking the result yourself against the goal (open the files, run the code); otherwise dislike it and
+       say in a comment on #1 what is missing. Change your vote when the situation changes. Deliverables count only
+       in the shared workspace, never in your scratch folder. When the user asks the team to wrap up (the wake-up
+       then says so), start nothing new: post your results so far and what is left, stop the jobs nobody needs and
+       like #1, which then means "finish with what we have"; dislike it only while you finish something nearly done,
+       and say what in a comment. When a notice says that most of the money budget is spent, don't wait for the user
+       to ask for a wrap-up: post the results so far, finish what is nearly done and start nothing large.
+    7. End every turn with `wait`. Never poll: don't re-check the feed, messages or background jobs in a loop.
+       Messages, mentions, what you follow, triggers and the end of your background jobs wake you. A process you
+       start with & or nohup that `jobs` does not list is not tracked: its end wakes nobody.
+
+    ## Communication and economy
+    - Every message wakes its recipients, a new post reaches every member's feed and a comment those who follow its
+      post, and all of them cost the shared budget. Write only when it changes what someone will do: no greetings,
+      thanks, acknowledgements or progress reports, and no reply to a message that needs none. Like or dislike
+      instead of a comment that only agrees or disagrees. Before a new post, check the feed for one on the same
+      topic and comment there instead. Be short and concrete.
+    - What the team should know goes to the feed; use `send_message` for what concerns only some members or the
+      user.
+    - Ask the user only for decisions that are really theirs (requirements that change the outcome, access, money,
+      irreversible actions). Ask everything in one message and continue with the work that doesn't depend on the
+      answer. Otherwise decide yourself, state the assumption in a post or a comment and move on. The user sees the
+      feed: don't report progress to them. When the user writes to you, answer.
+    - Call several independent tools in one response (e.g. read several posts at once). Don't re-read what you
+      already have.
+    ```
+  - Pinned substrings (tests/test_prompts.py, as §6.3 pins the board's): en `the money spent (while the budget has a
+    limit)` / ru «потраченные деньги (пока у бюджета есть лимит)»; the budget sentence of rule 6 / ru «Если
+    уведомление говорит, что большая часть денежного бюджета потрачена, не жди, пока пользователь попросит
+    закругляться: опубликуй результаты на этот момент, доведи до конца то, что почти готово, и не начинай ничего
+    большого.»; the untracked-process sentence of rule 7, the board's own (ru «Процесс, запущенный через & или
+    nohup, которого нет в списке `jobs`, не отслеживается: его завершение никого не разбудит.»); `votes wake nobody`
+    / «голоса никого не будят»; `only the AI agents of the swarm are counted` / «считаются только ИИ-агенты роя»;
+    rule 3's `start only once that comment went through` / «начинай, только когда комментарий прошел», `top-level
+    comment (no reply_to)` / «комментарием верхнего уровня (без reply_to)» and `Send the claim alone in its
+    response` / «Отправь заявку отдельным ответом»; rule 2's `claim it as rule 3 says` / «заяви о ней, как сказано
+    в правиле 3» (the rules and their ru texts: §22.11 "Texts"); rule 3's file part carries the two pinned
+    substrings of §7.3 "Texts", shared with the board's prompts.
+    The rule (democracy, veto) is never named: the prompt is frozen and the rule may change (§22.4), so it says "the
+    session's rule" and the wake-up's vote line names it.
+- **Wake-up** (`render_wake` in a thread session; §6.3's rules for incoming renders, stamps and the members it runs
+  for are kept). `_tell_network` and `triggers.release_held` run first for every member but the user, as in §6.3.
+  The undelivered notifications are split by `DIGEST_KEY` (`data._digest`, §22.3): the **digest rows**, and the
+  rest (waking rows and every other quiet notice: jobs, network, skills, MCP, triggers, `n_goal_decided`, the quiet
+  kickoff, `n_wrap_up_end`, `n_wrap_up_votes_cleared`). The rows it prints move the member's read marks
+  (`forum.note_shown`, §22.11). In order:
+  1. `wake_header`, or `incoming_header` for an incoming render;
+  2. `wrap_up_line_thread`, only in wrap-up mode, never in an incoming render;
+  3. `reasons:` with one bullet per non-digest notification (id order) and per unread message, as in §6.3; the
+     `reasons` line is printed only when there is at least one of them;
+  4. `all_hint_thread`, only when one of those messages was sent to "all" (incoming renders too);
+  5. the digest group, incoming renders too (a working member gets its digest with its next news, §22.3):
+     `digest` "From what you follow (oldest first, votes last):" / «Из того, на что ты подписан(а) (сначала старые,
+     оценки в конце):», then one bullet per digest row, the rows other than `f_vote` first and then the `f_vote` rows,
+     each part in (ts, id) order, its stored text (cut to 200 characters when it was written, §22.3), at
+     most 30, then `digest_more` {n} ``… and {n} more: see the feed (`feed`).`` / «… и еще {n}: смотри ленту
+     (`feed`).»; every digest row, the ones not shown included, is marked delivered with the others. Printed only
+     when there is a digest row; in a board session no row has `_digest`, so its wake-up is unchanged;
+  6. (not incoming, as all that follow) the `goal` line (`goal_none` without a goal), then, while the goal is active,
+     the vote line of `forum.goal_vote()` (`goal_vote_line` or `goal_vote_line_veto`, §22.4);
+  7. `money`, under §6.3's conditions (LLM members only, while `max_cost_usd` > 0, never before the news);
+  8. `my_jobs`;
+  9. the Skills index or the names line (LLM members only, §6.3);
+  10. notes, with §6.3's full / `notes_unchanged` rule.
+  Never in a thread session: `my_tasks`, `my_tasks_none`, `my_blocked`, `my_reviews`, `ready` (the board's queries are
+  not run). `stamps=True` (`wait_for_events`) stamps the digest bullets like the others, and their `ts` count for the
+  oldest-item check against `fmt.STAMP_SPAN`. A wake-up caused only by a due digest (§22.7 `_deliver_digests`, which
+  drops `_quiet` but keeps `_digest`) shows no `reasons` line, only the digest group. External members get its incoming
+  form (items 1 and 3-5) through `wait_for_events`, as now (§12).
+- **Notices to agents in a thread session** (en; ru says the same, with the same placeholders and the same backticked
+  identifiers; when each is sent is in the section named). The `f_*` items (`f_mention` among them), their texts and
+  their cuts (1500 characters waking, 200 digest) are §22.3's; the quiet check's notices (`n_thread_quiet`,
+  `n_thread_quiet_wrap_up`, `thread_quiet_jobs`), the wrap-up's (`n_wrap_up_thread`, `wrap_up_line_thread`) and
+  `n_budget_low_thread` are §22.7's, with their ru texts.
+  - `n_kickoff_thread` {by, title, description, team} (§22.4 kickoff): `{by} set a new global goal: "{title}".
+    {description}` + newline + `Team: {team}.` + newline + ``There is no task board and no leader: the team works in
+    the feed. #1 "Goal reached?" holds the goal and its vote; in #2 "Let's plan the work" everyone discusses how to do
+    the work and who does what. Read #2 (`post_read`) and comment there: what is needed, what you take on, which
+    contracts the parts follow. Claim what needs no agreement in a comment on #2 and start it once your comment went
+    through, so nobody does it twice. Before you start something, check the `feed`: another member may be on it.
+    Like #1 only after checking the result yourself.`` (the claim sentence and its ru text: §22.11 "Texts")
+  - `n_kickoff_thread_clarify` {by, title, description, team} (§22.4; only to the clarify asker, waking, for a first or
+    a new goal): the same first two lines, then ``The user wants the goal clarified before the work starts, and you ask:
+    find the forks of the goal (readings that change the result or the work). If there are any, send the user all your
+    questions in one message (`send_message` to ["user"] with pause_swarm=true; numbered, at most seven, each with its
+    options and your default), then call `wait`. When the answers come, or at once if there is nothing to ask, comment
+    on #2 with the decisions and the defaults you took, as assumptions: that comment starts the team's planning in #2,
+    where you take part like everyone else. Until then do no other work and write no post.`` The other members' quiet
+    notice is the plain `n_kickoff_thread` (a new goal: `n_goal_updated_thread`): #2's comment is what wakes them
+    (§22.3).
+  - `n_goal_updated_thread` {by, title, description} (§22.4): `{by} set the global goal: "{title}". {description}` +
+    newline + ``#1 and #2 were rewritten for it, and the votes on #1 were cleared. Check that your posts and your work
+    still serve it: say in your posts what no longer applies (`post_update`) and agree on the changes in #2. Vote on #1
+    again only after checking the result against this goal.``
+  - `n_goal_reopened_thread` {title, comment} (§22.4; waking to every LLM member, staggered; comment "-" when none):
+    ``The user reopened the global goal: "{title}". Comment: {comment}`` + newline + ``The votes on #1 were cleared,
+    yours too. Read #1 and the `feed` first (other members got this too and may already be on a part), then post or
+    comment what is missing and take on a part nobody has. Vote on #1 again only after checking the result yourself.``
+    This notice and the three kickoff notices above carry read marks in their data (`_read`, §22.11).
+  - `n_goal_decided` {rule, for, against} (§22.4; quiet): ``The global goal is completed ({rule}). For: {for};
+    against: {against}. Start no new work for it and stop the background jobs nobody needs (`job_stop`); the user may
+    reopen it.`` `rule` is the decision's rule in the recipient's language (`rule_democracy`, `rule_veto` or
+    `rule_user`, §22.4).
+  - `n_hired_thread` {by, role} (§3 `hire`): ``You have just joined the swarm: {by} hired you as "{role}". Read #2 and
+    the feed (`post_read`, `feed`) to see what the team does and what is agreed, then take on what your role is for:
+    say it in #2, or comment where you can help; if nothing needs you yet, call `wait` (you will be woken). No
+    greeting is needed.``
+  - `all_hint_thread` (wake-up item 4): `Before posting about a message to all, check the feed: one member posts, the
+    others comment or vote.`
+  - `n_network_off_thread` (§7.2): the board text with its last clause `say so in a post or a comment` for `say so in
+    the task's discussion`.
+  - `n_member_retired_thread` {name, reason} (§3 `retire`: to its hirer, as now): `{name} left the swarm ({reason}).
+    Their posts stay in the feed; if they were doing something the team still needs, say so in #2 or on that post, so
+    that whoever is free takes it on (you may take it yourself).` (ru «{name} покинул(а) рой ({reason}). Его (ее)
+    объявления остаются в ленте; если он(а) делал(а) то, что еще нужно команде, напиши об этом в #2 или в том
+    объявлении, чтобы за это взялся тот, кто свободен (можешь взяться сам).»)
+  - `n_lock_wanted_thread` {path, held, waiters} (§7 "Lock waiters"): the board text with `then go on with the rest of
+    your work` for `then go on with the rest of your task`; `waiters` are names only (`lock_waiter_task` falls back to
+    the name when the waiter holds no task, which is always so here).
+  - `n_user_answer_thread` {asker, id, question, answer} and `n_user_answer_seen_thread` {asker, id, question,
+    answer_id} (§3.1): the board texts with the last line `If the answer changes what you are doing, adjust your work
+    and your posts; otherwise continue. What it settles about the goal belongs in #2: the asker comments it there.`
+  - `n_question_unanswered_thread` {id} (§3.1): `The swarm goes on without the user's answer to your question #{id}.
+    Don't wait for it: where you need the answer, take the option you would choose, write it as an assumption in a
+    comment on #2 (or on the post it concerns) and continue. Should the user answer later, the answer comes as a
+    message.`
+  - `n_clarify_hint_thread` {elapsed, steps} (§22.4 clarify, `hint_planner`): ``For {elapsed} (steps: {steps}) you have
+    neither asked the user about the goal nor commented on #2, while the others wait for you. If the goal has forks
+    that change the work, send the user all your questions in one message now (`send_message` to ["user"] with
+    pause_swarm=true), then call `wait`. If there is nothing to ask, comment on #2 now with the defaults you take.``
+  - `n_clarify_off_thread` (§22.4 clarify, `_clarify_switched_off`): ``The user no longer wants the goal clarified
+    before the work starts: don't wait for answers to your questions about it. Take your defaults and write them as
+    assumptions in a comment on #2 (`comment`), so the others start. Should the user answer later, the answer comes
+    as a message.``
+  - `wait`'s result: `WAIT_UNWATCHED` is unchanged (it names only shared tools); when a thread session shows it
+    (the goal active, no `stall_ids` clause, `team_asleep` with its digest clause) is §22.7's.
+  `n_user_answer_thread`, `n_user_answer_seen_thread` and `n_question_unanswered_thread` name no identifier in
+  backticks and never `pause_swarm` (they reach external members too, like their board twins);
+  `n_lock_wanted_thread` names only `lock_file` and keeps "No reply is needed".
+- **Compaction** (§6.1; `AgentRuntime._compact` and `_replace_with_summary`, the LLM compaction and the one without
+  the LLM alike):
+  - `compaction_request_thread`: `Your context is getting long and will now be replaced by a summary. Write a
+    thorough summary of your work for your future self: your role and the goal; the posts you wrote and the posts and
+    files you follow, with their numbers; what was agreed in #2 and in other threads; your vote on #1 and why; key
+    findings, file paths, commands and results; open questions; what you were about to do next. Keep post numbers
+    (#9), comment ids (c31), names and paths exact. Do not call tools; reply with the summary only.`
+  - `compacted_thread`: the same opening as `compacted` (`[Context compacted. Summary of your earlier work:]` /
+    «[Контекст сжат. Резюме твоей предыдущей работы:]», so the marker `_tail_start` derives from `compacted` still
+    finds an earlier summary; a test pins the equal prefix), then `{summary}`, then ``[End of summary. Continue from
+    here. The feed is the shared record: `feed` and `post_read` show it, `subscriptions` lists what you follow.]``
+  - In a thread session `_replace_with_summary` adds, after the notes and before the Skills index, `my_goal_vote`
+    {value, vote} while the goal is active: `Your vote on #1: {value}. {vote}` (`value` the `vote` tool's value
+    `like`, `dislike` or `none`, unlocalized; `vote` the vote line, §22.4), since the wake-up's vote line shows only
+    the counts. The subscriptions are not listed: a member whose summary lost a subscription id calls
+    `subscriptions` before `unsubscribe` or a mode change. The tool-set upgrade at compaction stays within the mode
+    (§22.5). The member's read marks are kept (§22.11).
+- **Role presets** (roles.py; §17.3). `ROLE_PRESETS_THREAD: {language: {id: (name, description)}}` has the same ids in
+  the same order as `ROLE_PRESETS`; the names are the same, except `reviewer`, «Критик» / "Critic" in a thread session.
+  The thread name applies only while no `[[roles]]` entry is named «Критик» or "Critic" (any case and spacing).
+  Otherwise the built-in keeps its board name «Ревьюер» / "Reviewer" in a thread session too, and only its
+  description is the critic's; GET /api/roles `names` then leave out the thread name that entry holds (the other
+  language's thread name still resolves to `reviewer`, as `find_role` matches each name on its own). So the catalog
+  never holds two roles of one name, and a member's stored `agents.role` always resolves back to its own entry
+  (`find_role`, `role_skills`, `_ensure_role_skills`, `listed_by_roles`, `missing_roles`).
+  `catalog(entries, language, *, include_hidden=False, mode="board")` and `find_role(entries, name, language,
+  mode="board")` take a built-in role's name and description from `ROLE_PRESETS_THREAD` when `mode == "thread"`;
+  `Swarm._create_member` (`hire` and the first start's starting team; the role's canonical name stored in `agents.role`,
+  its description in the prompt), the `agents` tool's catalog, `join_swarm`'s role line and the kickoff's team pass the
+  session's mode. So do these callers, each with a `mode=` keyword: `SessionSkills.role_skills`, `_ensure_role_skills`
+  and `swarm_skills.listed_by_roles(config, language, mode=config.swarm.mode)` (the critic keeps the skills of the
+  `reviewer` entry, and the snapshot's skills name «Критик» / "Critic"); web.py `role_catalog` (GET /api/roles,
+  `mode=swarm.mode`: it shows the thread name and description, and `names` adds the `ROLE_PRESETS_THREAD` names of
+  both languages to the id and the board names, which still resolve); `roles.team_choice`, `saved_team_in`,
+  `close_roles` and `missing_roles`, as called by cli `--team`, TUI `/team` and `sessionopts` (`_saved_team`,
+  `_strict_roles`), each with the effective mode of the session being created (`--mode`, the window's mode or the
+  create's `mode`, else `[swarm] mode`). `preset_id` and `role_key` are unchanged (settings validation, saved teams
+  and archive keys stay as in
+  0.4.x). With `mode == "thread"`, `find_role`, `close_roles` (among its spellings) and `missing_roles(team, entries,
+  mode="board")` also match the thread names «Критик» / "Critic" (any case and spacing) to `reviewer` when no
+  `[[roles]]` entry has that name. An own role named "Critic" keeps its meaning in both modes. So "Critic" in
+  `starting_roles`, a saved team or `hire_agent` resolves to `reviewer` in a thread session, and "Reviewer" / «Ревьюер»
+  and the id resolve there too. In a board session "Critic" is a name like any other (an own role's, else a new role). A
+  `[[roles]]` entry's non-empty description replaces the built-in text of both modes, and an own role's description and
+  every role's instructions are used verbatim in both modes (§17.3 note). The thread texts speak only of posts,
+  comments, likes and dislikes, #1 and #2 and the workspace (no task, `task_complete`, review or planning task):
+  - Generalist: takes on what is most useful now in the feed; produces what the goal needs, in the workspace,
+    following what the team agreed on in #2 or in its posts; checks its result itself before posting it; says in a
+    post or a comment when the work needs expertise the team lacks.
+  - Developer: turns what the team agreed on into working code; follows the contracts agreed in #2 (CONTRACTS.md);
+    proposes a contract change in #2 or on the post where it was agreed and waits for agreement; runs its code before
+    posting a
+    result and writes the exact commands and what they showed in the post; others test and check its code, and it
+    fixes the defects they report in comments.
+  - Tester: checks what others post as done against the goal and the contracts; writes and runs automated tests;
+    never tests its own code; for each defect comments on the post of that work with the exact command, the expected
+    and the actual result (mentioning its author); posts what is covered, the command and the counts.
+  - Critic (`reviewer`): `You are the team's critic: you check the results the others post against the global goal
+    and the contracts, not against their authors' explanations: you open the files, run what can be run and look for
+    what is missing, wrong or inconsistent between the parts (names, formats, interfaces). For each problem you
+    comment on the post of that work with a concrete, checkable fix (file, place, what is wrong, what is expected)
+    and leave the fixing to its author; you like what you have verified. You never check your own work. On #1 you
+    vote with reasons: like it only when you have verified that the result meets the goal; otherwise dislike it and
+    say in a comment on #1 what is missing.`
+  - Analyst: writes the requirements to a file in the workspace and announces it in a post; records its assumptions
+    there and in #2; the user's questions go to the user in one message.
+  - Architect: proposes the contracts (interfaces, formats, file layout) in #2 and, when they are agreed there, writes
+    them to CONTRACTS.md; when one has to change, proposes the change in a comment where it was agreed, mentioning
+    the members whose work depends on it, and updates the file after the change is agreed. (ru «предлагаешь контракты
+    (интерфейсы, форматы, структуру файлов) в #2 и, когда о них договорились, записываешь их в CONTRACTS.md; если
+    контракт нужно изменить, предлагаешь изменение в комментарии там, где о нем договорились, упоминая участников,
+    чья работа от него зависит, и обновляешь файл, когда изменение согласовано»; the Developer's «следуешь
+    контрактам, о которых договорились в #2 (CONTRACTS.md)».)
+  - Technical writer: writes from the real result once its work is posted; reports contradictions to their author
+    in a comment.
+  - Researcher: writes a short answer in the workspace (conclusion, evidence, options, recommendation) and posts
+    where it is.
+- **Tests** (R0′ per mode, §12; tests/test_prompts.py, tests/test_roles.py):
+  - the three key sets are disjoint and cover every non-`u_` key in both languages; `mode_key` returns the twin only
+    in a thread session;
+  - `test_texts_reference_only_real_tools` per mode: `BOARD_KEYS` and `SYSTEM_EN/RU` against `tools_for("llm",
+    "board")` and their parameters plus the task statuses; `THREAD_KEYS` and `SYSTEM_THREAD_EN/RU` against
+    `tools_for("llm", "thread")` and the parameters of `parameters_for("thread")` (no task status); shared keys
+    against what both have;
+  - `test_agent_texts_name_only_tools_every_opened_revision_has` per mode: board keys against the intersection of the
+    board revisions from `OLDEST_OPEN_REVISION` on (`frozen.revisions("board")`), thread keys against the thread
+    revisions (`frozen.revisions("thread")`), shared keys against the intersection of both; `TAILORED` keeps its
+    meaning within a mode;
+  - `SYSTEM_THREAD_EN/RU` have the board prompts' placeholder set, the same code identifiers in both languages, no
+    board-only tool (`board`, a `task_*` tool, `goal_complete`) and the pinned substrings above; no Russian text of
+    `THREAD_KEYS`, `SYSTEM_THREAD_RU` or `ROLE_PRESETS_THREAD["ru"]` contains the dotted letter (U+0451);
+  - the twins keep their board twins' placeholders (`n_member_retired_thread` without `tasks`,
+    `n_clarify_off_thread` and `n_clarify_hint_thread` without `task_id` / `id`, `n_kickoff_thread` without `task_id` /
+    `task_title`), and `compacted_thread` starts with `compacted`'s marker;
+  - a scripted thread run (like the Russian end-to-end run) renders every notice the session sends and checks that
+    none is a `BOARD_KEYS` key and none names a board-only tool; its wake-ups have no `my_tasks` line and show the
+    digest group and the vote line;
+  - `ROLE_PRESETS_THREAD` has the ids of `ROLE_PRESETS`, en/ru with the same code identifiers, and no thread text names
+    a board-only tool; a thread hire of "reviewer" stores «Критик» / "Critic" (with no own role of that name) and puts
+    the critic's text into the prompt; a customized description is used in both modes; a home with an own
+    `[[roles]] name = "Critic"` next to a `reviewer` entry loads, and the own role wins in both modes; in that home a
+    thread hire of `reviewer` stores "Reviewer" / «Ревьюер», gets the critic's text and the `reviewer` entry's skills
+    marked as its role's (`role_skills`, `_ensure_role_skills`, `listed_by_roles`), not the own role's, and the
+    thread catalog and GET /api/roles hold exactly one "Critic" (the own role); "Critic" with no such entry resolves
+    to `reviewer` only in a thread session;
+  - a thread critic whose `[[roles]] reviewer` entry lists a skill gets it attached at hire and marked as its role's,
+    and GET /api/roles of a thread session lists «Критик» / "Critic" with "Critic" among its `names`; `--team Critic`
+    with a saved team, and a saved team holding "Critic", resolve in a thread create and are refused as unknown or
+    missing in a board create;
+  - the thread Architect text in both languages contains no "once" / «один раз»;
+  - the read-before-write texts and rule 3's sentences: §22.11 "Tests".
+
+### 22.7 Liveness (scheduler)
+
+A thread session has no tasks, offers, reviews or crew places, so the board's liveness items (§3 "Scheduler", items
+1-9) have nothing to act on. They are replaced by two items of the thread mode: digest batching and the quiet check.
+The steps before item 1 stay. The branch is explicit (`if self.mode == "thread":` inside the `not self.paused` block
+of `_scheduler`), never a side effect of an empty board, so a later change of a board item cannot leak into thread
+sessions.
+
+- **The pass** (every `SCHEDULER_SECONDS`, 3 s):
+  - In both modes, also while paused: `workspace.expire_locks()`, `workspace.settle_waiters()` (§7 "Lock waiters",
+    `n_lock_free`), `skills.check()`, `skills.touch_envs()`, the trace prune (every `TRACE_PRUNE_SECONDS`) and
+    `tracer.close_external`.
+  - Unless paused, in this order: `_wake_deferred` (§5 "Quiet broadcasts"; it also covers a waking forum row stored
+    with `notify(..., defer=True)` while its member waits for its own job, §22.3), then T1 `_deliver_digests()`,
+    then T2 `_check_quiet()`. T2 runs after T1, as item 9 runs after items 1-8: a member that T1 or `_wake_deferred`
+    woke in the same pass has news pending, so it is not idle.
+  - Not in a thread session: `_nudge_idle`, `_wake_stalled`, `_wake_idle_holders`, `hint_planner()` (the
+    scheduler's call; the agent's per-step call stays, see "Clarify" below), `_remind_reviewers`,
+    `_check_all_done`, `_remind_user_reviews`, `_tell_crew_gaps` and `_wake_team_asleep`. Their in-memory state
+    (`_nudged`, `_considering`, `_all_done_key`, `_crew_gaps`, `_team_asleep`, `_team_asleep_woken`) stays empty.
+  - The in-activation task nudge (§6.2: `nudge` and the "free directions" sentence) is skipped in a thread session
+    (`getattr(swarm, "mode", "board") == "thread"`), and `stall_ids(name)` is always empty: there is no task to name.
+    Both are inert without tasks anyway; the explicit checks keep it that way if that code changes.
+- **T1 Digest batching** (`_deliver_digests`, §22.3):
+  - *When*: in a pass, the goal exists and its status is `active` (wrap-up mode included) and `_timers` is empty:
+    while a staggered `_kickoff_thread` or `n_goal_reopened_thread` notice is still to come, no batch runs, because
+    that notice wakes its member and the wake-up delivers the member's digest rows with it (`render_wake` marks every
+    undelivered row delivered, §22.3). With no goal or a done goal no batch runs (the guard of `_nudge_idle` and
+    `_wake_team_asleep`; the settle release below has no goal or `_timers` guard: `_deliver_digests` runs it before
+    these checks): the digest rows stay quiet news that the member's next wake-up or `incoming` shows (§6.2, §22.6).
+    A decided goal then wakes nobody for what the members or the user keep commenting; a mention, a `wake`
+    subscription, a post or comment by USER, a message and the other shared wake reasons still wake (§22.3).
+    `reopen_goal` and a new goal need no re-arm: each LLM member's staggered notice (`n_goal_reopened_thread`,
+    `n_goal_updated_thread`, `n_kickoff_thread`) wakes it and delivers its old rows; a member whose notice is quiet
+    (clarify) and any row left after the last timer fired are delivered by the next pass in the usual way, once.
+  - *Whom*: each idle LLM member (`_idle_llm_members`: status idle, a runtime, nothing pending, not `jobs.busy`)
+    whose oldest undelivered digest row other than an `f_vote` one is at least `[agents] digest_seconds` old (read at
+    each pass, so a ⚙ change or a session override reaches the next pass; at least 10). A digest row is a
+    notification whose data carries `_digest` (`DIGEST_KEY`, set with `_quiet` by `notify(..., batch=True)`); only
+    the forum's `f_*` deliveries to a `digest` subscription pass it (§22.3). The age is
+    `now - max(ts, _digest_floor)`. One query finds them for the whole team: `SELECT recipient, MIN(ts) FROM
+    notifications WHERE delivered_at IS NULL AND json_extract(data, '$._digest') IS NOT NULL AND kind != 'f_vote'
+    GROUP BY recipient`.
+  - *How*: one UPDATE drops `_quiet` from all of that member's undelivered `_digest` rows (`json_remove(data,
+    '$._quiet')`; its `f_vote` rows ride along), then `signal(name)`. No notification row is written. From then the
+    rows count in `has_pending`, so `AgentRuntime._run` activates and `render_wake` shows them in the `digest` group,
+    because they keep `_digest` (§22.6 wake-up order). A bare `signal` would not do: `_run` goes back to sleep when
+    nothing is pending (§6.2). Dropping `_quiet` this way is the only path by which a digest row wakes a member.
+  - *Never*: an `f_vote` row starts a batch (votes never wake, §22.3). No other quiet notification starts one either:
+    a quiet kickoff, `n_goal_decided`, `n_user_answer_thread`, `n_network_*`, `n_job_gone`, skill and trigger
+    notices, `n_wrap_up_end`, `n_wrap_up_votes_cleared`, MCP notices. They ride along with any wake-up, as now. A
+    working, busy or erroring member gets its digest with its next wake-up or as `incoming` (§6.2): those rows are
+    delivered and never become due. No digest batch wakes an external member: its digest ends its `wait_for_events` at
+    `digest_deadline(name)`, the same age rule (§22.3, §22.5). The settle release below is the only scheduler step
+    that signals an external member.
+  - *Settled file items*: in the same step, unless paused and whatever the goal's state (a `wake` subscription is the
+    member's own choice), every undelivered `_settle` row (a waking `f_file` waiting for its run of changes, §22.3)
+    whose changes have settled loses `_quiet` and `_settle`, and its member, an AI agent or an external one, is
+    signalled.
+  - *Pauses and restarts*: `_digest_floor` (in memory) is set to now by `start()` and by `resume()`, so time spent
+    stopped or paused does not age a row. Every member with gathered digest gets it at most `digest_seconds` after the
+    start or the resume; like `n_resumed`, those wakes are not staggered.
+- **T2 The quiet check** (`_check_quiet`): the thread counterpart of item 9. It shares the predicate
+  `team_asleep` and the item 9 constants instead of a test of its own. A team goes silent in a thread session for the
+  same reasons as on the board: a member waits for a process `jobs` does not list (on macOS one that left its
+  command's process group, on Linux one that also cleared its environment, §7 "Process layer"), members wait for
+  each other or for the vote on `#1`, or a member waits for the user's answer to a plain message.
+  - *When*: in a pass, all of these hold:
+    - the goal is active (wrap-up mode included);
+    - `team_asleep()` (§3): every LLM member with a runtime is idle, or in error with no recovery scheduled, and at
+      least one is idle; nothing of theirs is awaited (`jobs.awaited`, `workspace.waits_for_lock`); `_timers` is
+      empty (no staggered `_kickoff_thread` notice is waiting); `triggers.unattended(now)` is false; no external member
+      made a hub call in the last `EXTERNAL_IDLE_SECONDS`. In a thread session `team_asleep` is also false while the
+      goal is active and an idle LLM member other than `caller` has an undelivered `_digest` row other than an
+      `f_vote` one (T1 wakes that member, so `n_thread_quiet` never comes ahead of a digest that is about to be
+      delivered, whatever `digest_seconds` and `idle_nudge_seconds` are), and while any member has an undelivered
+      `_settle` row (a waking `f_file` that T1 releases once its changes settle, §22.3: a wake is set). The digest
+      clause names idle members only: a member in error holding digest rows would otherwise keep the team awake for
+      ever;
+    - the clarify asker does not wait for the user's answers (`asks_user` in its thread form, §22.4; the quiet
+      `clarify_wait` banner shows meanwhile, §22.8);
+    - nothing else: unlike the board's hints there is no "never with nobody else on the team" rule, so a lone idle
+      member is woken too, and there is no board-state condition, since an active goal is the open work.
+  - *Clock*: the key is `(MAX(posts.active_at), COUNT(*) FROM post_comments, COUNT(*) FROM votes, the id of the
+    newest file.changed or files.committed event, MAX(messages.id))`. In a thread session the activity is posts, edits,
+    comments, votes, workspace changes and messages; each makes a new key. A vote turned from like to dislike leaves
+    the counts as they are, and so leaves the key. The event id is read on the events type index.
+    `_thread_quiet` (key, since) is kept in memory. `since` is when a pass first saw the conditions hold with that
+    key, raised to the latest `last_active` of the idle LLM members (not of those in error: a failing retry does not
+    restart it). A pass where the conditions fail, or the goal is not active, drops it; a changed key starts a new
+    clock; `start()` and `resume()` drop it.
+  - *Due* when `now - since >= 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) * idle_nudge_seconds` (`agents.idle_nudge_seconds`,
+    read at each pass) and `per_key < TEAM_ASLEEP_MAX`. `TEAM_ASLEEP_FACTOR` is not applied: it leaves room for items
+    2-3, which a thread session does not have. `sent` = `SELECT COUNT(*) FROM notifications WHERE kind IN
+    ('n_thread_quiet', 'n_thread_quiet_wrap_up') AND ts >= goal.updated_at`, so a restart keeps it, and a new or
+    reopened goal starts again. `per_key` = the nudges since the key was first seen, from `_thread_quiet_woken`
+    (key, count, told), in memory. With the default 60 s the nudges come after 1, 2, 4, 8, 16, 32, 32… minutes of
+    quiet, at most 2 per key. A member that only comments "nothing to do" at every nudge makes a new key each time and
+    so still waits twice as long each time. With `idle_nudge_seconds` = 0 the delay is 0: T2 is due at the first
+    pass that finds the team asleep, still at most 2 per key.
+  - *Whom*: among the idle LLM members (never one in error):
+    - while the clarify asker is still in its clarify phase (§22.4 "Clarify") and is idle, the asker, so no other
+      member takes the questions up;
+    - otherwise the one least recently active (`last_active` oldest first; a member never active counts as oldest),
+      so successive nudges go round the team.
+  - *Notice*: the member chosen gets the waking `n_thread_quiet` {vote, jobs}, or `n_thread_quiet_wrap_up` {vote,
+    jobs} while `wrapping_up`; `per_key` is recorded right after that notify succeeds. `vote` is `goal_vote_line` (or
+    `goal_vote_line_veto`, §22.4) in the recipient's language. `jobs` is "" or `thread_quiet_jobs` {jobs}, naming the
+    member's running jobs whose end is quiet (`jobs.running_of(name)` minus `jobs.awaited(name)`, labels `j3, j5`).
+    With `_works_on` (below), every running job of a member is awaited under an active goal, and an awaited job
+    keeps `team_asleep` false, so that list is empty whenever T2 fires. The placeholder keeps the text right if the
+    job rule changes.
+  - *USER*: in its own try/except with a log line, USER gets the waking `u_thread_quiet` {vote, elapsed}
+    (`wake=True`, as `u_team_asleep`: a user MCP client in `wait_for_events` is told) once per key, from the second
+    nudge of the goal on. It comes with the first nudge of a key that follows an earlier nudge of this goal (`sent` ≥
+    1). That covers both a second nudge with nothing new in the thread and one that follows a comment or a vote from
+    the nudged member, which makes a new key. A count of nudges within one key would rarely reach USER, since
+    `n_thread_quiet` asks for exactly that comment or vote. In wrap-up mode it comes with the first nudge: the vote is
+    then how the run ends, and under `veto` one member still finishing keeps it open. In code: with a nudge sent
+    while `sent` (as read for *Due*, before this nudge) ≥ 1 or `wrapping_up`, unless `told` is set for the key; then
+    `told` is set. `resume()` and `start()` also drop `_thread_quiet_woken`: a pause or a restart ends the quiet
+    period, so
+    USER never gets `u_thread_quiet` because of a pause. `elapsed` = `fmt_duration(now - since)` and `vote` the vote
+    line, both in USER's language. The surfaces (§22.8, §22.9): the TUI shows it as a warning (`_WARN_NOTES`), print
+    mode writes it to stderr (`STDERR_NOTES`), and for an HTTP API v1 client it is the signal of a stalled vote.
+  - *Texts* (R0′ per mode, §22.5: they name only tools of the thread set, revision 6). The ru texts follow the same
+    rules as the board's item 9 texts: the same placeholders and backticked identifiers; an untracked process is
+    «процесс, запущенный через & или nohup, которого нет в списке `jobs`», never «фоновый процесс», which is a job; no
+    & or nohup in backticks; the letter е, never its dotted form.
+    - `n_thread_quiet`: ``The thread is quiet, and nothing is set to wake the team: no running background job whose end
+      wakes its owner, no trigger that can still fire on a time or a file, no locked file someone was refused.{jobs}
+      {vote} A process started with & or nohup that `jobs` does not list is not tracked: its end wakes nobody. If you
+      are waiting for one, check it now; if it still runs, set a trigger with a deadline before you `wait`
+      (`trigger_create`, e.g. file_exists("out/result.json") or elapsed(1800)), and start the next such run with
+      background=true, without & and nohup. If you are waiting for the user's answer, don't ask again: the user has
+      your message. If you are waiting for another member, @mention them in a `comment`: a mention wakes them.
+      Otherwise, if the goal is reached, check the result yourself and like #1 (`vote`); if not, post or comment what
+      is missing and take it on.`` / ``В треде тихо, и команду ничто не разбудит: нет фонового процесса, чье
+      завершение разбудит его владельца, нет триггера, который еще может сработать по времени или по файлу, нет
+      занятого файла, который кто-то ждет после отказа.{jobs} {vote} Процесс, запущенный через & или nohup, которого
+      нет в списке `jobs`, не отслеживается: его завершение никого не разбудит. Если ты ждешь такой процесс, проверь
+      его сейчас; если он еще работает, поставь триггер со сроком, прежде чем вызвать `wait` (`trigger_create`,
+      например file_exists("out/result.json") or elapsed(1800)), а следующий такой запуск делай с background=true,
+      без & и nohup. Если ты ждешь ответа пользователя, не спрашивай снова: твое сообщение у пользователя. Если ты
+      ждешь другого участника, упомяни его через @ в комментарии (`comment`): упоминание его разбудит. Иначе: если
+      цель достигнута, сам проверь результат и поставь «нравится» объявлению #1 (`vote`); если нет, опубликуй или
+      прокомментируй, чего не хватает, и возьмись за это.``
+    - `n_thread_quiet_wrap_up`: the same up to "a mention wakes them." / «упоминание его разбудит.», then ``Wrap-up
+      mode is on: post what you have and what is left, if you have not yet, then like #1 now (`vote`): in wrap-up mode
+      a like on #1 means "finish with what we have". Dislike it only while you are still finishing something nearly
+      done, and say what in a comment.`` / ``Включен режим завершения: опубликуй, что у тебя есть и что осталось,
+      если еще не сделал этого, и сразу поставь «нравится» объявлению #1 (`vote`): в режиме завершения это значит
+      «заканчиваем с тем, что есть». «Не нравится» ставь, только пока доделываешь почти готовое, и напиши в
+      комментарии, что именно.``
+    - `thread_quiet_jobs`: ` Your background jobs {jobs} still run, but their end will not wake you.` / ` Твои
+      фоновые процессы {jobs} еще работают, но их завершение тебя не разбудит.` (no "while you hold no task in
+      progress": `team_asleep_jobs` stays board-only).
+    - `u_thread_quiet`: `Nobody in the team has worked for {elapsed}, and nothing is set to wake the team. {vote} The
+      team may be waiting for the vote on #1: you can mark the goal reached yourself, switch wrap-up mode off (when it
+      is on), write to the team or post in the feed, or stop the session.` / `Уже {elapsed} никто в команде не
+      работает, и команду ничто не разбудит. {vote} Возможно, команда ждет голосования по #1: вы можете сами отметить
+      цель достигнутой, выключить режим завершения (если он включен), написать команде или в ленту либо остановить
+      сессию.`
+  - *Limits accepted* (as item 9's): a job whose end wakes its owner, a server started with `background=true`
+    included, keeps T2 silent until it ends or reaches `[shell] job_max_minutes` (480 min by default; 0: as long as it
+    runs). A wait for a refused file keeps it silent until the lock ends (unlock, expiry after `[workspace]
+    lock_ttl_minutes`, retire). A trigger that reads only files counts for `UNATTENDED_FILE_SECONDS` (§8). A team
+    whose LLM members are all in error with no recovery scheduled wakes nobody: USER was told of the error
+    (`u_agent_error`). A session with no LLM member, or with an external member that called the hub in the last
+    `EXTERNAL_IDLE_SECONDS`, is not asleep. T2 never wakes an external member. A `dreamteam -p` run still waits, until
+    its `--timeout` when one is given, with `u_thread_quiet` on stderr (docs/TUI.md §2).
+- **`wait`'s unwatched clause** (§12 `wait`): in a thread session the `WAIT_UNWATCHED` text replaces the plain result
+  when all of these hold: the goal is active (wrap-up mode included); none of the caller's jobs or refused files is
+  awaited (the first branch of the result, as now); the caller has no active trigger of its own; and
+  `swarm.team_asleep(caller)` holds, with its thread clause on digest rows. The `stall_ids` condition is dropped:
+  `_unwatched` checks it only when `getattr(swarm, "mode", "board") == "board"`, so FakeSwarm keeps the plain text.
+  The string is the same: it names only shared tools, and "If you are waiting for one" holds without a task. The
+  member reads it after its next wake-up, which here is usually `n_thread_quiet`.
+- **Jobs** (§7.1 "Liveness"): in a thread session "the owner holds an in_progress task" reads "the goal is active".
+  `JobManager._works_on(name)` = (thread session and goal status `active`) or `_holds_in_progress(name)`, used by
+  `busy` and `wakes`. Under an active goal, a `background` job younger than `[shell] max_timeout` keeps its owner
+  busy (no digest batch for it, no quiet check meanwhile), and the end of a `detached` job wakes its owner; once the
+  goal is done no job end wakes anybody, as on the board. `waits_for_job`, `awaited`, `defer_wake` and
+  `_wake_deferred` work unchanged on top of it. The shell result's texts follow the same reading.
+  `jobs.FOOTERS_THREAD["detached"]` is `FOOTERS["detached"]` with `(only at your next wake-up unless you hold a task
+  in progress)` replaced by `(at once while the goal is active, else at your next wake-up)`. Its other parts
+  (`started`, `background`) name no task and are shared. `ShellOutcome` gains `mode: str = "board"`, which
+  `JobManager.run` sets from `getattr(self.swarm, "mode", "board")` in its `outcome()` helper, so every outcome of the
+  call carries it. `render(cfg=..., has_wait=...)` keeps its signature, and the `shell` tool handler
+  (tools/file_tools.py) calls it unchanged. With `self.mode == "thread"`, `render` picks
+  `FOOTERS_THREAD.get(state, FOOTERS[state])` and `_note_text` picks the thread note the same way.
+- **Clarify** (§22.4 "Clarify"): a question pause is a pause, so T1 and T2 do not run while the user is asked; T2
+  also stands down while `asks_user` holds for the asker, and wakes the asker first while it is idle in its clarify
+  phase (above). The clarify hint is the agent's own per-step `hint_planner(name)` call (§22.4), never a scheduler
+  item; how the answer reaches the others (the asker's comment on `#2`, delivered by T1) is §22.4's.
+- **Wrap-up mode** (the meaning of a like on `#1` and the decision record are in §22.4):
+  - `wrap_up()` sends every LLM member the waking `n_wrap_up_thread` in place of `n_wrap_up`, and every wake-up then
+    carries `wrap_up_line_thread` in place of `wrap_up_line` (both picked through `prompts.mode_key`). No command of a
+    member becomes a new job (§7.1 "Wrap-up mode"); a refused `background=true` gets `jobs.WRAP_UP_ERROR_THREAD`:
+    `The user asked the team to wrap up, so no new background jobs are started. If the command is quick, run it
+    without background (it is stopped at its timeout); otherwise post what you have (post_create, or a comment on
+    your post: the result so far and what is left).` A command killed at its timeout in wrap-up mode gets the note
+    `jobs.NOTES_THREAD["wrap_up"]` in place of `NOTES["wrap_up"]`: `It was not moved to the background: the user
+    asked the team to wrap up, so no new background jobs are started. Post what you have (post_create, or a comment
+    on your post: the result so far and what is left).` `wrap_up_left` names no task and is shared.
+    `_check_all_done` and its `n_all_done_wrap_up` do not run: the
+    vote on `#1` under the session's rule ends a thread wrap-up. Votes given before wrap-up are kept;
+    `n_wrap_up_thread` asks to vote again. T2 sends `n_thread_quiet_wrap_up` and tells USER with the first nudge of a
+    key. The clarify hint stops, as item 4 does in wrap-up. `end_wrap_up()` sends the shared quiet `n_wrap_up_end`,
+    except for the user's switch-off under an active goal: it then clears the votes on #1 and sends the quiet
+    `n_wrap_up_votes_cleared` (§22.4).
+  - `n_wrap_up_thread`: ``The user asked the team to wrap up: start no new computations or background jobs, not even
+    one more quick pass. Post what you have now: the results so far and what is left (a post of your own, or a comment
+    on it), and where they are in the workspace. Stop the background jobs nobody needs. Then like #1 (`vote`): in
+    wrap-up mode a like on #1 means "finish with what we have", not "the goal is reached". Dislike it only while you
+    are still finishing something nearly done, and say what in a comment. A vote you gave before still counts: check
+    that it says what you mean now. When the votes meet the session's rule, the goal is completed with what the feed
+    and the workspace hold.`` / ``Пользователь попросил команду закругляться: не начинай новых вычислений и фоновых
+    процессов, даже еще одного быстрого прохода. Опубликуй, что у тебя есть сейчас: результаты и что осталось (свое
+    объявление или комментарий к нему) и где они лежат в рабочей папке. Останови фоновые процессы, которые никому не
+    нужны. Затем поставь «нравится» объявлению #1 (`vote`): в режиме завершения это значит «заканчиваем с тем, что
+    есть», а не «цель достигнута». «Не нравится» ставь, только пока доделываешь почти готовое, и напиши в
+    комментарии, что именно. Голос, отданный раньше, по-прежнему учитывается: проверь, что он значит то, что ты
+    имеешь в виду сейчас. Когда голоса выполнят правило сессии, цель будет завершена с тем, что есть в ленте и в
+    рабочей папке.``
+  - `wrap_up_line_thread`: `Wrap-up mode (the user): start no new computations or background jobs and stop the ones
+    nobody needs; post the results and what is left, then like #1 (here it means "finish with what we have"; dislike
+    it only while you finish something nearly done, and say what in a comment).` / `Режим завершения (пользователь):
+    не начинай новых вычислений и фоновых процессов и останови ненужные; опубликуй результаты и что осталось, затем
+    поставь «нравится» #1 (здесь это значит «заканчиваем с тем, что есть»; «не нравится» ставь, только пока
+    доделываешь почти готовое, и напиши в комментарии, что именно).`
+- **Money** (§3 `record_usage`): the money notice works as on the board (`[swarm] budget_notice_at`, kv
+  `budget_notice`, one notice per limit and share, the quiet `u_budget_low` to USER, the `money` wake-up line).
+  `_budget_low` sends `n_budget_low_thread` {spent, limit, pct} in place of `n_budget_low`. The wake rule is the
+  board's condition, whose task and review terms are empty here: the notice wakes a member that is working or has
+  `has_pending` news, and is quiet for any other. Undelivered digest rows do not count, because they are quiet and T1
+  delivers them anyway. Text: ``Money: spent ${spent:.2f} of the ${limit:.2f} budget ({pct}%). When it is used up,
+  the swarm pauses: every agent stops between two steps. Don't wait for the user to ask for a wrap-up: from now on
+  finish what is nearly done, post what you have (a post or a comment: the result and where it is in the
+  workspace), keep the workspace consistent with what the posts say, start nothing large, and vote on #1 once you
+  have checked the result.`` / ``Деньги: потрачено ${spent:.2f} из ${limit:.2f} денежного бюджета ({pct}%). Когда он
+  закончится, рой встанет на паузу: каждый агент остановится между двумя шагами. Не жди, пока пользователь попросит
+  закругляться: с этого момента доделывай то, что почти готово, публикуй, что есть (объявление или комментарий:
+  результат и где он лежит в рабочей папке), держи рабочую папку в согласии с тем, что сказано в объявлениях, не
+  начинай ничего крупного и проголосуй по #1, когда проверишь результат.`` The budget pause itself (`u_budget`, the
+  auto-resume when the limit is raised, `stop_when_done`, §21.4) is shared.
+- **Pause, resume, restart**: the user's pause, a question pause and a budget pause stop T1 and T2, as they stop
+  items 1-9; the steps before them go on.
+  - `resume()` needs no thread branch for its wake set: the board terms are empty, so `n_resumed` goes to members
+    with `has_pending` (waking rows and unread messages; digest rows are quiet) or an activation the pause cut short
+    (`runtime.interrupted`). It sets `_digest_floor` to now and drops `_thread_quiet` and `_thread_quiet_woken`
+    (as it drops `_team_asleep`). A member with only digest rows gets no `n_resumed`: T1 wakes it, at most
+    `digest_seconds` later.
+  - `start()` alike: `n_restart` goes to members with `has_pending` under an active goal or with an interrupted
+    activation. It sets `_digest_floor` and leaves `_thread_quiet` and `_thread_quiet_woken` empty. It runs
+    `forum.rewrite_goal_rule()` and `forum.recheck_goal(None)` once (§22.4: a vote met while the session was stopped,
+    or under a rule changed then).
+  - `reconfigure()`: a new `digest_seconds` or `idle_nudge_seconds` reaches T1 and T2 at the next pass; a changed
+    `goal_rule` runs `_goal_rule_changed` (§22.4).
+- **After the decision**: once the goal is done (by the vote or by `complete_goal_by_user`), and while there is no
+  goal, T1's digest batching and T2 do nothing (T1's release of settled `f_file` rows still runs, §22.3); once it is
+  done no job end wakes its owner either, and only the shared wake reasons wake
+  a member (§22.3). A vote stuck under `veto` or in a split team has three ways out: the members change their votes,
+  the user completes the goal directly (`swarm_control` `complete_goal`: «Цель достигнута» / "Mark goal reached" on
+  the board, `/done` in the TUI, PATCH `complete_goal` in the HTTP API; §22.4, §22.8), or the budget pauses the swarm.
+  An HTTP API v1 session has no request kind for it: the budget, the client's `stop` or its `complete_goal` end it,
+  and `u_thread_quiet` is its signal (§22.9).
+- **Tests**:
+  - a thread pass never calls items 1-9 (each patched to fail);
+  - a lone idle member with an untracked process gets `n_thread_quiet`, then USER gets `u_thread_quiet` with the
+    second nudge, both when nothing changed in between (the same key) and when the nudged member commented or voted
+    (a new key), never twice for one key, and with the first nudge in wrap-up mode (also when wrap-up is switched on
+    after a key's first nudge); never more than `TEAM_ASLEEP_MAX` nudges per key, with the doubling across keys;
+  - T2 stays silent while a member has a due or pending digest row, while `_timers` is not empty, while a job is
+    awaited, and during a question pause;
+  - T1 wakes an idle member once for gathered digest rows, never for `f_vote` rows alone or for other quiet notices,
+    and never with no goal or a done goal; a resume or start moves the age floor;
+  - an external member that keeps the feed in `digest` calls `wait_for_events(timeout=600)` (`swarm_tools.WAIT_MAX`);
+    after another member's post the call returns about `digest_seconds` later (at `digest_deadline`, not at the timeout)
+    with that post in the `digest` group, marked delivered; `f_vote` rows alone never end the wait early, and a waking
+    row (a mention of the member) still ends it at once;
+  - `wait` in a thread session gives `WAIT_UNWATCHED` to a lone member with no trigger, and the plain text with its
+    own trigger or with another member's undelivered digest row;
+  - crossing `budget_notice_at` sends `n_budget_low_thread` (no `n_budget_low`), waking only working members or those
+    with waking news, and one `u_budget_low`;
+  - the clarify asker gets `n_clarify_hint_thread` and never `n_planning_hint`; T2 wakes the asker first while it has
+    not asked;
+  - `ShellOutcome(state="timeout", note="wrap_up", mode="thread")` and `ShellOutcome(state="detached", mode="thread")`
+    render with no "task", and the same outcomes with the default `mode` ("board") render today's texts byte for byte;
+  - T1 wakes no member while `_timers` is not empty: a reopen with old digest rows on every member gives each LLM
+    member exactly one wake-up, in the shuffled stagger order, with the reopen notice and its digest rows together.
+
+### 22.8 Surfaces
+- **Settings keys** (config.py, §17.1). All three are validated in `Config.load`, next to the `network` check, and
+  have a line in the template (`render_template`) with a Russian comment:
+  - `[swarm] mode` ("board" | "thread", default "board"; `SwarmSettings.mode`, right after `clarify`; anything else
+    is the ValueError `swarm.mode must be 'board' or 'thread', got 'x'`): the mode of the sessions created from now
+    on, and of a `dreamteam run` project's `swarm.db` when it is first made ("CLI" below). It never changes an
+    existing session ("The mode of a session" below), `main` and a `run` project included. Template: `mode =
+    "board"` after `clarify`, `# board — доска задач; thread — лента обсуждений (выбирается при создании сессии)`.
+    The settings page has its field; a session's ⚙ dialog shows the session's mode read-only.
+  - `[swarm] goal_rule` ("democracy" | "veto", default "democracy"; `SwarmSettings.goal_rule`, after `mode`;
+    `swarm.goal_rule must be 'democracy' or 'veto', got 'x'`): how the vote on #1 decides the goal (§22.4). It is the
+    default of new thread sessions: `create` freezes the effective rule into the session's overrides (below), so a
+    later save of the general settings never changes the rule of an existing session; a board session ignores it.
+    Template: `goal_rule = "democracy"` after `mode`, `# в режиме треда: democracy — цель достигнута, когда «за»
+    больше половины ИИ-агентов; veto — все «за», никого «против»`.
+  - `[agents] digest_seconds` (a number ≥ 10, default 60; `AgentSettings.digest_seconds`, after
+    `trigger_wake_seconds`): the digest batching age of §22.3, read at each scheduler pass; session overrides and the
+    partial update apply. The lower bound: `config._MIN_ONE` becomes `_MIN: dict[str, int]` (its keys map to 1, plus
+    `"digest_seconds": 10`; `_checked` takes `low = _MIN.get(key, 0)`), so the existing `_bad` text reads
+    `[agents] digest_seconds must be >= 10, got 5`; the other keys keep their bounds. Template: `digest_seconds =
+    60` after `trigger_wake_seconds`, `# в режиме треда: подписка «дайджестом» будит не чаще раза в столько секунд
+    (не меньше 10)`. Fields: the settings page's «Агенты» and the ⚙ dialog's group «Тред».
+  - `[swarm] clarify` keeps its key and rules; its template comment covers both modes: `# true — сначала уточнить
+    цель (на доске планировщик задает вам вопросы до плана, остальные ждут; в треде — вопросы вам в обсуждении #2);
+    важный вопрос агента ставит рой на паузу до ответа`. Its meaning in a thread session: §22.4 "Clarify".
+  - Read with a thread use, unchanged otherwise (§22.7): `idle_nudge_seconds`, `stagger_seconds`,
+    `planning_hint_steps` / `planning_hint_minutes` (only the clarify asker's hint), `file_settle_seconds` /
+    `file_max_wait_seconds`, `budget_notice_at` (its notice is `n_budget_low_thread`, §22.6). `[swarm]
+    independent_review` and `crew_review` do nothing in a thread session: it has no tasks.
+- **The mode of a session** (sessions.py; the authority is the database's kv `swarm_mode`, the cache in the
+  overrides, `_merged` and `main`: §22.1):
+  - `create` takes the effective mode: `overrides.swarm.mode` when given, else the home's `[swarm] mode`. For a thread
+    session it writes `swarm.mode` = "thread" into the overrides, even when the home's default is thread, and the
+    effective `swarm.goal_rule` (the given one, else the home's) and makes the session's database at once
+    (`Database(path, forum=True)`, kv `swarm_mode` = "thread"); a board session's database is made at its first start as
+    now, and `Swarm` writes its kv (§22.1). A board session stores neither `swarm.mode` nor `swarm.goal_rule`: `create`
+    drops a given "board" and a rule without a refusal (a TUI window may hold `/rule` for its new sessions while it
+    makes board ones); `sessionopts.overrides_from` refuses a rule before, in both of its paths (v1 and the launcher
+    MCP, §22.9).
+  - Neither `update_settings`, nor a session's PATCH, nor a hand edit of the settings of `main` or of a `run`
+    project switches a database that already exists. When the cache and kv differ (a hand edit of session.json), kv
+    wins wherever it is read (`summary` below; `update` puts the kv value back).
+- **Updating a session** (`update`, `PATCH /api/sessions/{sid}`, §17.2). The stored mode (kv `swarm_mode` when the
+  database exists, `db.session_mode`, else the cache) and the frozen rule are kept whatever the client sends; the
+  check runs in `update` on the result of `clean_overrides` / `_patched_overrides`, before validation, and nothing is
+  written on a 400:
+  - `settings` or `overrides` naming another `swarm.mode`, or `settings` clearing a thread session's mode (null or ""):
+    400 `the mode is chosen when the session is created`. The stored value, or null and "board" for a board session, is
+    a no-op, and a board session never gets the key stored. `overrides` without the key (a full replacement) of a thread
+    session gets "thread" back. The answer's summary and `config_view` show the stored mode.
+  - `swarm.goal_rule` in a thread session: a new value through `settings` or `overrides` applies live (`reconfigure`
+    re-evaluates the vote, §22.4); `settings` that clear it (null or "") are a 400 `the goal rule of a thread session
+    cannot be cleared`, and a full `overrides` without it keeps the stored rule. In a board session a
+    `swarm.goal_rule` value is a 400 `goal_rule applies to a thread session` (null removes nothing and passes).
+  - `agents.digest_seconds` is an ordinary live key in both modes (a board session stores it; nothing reads it).
+  - Tests (tests/test_sessions.py; the PATCH in tests/test_api_sessions.py; `run` in tests/test_cli.py): a session
+    created under a board default stays board after `[swarm] mode` = "thread" is saved (stopped, and running through
+    `update_settings`); `main` stays board under a thread default; a board session created with `mode: "board"` in a
+    home whose default is thread stores no `swarm.mode` and stays board; a `run` project's swarm.db keeps its kv
+    `swarm_mode` when dreamteam.toml's `[swarm] mode` changes, and another `--mode` exits 2; `update` answers 400 to
+    `settings` `{swarm: {mode: <other> | null}}` of a thread session and to `overrides` naming another mode, writing
+    nothing, while `swarm.mode` "board" or null on a board session stores nothing; it puts a thread session's mode and
+    rule back into a full `overrides` without them; it answers 400 to a cleared rule in a thread session and to a
+    `goal_rule` value in a board session; `read_stats` of a stopped thread session whose goal is done gives
+    `goal.decision`, and after a reopen, and in a board session, null.
+- **Summary** (`summary(sid)`, §17.2) gains `"mode": "board"|"thread"`, `"goal_rule"` (the effective rule, null in a
+  board session), `"goal_vote"` (the `goal_tally` shape of §22.2, null in a board session and before #1 exists) and
+  `"posts"` (the ordinary posts, kind `post`; 0 in a board session). A summary without `mode` (an older hub's) is a
+  board session's. `read_stats(db_path, conn=None, *, clarify=False, running=True, requests=False, mode="board",
+  goal_rule="democracy")`: `summary` passes the cached mode and the effective rule; `read_stats` replaces the mode
+  with kv `swarm_mode` when the file has one (`db.session_mode` on the same connection) and, in a thread session,
+  counts the posts and computes `goal_vote` with `forum.goal_tally(conn, rule)` in a try of its own (a file without
+  the forum tables gives 0 and null, the other figures stay); `tasks` keeps its zero default; its `goal` also carries
+  `"decision"`: kv `goal`'s `decision` while its status is done, else null (a board session's goal never has one, so
+  null; the pending goal `summary` makes from session.json gets null too). `completed_by` is not copied. Its
+  `requests` count
+  sees the kickoff asker of a clarify #2 the way it sees a clarify planner (`autoreply`, §22.9). `finished(sid)` is
+  unchanged (the goal is done; a thread session has no open task).
+- **Settings page** (home.js, §18.4):
+  - «Новые сессии по умолчанию», right after «Сначала уточнять цель»: «Режим работы» / "Work mode" (`swarm.mode`, a
+    select «Доска задач» / «Тред», en "Task board" / "Thread"; hint «Выбирается при создании сессии: уже созданные
+    сессии сохраняют свой режим.» / "Chosen when a session is created: existing sessions keep their mode.") and
+    «Решение о цели» / "Goal decision" (`swarm.goal_rule`, a select «Демократия» / «Вето»; hint «Только в режиме
+    треда. Демократия — цель достигнута, когда «за» больше половины ИИ-агентов; вето — все «за», никого «против».
+    Новая сессия получает это значение, в созданной его меняют в ее ⚙ настройках.» / "Thread mode only. Democracy:
+    the goal is reached when more than half of the AI agents are for it; veto: all for, none against. A new session
+    takes this value; an existing one changes it in its ⚙ settings."). The hints of «Независимое ревью задач» and
+    «Проверять групповую задачу целиком» end with «Только на доске задач.» / "Task board only.".
+  - «Агенты», after the triggers' fields: «Сводка подписок, с» / "Subscription digest, s" (`agents.digest_seconds`,
+    a number, min 10, step 10; hint «Только в режиме треда: бездействующий агент получает накопленные уведомления
+    своих подписок одним пробуждением, не чаще раза в столько секунд (не меньше 10).» / "Thread mode only: an idle
+    agent gets what its digest subscriptions gathered in one wake-up, at most once per this many seconds (at least
+    10).").
+- **New-session modal** (home.js, §18.4):
+  - `#ns-mode`: a radio `fieldset` (name `ns-mode`, legend `f_mode` «Режим работы» / "Work mode"; options
+    `f_mode_board` «Доска задач» / "Task board" with `f_mode_board_hint` «задачи с исполнителями, статусами и
+    ревью» / "tasks with owners, statuses and reviews", and `f_mode_thread` «Тред» / "Thread" with
+    `f_mode_thread_hint` «без заданной структуры: агенты публикуют объявления, обсуждают, голосуют и подписываются;
+    цель решается голосованием» / "no set structure: the agents post, discuss, vote and subscribe; the goal is
+    decided by a vote"), in the main grid right after the description and before `#ns-clarify` (the mode changes
+    what clarify means); checked from the saved `swarm.mode`.
+  - `#ns-rule` right under it (name `ns-rule`, `f_rule` «Решение о цели» / "Goal decision"; `f_rule_democracy`
+    «Демократия — больше половины ИИ-агентов за» / "Democracy: more than half of the AI agents for it",
+    `f_rule_veto` «Вето — все ИИ-агенты за, никто против» / "Veto: all AI agents for it, none against"), shown only
+    while «Тред» is chosen; checked from the saved `swarm.goal_rule`.
+  - While «Тред» is chosen, the clarify hint swaps live to `f_clarify_thread_hint` «агенты сначала спросят вас о
+    неясных местах цели в обсуждении #2; важный вопрос агента поставит весь рой на паузу до вашего ответа» / "the
+    agents first ask you about the unclear points of the goal in the discussion #2; an agent's critical question
+    pauses the whole swarm until you answer". The «Рабочая папка» block stays right after `#ns-clarify` (all three
+    folder choices work in both modes), so the order is mode, rule, clarify, working folder, model.
+  - `sessionOverrides` gains `mode` and `goal_rule`, under the modal's rule: `swarm.mode` only when it differs from the
+    saved default, `swarm.goal_rule` only with «Тред» chosen and when it differs (a rule picked while «Доска задач» is
+    on is never sent). The server writes a thread session's mode and rule in any case ("The mode of a session").
+  - The team composer's saved-team note reads «the order is who is woken first and, in a board session, who plans»:
+    in a thread session the order only chooses the clarify asker (the first AI member); who is woken first is
+    shuffled for each goal and reopen (§22.4).
+- **Session settings dialog** (⚙ «Настройки роя», app.js, §18.4):
+  - The mode comes from the snapshot's `swarm.mode` (`S.state.swarm.mode`, missing = board), so it works for `main`
+    and a standalone `dreamteam run` too; `detail.config.swarm.mode` of `GET /api/sessions/{sid}` is only a
+    cross-check.
+  - A read-only line at the top for every session, `main` and a standalone run included: `sf_mode_line` «Режим
+    работы: {mode} — выбирается при создании сессии» / "Work mode: {mode}, chosen when the session is created". It
+    is rendered outside `SESSION_FIELDS` and never as an input, so the patch never carries `swarm.mode` (the 400
+    above stays the backstop).
+  - `SESSION_FIELDS` entries gain an optional `modes` (default both, the idea of `ToolSpec.modes`).
+    `sessionFields(mode)` filters them, and every use in `settingsModal` takes the filtered list in place of
+    `SESSION_FIELDS`: the `fields` argument of `sessionFieldsHtml` and of `sessionSettingsPatch`, the texts map the ⚙
+    save reads with `$("#" + sessionFieldId(f)).value`, and the `S.modalInitial` refresh after a saved PATCH (the
+    error focus then only ever names a rendered field). So a field hidden in the mode is never read from the dialog
+    nor diffed, and its stored value is never sent as null; a board session's dialog works exactly as before.
+    `agents.planning_hint_steps`
+    and `agents.planning_hint_minutes` stay in both modes (the clarify asker's hint reads them, §22.4); in a thread
+    session `sessionFieldsHtml` gives them `sf_plan_hint_thread` «Только при уточнении цели: когда напомнить
+    спрашивающему агенту задать вопросы или написать в #2; 0 — выключено» / "Only while the goal is clarified: when to
+    remind the asking agent to ask its questions or to comment on #2; 0 = off" in place of `sf_plan_hint`. Thread only,
+    a group «Тред» (`sg_thread`, after «Уточнение цели»): `swarm.goal_rule` (kind `choice`, label «Решение о цели»,
+    options democracy | veto; the option labels come from the field's `optionKey` prefix, `goal_rule_democracy` /
+    `goal_rule_veto`, in place of the hard-coded `net_` one, which `swarm.network` keeps as its `optionKey`; the field
+    has `inherit: false`: no «как в общих настройках» option, since a thread session always has its own rule, and the
+    select starts at the session's value, else the global one, and is sent only when changed) and
+    `agents.digest_seconds` (kind `num`, min 10, hint `sf_digest_hint` «Бездействующий агент получает накопленные
+    уведомления подписок одним пробуждением, не чаще раза в столько секунд»). The placeholder or inherited value comes
+    from `GET /api/settings`, whose public view fills both keys' defaults.
+  - Clarify keeps its field in both modes; in a thread session `sessionFieldsHtml` (which gets the mode) shows
+    `sf_clarify_thread_hint` «Вкл: важный вопрос агента ставит рой на паузу до вашего ответа, а обсуждение #2
+    начинается с вопросов вам. Уже опубликованный #2 не меняется.» / "On: an agent's critical question pauses the
+    swarm until you answer, and the discussion #2 starts with questions to you. A #2 already posted stays as it
+    is.". No hint names a planning task there.
+  - Node tests: the filtering by mode; `parseSessionField` of `goal_rule` (another value is `sf_bad_choice`) and of
+    `digest_seconds` (below 10 refused); `sessionSettingsPatch` never emits `swarm.mode` nor a field hidden in the mode,
+    and never a null `goal_rule`; a board session's ⚙ save, with `SESSION_FIELDS` holding the thread-only fields,
+    reads only the inputs `sessionFieldsHtml` rendered and sends the same patch as before; `sessionFieldsHtml` renders
+    «Тред» only in thread mode, and the planning-hint fields
+    in both modes with `sf_plan_hint_thread` in thread mode.
+- **Sessions page card** (home.js, §18.4). A thread session (summary `mode` "thread") gets a plain badge «Тред» /
+  "Thread" next to «Без интернета» and «API», and in place of the task progress bar a vote bar «Голоса за цель: {for} из
+  {counted} (нужно {needed})» / "Goal votes: {for} of {counted} (needs {needed})" from `goal_vote` (the tooltip is the
+  rule in words, `f_rule_democracy` / `f_rule_veto`; no bar while `goal_vote` is null) and «объявлений: N» / "posts: N".
+  A board session's card is unchanged except for one tooltip text: `api_hint_auto` (and printmode's `hub_answers`,
+  Print mode below) is reworded for every API session, board ones included, to say that the hub answers the agents'
+  questions «и, на доске задач, ревью» / "and, on the task board, reviews"; nothing else about a board API card
+  changes.
+- **Board page of a thread session** (index.html, app.js; the mode from `S.state.swarm.mode`):
+  - Tabs: `data-tab="board"` and `#pane-board` are not rendered; `data-tab="thread"` with `#pane-thread` is the first
+    tab and the default one. `data-tab="feed"` / `#pane-feed` stay, labelled `tab_events` «События» / "Events"; the
+    other tabs are unchanged. `#search` gets the placeholder `search_posts` «Поиск по треду…» / "Search the
+    thread…" and filters the feed's rows by title, author and `#id` (the snapshot has no texts; `feed` with `query`
+    searches the texts too); the board's stack state (`S.expanded`, `S.unforced`, `S.preSearch`) is not used.
+    `#new-task-btn` is labelled `new_post` «+ Объявление» / "+ Post" and opens the post composer.
+  - The thread tab: the feed on the left (the system posts first, then by `active_at`; title, author, likes, dislikes,
+    comments, and a dot for a post with news since the user last opened it: localStorage `dt-seen:<session id>` (the
+    swarm's `name` on a standalone run) → `{post_id: active_at}`, every access in try/catch, nothing on the server); the
+    open post on the right (`GET /api/posts/{id}`): its text as Markdown, its votes, the comments with replies indented
+    under their comment, like / dislike buttons on the post and each comment (a pressed one withdraws the vote, `vote`
+    value `none`; disabled on the user's own posts and comments, which the forum refuses too, §22.2), «Ответить» on a
+    comment (`data-reply-comment`), «Изменить» on every ordinary post (USER may edit any, §22.2; not on #1 and #2). The
+    composers (a post: title and text; a comment) reuse `mentionQuery`, `mentionCandidates` and `attachMentions` for
+    @-completion, each with a menu element of its own; they send `/api/act/post_create`, `post_update`, `comment`,
+    `vote`. Element ids and attributes of the thread are its own (`tpost-N`, `tcomm-N`, `data-open-post`,
+    `data-open-comment`, `data-reply-comment`); the board's `#post-N`, `data-reply` and `data-goto-post` stay for task
+    discussions. WS `post.*` events reload the open post (`?since_id=` its last comment) and the snapshot poll keeps the
+    feed's rows; the keyboard focus stays where it was across re-renders.
+  - `#1`'s card adds the rule, the counted voters as chips with their votes (from `goal_vote`; an active AI agent
+    with no vote is a plain chip), the votes that are shown but not counted (members joined through MCP, the user)
+    apart, a bar with the threshold, and, once decided, the decision (`swarm.goal.decision`: «цель достигнута
+    голосованием» / «… решением пользователя»). Its buttons: «Изменить цель» (the goal modal), «Цель достигнута» /
+    "Mark goal reached" while the goal is active, and «Вернуть цель в работу» with an optional comment while it is
+    done (the page sends `-` for an empty comment, which posts nothing on #1, §22.4).
+  - «Цель достигнута» (on #1 and in the goal modal of an active goal) asks first, with an optional summary field
+    («Итог, необязательно» / "Summary, optional"), then sends `swarm_control {complete_goal: true, goal_summary}`
+    (§22.4, §22.5). A board session has no such button: its members complete the goal with `goal_complete`.
+  - Header: `#goal-status` keeps active / done and adds the short count from `goal_vote` («2/5 за, нужно 3» / "2 of
+    5 for, needs 3"); `#goal-btn` opens #1 in the thread tab, or the goal modal while there is no #1. In a thread
+    session with a goal set, the goal modal says under its title field «Посты #1 и #2 будут переписаны, голоса за
+    цель сброшены» / "Posts #1 and #2 will be rewritten and the goal votes cleared", and its save asks the same.
+  - Text: `md()` and `linkify()` take the mode; in a thread session `decorate()` turns `#N` into a
+    `data-open-post="N"` link (#1 and #2 alike) and `cN` into `data-open-comment="N"` (opens its post and scrolls to
+    the comment). The feed's `swarm.*` and `session.*` lines stay escaped, as now. A board session is unchanged.
+  - «События»: `FEED_TYPES` adds `post.created` in a thread session (the decision comes as `goal.completed`, `goal.*` is
+    listed already); `post.comment`, `post.updated`, `post.vote`, `subscription.changed` and `files.committed` stay out
+    (the thread tab shows them). `describeEvent`'s `goal.completed` line with `d.goal.decision` never names the actor:
+    «цель достигнута голосованием ({rule}) — {summary}» / "goal reached by vote ({rule}) — {summary}" (the rule as
+    «демократия» / «вето», "democracy" / "veto"); rule `user`: «цель завершена пользователем — {summary}» / "goal
+    completed by the user — {summary}"; without a decision as now.
+  - The agent drawer lists the member's subscriptions (kind, target, `by`, mode, an «авто» mark), read-only.
+- **Snapshot and REST** (web.py, §14, §14.1):
+  - `swarm` gains `mode` ("board" | "thread": the session's work mode, which is neither `/api/hub`'s `mode` nor
+    `swarm.network.mode`) and `goal_rule` (`Swarm.goal_rule`). The top level gains `posts`: every post without its
+    text, `[{id, kind, title, author, created_at, edited_at, active_at, likes, dislikes, comments, my_vote}]` in the
+    feed's order (`my_vote`: the user's, `like` | `dislike` | null), and `goal_vote` (the §22.2 shape | null).
+    `agents[]` gains `subscriptions` `[{id, kind, target, by, mode, auto}]`. Both are read by one query each, so a
+    poll costs a fixed number of queries; in a board session `posts` is [], `goal_vote` null and `subscriptions` [].
+  - The board fields in a thread session: `tasks` [], `counts` every status at 0 (what `snapshot` gives an empty
+    board), `agents[].open_tasks` [], `clarify_wait` `{"name", "post_id": 2}` | null (the kickoff asker of a clarify
+    #2 while it waits for the user's answers, §22.4; the quiet banner of §14.1 then uses a new key
+    `clarify_wait_thread`, «{name} ждет ваших ответов на вопросы по цели (#2) — ответьте в чате» / "{name} waits for
+    your answers about the goal (#2): reply in the chat", chosen while `S.state.swarm.mode` is "thread"; a click still
+    opens the asker's chat, and `clarify_wait` keeps the board's text and stays in use in a board session; app.js's ru
+    and en tables each gain `clarify_wait_thread`), `independent_review` the setting's value (inert).
+  - `GET /api/posts/{id}?since_id=` (a new row of the §14 table) → `{post, comments, votes, goal_vote?}`: `post` is
+    `Forum.get` plus `my_vote`; `comments` the tree in id order, each `{id, author, text, reply_to, ts, likes,
+    dislikes, my_vote}` (the page nests a reply under its `reply_to`), with `since_id` only the later ones; `votes`
+    the post's voters `[{voter, value, counted}]`; `goal_vote` for #1 only. 404 for an unknown post, and for every
+    `/api/posts` path in a board session. The user acts through `/api/act/{tool}`: `post_create`, `post_update`,
+    `comment`, `vote` and `swarm_control` (`complete_goal`, `reopen_goal_comment`); `feed`, `post_read` too.
+  - The auto-reply paragraph of §14: in a thread session there is no planning card; under the lease no #2 is
+    written with the ask-the-user-first sentence (`clarifying` is false, §22.4) and no question pauses the swarm.
+- **CLI** (cli.py, §18.3):
+  - `--mode board|thread` and `--goal-rule democracy|veto` (argparse choices, default None: the settings decide) on
+    `tui`, `-p`, `serve` (with `--goal`) and `run`; neither is a TUI-only nor a serve-only flag
+    (`_default_command`), and `sandbox` forwards neither (the dialog inside the container sets them).
+    `tui.commands.FLAT_OVERRIDES` gains `"mode"` → ("swarm", "mode") and `"goal_rule"` → ("swarm", "goal_rule").
+  - `tui`: both become overrides of the sessions the window creates (`overrides["mode"]`, `overrides["goal_rule"]`,
+    only when given), also with `-c` / `-r`, where they are the window's setting for new sessions, as `--clarify`.
+  - `-p` with `-c` / `-r` refuses with exit 2 before anything starts: `dreamteam -p: --mode is chosen when a session
+    is created; an existing session keeps its mode.` and `dreamteam -p: --goal-rule is a setting of a new session;
+    change an existing one with /rule in dreamteam tui or in its ⚙ settings on the board.`
+  - `serve`: with `--goal` they go into `create(..., overrides={"swarm": {"mode": ..., "goal_rule": ...}})`;
+    without it, exit 2 in the wording of `--clarify needs --goal` (`--mode needs --goal: it is a setting of the
+    session that --goal creates (an existing session keeps its mode).`, `--goal-rule needs --goal: … (an existing
+    session changes it in its ⚙ settings or with /rule).`).
+  - `run`: the project's mode is fixed by kv `swarm_mode` when its swarm.db is first made: `--mode` when given (for
+    that first start), else the project's `[swarm] mode`; afterwards kv wins over dreamteam.toml (a differing
+    `[swarm] mode` logs the warning of §22.1). A `--mode` that differs from an existing database's mode
+    (`db.session_mode`; a database with no kv yet and no tasks, messages or events takes the flag) exits 2 before
+    anything starts: `this project's swarm.db is a <mode> swarm: the mode is chosen when it is created`.
+    `--goal-rule` is for this run only, as `run --clarify` (the file keeps its value; the vote is re-evaluated at
+    the start, §22.4).
+- **TUI** (docs/TUI.md §2, §3.2, §4.1-§4.3 and §4.5 say the same, updated with the code):
+  - Commands of a thread session: `/feed [@Имя] [текст]` (`feed` with `by` and `query`: an argument that starts with
+    `@` is split by `console.match_addressee` over every `agents[]` name of the snapshot, retired ones included (not
+    `members_of`, which drops them), plus `user` / `пользователь` for the user's posts. The matched name is `by` and
+    the rest, stripped, is `query` (empty = none). An `@` that matches nobody prints uitext `unknown_member` («Нет
+    такого участника: {name}») and sends nothing. Without `@`, the whole argument is `query`); `/post N` (`post_read`:
+    the post, #1's vote line for N = 1, the comment tree with `cM` ids and votes); `/post` alone (the next input is
+    the post: its first line the title, the rest the text, as `/new` and `/goal`); `/comment N текст` (on post N),
+    `/comment N cM текст` (a reply to comment M of post N: a second word of the form `cM` is the reply's target, and
+    the command sends `comment` with post_id N and reply_to cM; a comment of another post is refused by the forum
+    with `No comment c31 on #9`); `/like N|cN`, `/dislike N|cN`, `/unvote N|cN` (`vote` with `like`, `dislike`,
+    `none`; the TUI sends a bare number N as target `#N`, and `#N`, `pN` and `cN` as typed, so the forum's refusal of
+    a bare number never reaches the user; the user's votes are shown and never counted); `/done
+    [итог]` (`swarm_control` `complete_goal` with `goal_summary`, after a confirmation, «Нет» preselected). A post or a
+    comment typed by the user wakes every member (§22.3).
+  - `/rule [democracy|veto]` (also `демократия|вето`): in a thread session, without an argument the rule («Решение
+    о цели в этой сессии: демократия»), with one `update_session` {"swarm": {"goal_rule": …}} (live); in a board
+    session, `main` included, «Решение о цели действует только в сессии-треде» and no PATCH. Without a session: the
+    window's setting for new sessions (§4.5), as `/clarify`. `/mode [board|thread]` (also `доска|тред`): without a
+    session the window's mode for new sessions; in a session it shows the mode, and an argument is refused with
+    «Режим выбирается при создании сессии». Both are launcher only, like `/clarify`.
+  - Board commands in a thread session: `/board` is `/feed`; `/task N`, and `/approve N` or `/reject N` with a
+    number, print «В треде нет задач: /post N, /comment N, /like N» and send nothing (`/approve имя` and `/reject
+    имя` of MCP are unchanged). In a board session the thread commands print «В этой сессии доска задач: /board,
+    /task N» and `/done` «На доске цель завершают агенты (goal_complete)». `/help` and the `/` suggestions list the
+    commands of the session's mode.
+  - `/goal`: the goal panel adds #1's vote line and the rule (and the decision once done); `/goal текст` in a thread
+    session with a goal asks first «Посты #1 и #2 будут переписаны, голоса за цель сброшены. Продолжить?».
+    `/clarify` there words it as questions to the user before the work starts, in #2, and says that a #2 already
+    posted stays as it is.
+  - Suggestions: `#` lists the snapshot's `posts` (`#3 Title · нравится 4 · комментариев 2`); after `/like`,
+    `/dislike`, `/unvote` and `/comment` also the comments of the open post as `cM`. The default addressee is the
+    agent who last messaged the user, else `all` (there is no planning task). The session picker's hint adds «тред»
+    / "thread" after the status (uitext `sess_thread`, as `sess_api`). On attach, the one-line board summary is
+    replaced by the vote line and the feed's first rows.
+  - Rendering (render.py, through `render.event` also for `-p --verbose`): `EVENT_TYPES` and `_HANDLERS` gain the
+    six types of §22.2. Normal: `post.created` as `#9 title — Anna` with the post symbol, `post.comment` as one
+    folded line `Anna → #9: first line…` (`↳ c31` for a reply), a vote on `p1` as its line followed by the vote line
+    of the refreshed snapshot's `goal_vote`; verbose only: the other votes, `post.updated`, `subscription.changed`,
+    `files.committed`; quiet: `post.created` and the user's `f_*` notices. The user's `f_comment`, `f_reply` and
+    `f_mention` are not printed at normal and verbose (the event's line says it, a mention highlighted). `ECHOED_TOOLS`
+    gains `post_create`, `post_update`, `comment` (`subscribe`, `unsubscribe`, `vote` show in verbose only);
+    `_QUIET_SKIP_NOTES` gains `u_goal_decided` (the goal panel says it); `_WARN_NOTES` gains `u_thread_quiet`.
+- **Print mode** (tui/printmode.py; continuing and the result: §22.9). `printmode.STDERR_NOTES` gains `u_thread_quiet`:
+  its text goes to stderr once and the run keeps waiting. `_summary_line` gains a post branch (`#9 title`, and `#9 c31:
+  text` for a comment). The automatic task approvals (`AUTO_REVIEW`) find nothing in a thread session. `hub_answers`
+  (said once under `--verbose`, §21.5) is reworded for both modes: «Эта сессия создана через HTTP API с answers =
+  "auto": на вопросы агентов (и, на доске задач, ревью) за вас отвечает сам хаб, этот запуск автоответов не шлет.» /
+  `This session was created through the HTTP API with answers = "auto": the hub itself answers the agents' questions
+  (and, on the task board, reviews) in your place, so this run sends no automatic replies.` `--clarify` keeps its rules
+  (`--no-auto-reply` needed: under the lease no clarify #2 is written); its clarify line (`asked` / `asked_timeout`,
+  which `on_message` writes once for an agent's message to the user while `clarify` is on; it never reads the
+  snapshot's `clarify_wait`) is mode-neutral and unchanged: in a thread session the kickoff asker of a clarify #2
+  asks by a message to the user too (§22.4). A `-p` run whose team went quiet with the goal undecided says so once on
+  stderr (`u_thread_quiet`) and then ends by its timeout, the budget or Ctrl+C, as a stalled board run does.
+- **Hub MCP and launcher MCP** (§13, §18.2): the tools and instructions by mode, `session_create`'s `mode` and
+  `goal_rule` and `sessions_list`'s thread line are §22.9's.
+
+### 22.9 HTTP API v1, launcher and hub MCP, external members, export and import
+
+Every outside surface serves both modes. The mode is read from the session (`Swarm.mode` of a loaded one, the summary's
+`mode` of a stopped one, §22.8), never from the global `[swarm] mode`, which is only the default of a new session.
+
+- **Hub MCP (§13).** A session's `/mcp`, `/s/{sid}/mcp` and stdio server list the tools of that session's mode only:
+  - `hub_specs(mode=None)` filters `REGISTRY` by audience (E∪U, as now) and by `spec.modes`; `None` is the union of
+    both modes (the launcher). `list_hub_tools(swarm)` calls `hub_specs(swarm.mode)`, takes each
+    schema from `spec.parameters_for(mode)` and each description from `_description(spec, language, mode)`, which
+    calls `spec.describe(language, mode)` (a tool's `variants["thread"]` text in a thread session, §22.5). With
+    `mode` None a shared tool is listed with its board text, and its schema's properties are the union of both
+    modes': the board's in their order, then the ones only its thread variant has (today `swarm_control`'s
+    `complete_goal` and `goal_summary`, whose descriptions say "Thread sessions only"). `required` is the board's;
+    `agent_traces` keeps `task` there (the board has it), and the launcher shows `complete_goal`, which its
+    INSTRUCTIONS names.
+  - The forum tools (§22.5) are listed with the suffixes of today: `subscriptions`, `subscribe` and `unsubscribe`
+    (audience LE) get " [Members only: call join_swarm first and pass as_agent.]"; the user calls `feed`,
+    `post_read`, `post_create`, `post_update`, `comment` and `vote` without `as_agent`.
+  - `build_hub_server(swarm)` passes `INSTRUCTIONS_THREAD` as `instructions=` when `swarm.mode == "thread"`, else
+    `INSTRUCTIONS`, which keeps its board text. `INSTRUCTIONS_THREAD` (English, on the pattern of `INSTRUCTIONS`)
+    says:
+    - the swarm works without a task board: in a feed of posts (`feed`, `post_read`, `post_create`, `post_update`),
+      their comments (`comment`, replies with `reply_to`) and likes and dislikes (`vote` like / dislike / none);
+    - post #1 ("Goal reached?" / «Цель достигнута?») holds the goal and its vote under the session's rule
+      (democracy: more than half of the swarm's own AI agents like #1; veto: all of them like it and none dislikes
+      it), and #2 ("Let's plan the work" / «Спланируем работу») is where everyone plans together;
+    - only the swarm's own AI agents' votes count: the votes of the user and of members who joined over MCP are shown
+      and never counted;
+    - the user can complete the goal directly (`swarm_control` with `complete_goal=true` and an optional
+      `goal_summary`, §22.4) or reopen it (`reopen_goal_comment`), which clears the votes on #1; a post or a comment
+      of the user reaches every member at once (§22.3);
+    - `wait_for_events` with `progress=true` also returns on new posts, comments and goal events (§22.5);
+    - on the members' side: `subscriptions`, `subscribe` (`feed`, `post`, `file`, `reactions`; `by=<member>`; `wake`
+      or `digest`) and `unsubscribe`; every member starts subscribed to the whole feed, to #1 and #2 and to the
+      reactions to its own posts and comments, all as digests (the feed itself can never be removed, only its mode
+      changed); an @mention reaches the member at once; a digest reaches a member who joined over MCP through
+      `wait_for_events` once its oldest item is `[agents] digest_seconds` old (below); a member who joined votes, but
+      its vote on #1 does not count;
+    - in the user's wrap-up mode a like on #1 means "finish with what we have" (§22.4);
+    - read before you write, as §22.11 "Texts" words it: a member's `comment`, `post_update` and `post_create` are
+      refused while there is news it has not read, and its `write_file` / `edit_file` of an existing file while the
+      file changed since it last read or wrote it, or it never read it (`write_file` of a long file needs every line
+      read); the refusal shows what is new and counts as reading it (a long file: `read_file`); a claim goes in a
+      top-level comment on the post it belongs to, and the work starts once it went through; the user is never
+      refused;
+    - the rest as `INSTRUCTIONS` says it: the user's controls, the answer rule of a question pause (§3.1), `jobs` and
+      `job_stop`, the skills, `join_swarm` and `as_agent`, `shell` and its background jobs, `max_agents`.
+  - `serve_stdio_proxy` forwards the upstream server's instructions, so a proxy of a thread session's `/s/{sid}/mcp`
+    gets `INSTRUCTIONS_THREAD` with no change.
+- **One refusal for a tool of the other mode.** It lives in `tools.call_tool` (§22.5), the one entry of the hub MCP,
+  the launcher MCP, `/api/act`, the TUI and v1, never in `hub_call` or `call_launcher_tool`: a `task_create` in a
+  thread session or a `post_create` in a board one is refused without running, with §22.5's text, so every surface
+  answers alike. The LLM agents never see it: their frozen sets (§6.1) hold their mode's tools only.
+- **Launcher MCP (§18.2).** One server serves the sessions of both modes, and MCP clients cache the tool list:
+  - `list_launcher_tools` lists the union once: `list_hub_tools(_LanguageOnly(language))`, where `_LanguageOnly`
+    carries `mode = None` beside `language`. A tool of one mode only gets " [Board sessions only.]" or " [Thread
+    sessions only.]" after the suffixes of today (`_description` with `mode` None). Each keeps its `session`
+    property.
+  - `dispatch_launcher_call`'s unknown-name check and its close matches use `hub_specs(None)`. A tool of the other
+    mode reaches the session, whose `call_tool` refuses it as above. A shared tool called with an argument only the
+    board's schema has (`mcp_create`'s `task_id`) is validated against the session's mode (`prepare_args(...,
+    mode=)`, §22.5), as a call from the session's own `/mcp` is.
+  - `session_create` gains `mode` (`{"type": "string", "enum": ["board", "thread"]}`: "board: a task board with owners,
+    statuses and reviews; thread: no imposed structure: the agents post to a feed, comment, vote and subscribe, and
+    decide by their vote on post #1 that the goal is reached. Fixed for the session's life. Default: the global setting
+    ([swarm] mode, board).") and `goal_rule` (`{"type": "string", "enum": ["democracy", "veto"]}`: "Thread sessions
+    only: democracy (more than half of the swarm's own AI agents like post #1) or veto (all of them like it and none
+    dislikes it). Default: the global setting ([swarm] goal_rule, democracy)."). Both go through
+    `sessionopts.overrides_from` (not strict, below) to `SessionManager.create`, which writes a thread session's mode
+    and effective rule (a board session stores neither, §22.8).
+  - Its `clarify` description is worded for both modes: "true: the agents first ask you about the forks of the goal
+    (board: the planner, before any task, while the other agents wait; thread: the first agent, in one message,
+    then it comments your answers on post #2), and an agent's critical question pauses the whole swarm until you
+    answer (send_message to that agent in the session answers it); false: off. Default: the global setting ([swarm]
+    clarify, off)."
+  - `sessions_list` (`session_line`, from the board summary's `mode`, `goal_rule`, `posts` and `goal_vote`, §22.8): a
+    thread session has ` | thread (<rule>) | posts N` in place of ` | tasks d/t done` (`<rule>`: the summary's
+    `goal_rule`, `democracy` or `veto`), then, while #1 exists, ` | goal vote F/C for (needs K)` with `, A against`
+    before the parenthesis when someone counted dislikes #1 (F, A: the counted likes and dislikes, C: `counted`, K:
+    `needed`); the other marks follow as now. Its `goal [done]` line is unchanged.
+  - `INSTRUCTIONS`: "its own goal, task board, agents, messages and workspace" becomes "its own goal, agents, messages
+    and workspace, and either a task board or a feed of posts (its mode)", and one paragraph follows the
+    `team_name` line: "A session works in one of two modes, chosen when it is created and fixed for its life:
+    board (a task board: tasks with owners, statuses and reviews) or thread (a feed of posts, comments and likes;
+    the goal is reached by the vote of the session's own AI agents on post #1, whose rule is democracy or veto):
+    `session_create(..., mode="thread", goal_rule="veto")`. `sessions_list` shows a thread session's mode, goal rule and
+    goal vote. Tools marked [Board sessions only.] or [Thread sessions only.] work only in sessions of that mode; the
+    hub instructions below describe a board session; in a thread session read the feed with `feed` and `post_read`, post
+    with `post_create`, discuss with `comment`, vote with `vote`, and complete the goal yourself with `swarm_control`
+    complete_goal=true." The hub instructions appended after it stay `INSTRUCTIONS` (board).
+- **External members** (members who joined over MCP, kind `external`):
+  - Subscriptions: `Swarm._create_member` (through `hire`) makes the automatic ones (`forum.auto_subscribe`, §22.3) for
+    every kind, so `join_swarm` gives a new external member the feed, #1, #2 and its reactions, all `digest`. A
+    welcome-back (`join_swarm(name=<an existing external member>)`) keeps the member's subscriptions and makes none; a
+    retire drops them all (`forum.drop_subscriptions`). The subscription tools are theirs as for any member (LE).
+  - Digests: an external member has no scheduler digest wake (the settle release of a waking `f_file`, §22.3 /
+    §22.7 T1, is the one scheduler signal it gets, and it ends a pending `wait_for_events` at once). In a thread
+    session its `wait_for_events` also ends at
+    `Swarm.digest_deadline(actor)` (§22.3: its oldest undelivered digest row other than an `f_vote`, older than
+    `[agents] digest_seconds`), a deadline inside the loop of today, so `has_pending` and `team_asleep` keep their
+    meaning. The result renders the `digest` group (§22.6) and marks its rows delivered; waking rows (a `wake`
+    subscription, a mention, a message, a post or comment of the user) end the wait at once, as now. When the timeout
+    comes first, the result still holds the digest items gathered so far (§22.3: an incoming render delivers every
+    undelivered row).
+  - Liveness: `_check_quiet` requires `Swarm.team_asleep()` (§22.7), which counts an external member seen within
+    `EXTERNAL_IDLE_SECONDS` (`_external_seen`, §13) as active, so the team is not nudged and the user not told
+    `u_thread_quiet` while an MCP member works in a long call.
+  - Results: `join_swarm` and `swarm_status` name the feed instead of the board in a thread session, and a vote on
+    #1 by an external member or the user says that it is not counted, as §22.5 words them.
+  - Counting: their votes are shown on #1 (`post.vote`, the board's chips) and never counted (§22.4); hiring or
+    retiring an external member never changes `counted`.
+  - Read marks (§22.11): an external member is checked and has marks like an AI agent; its `wait_for_events` results
+    move them (they are `render_wake`'s), what its client wrote or read as another member or as USER is marked for
+    it too, when the call runs (`seen_as`, §22.11 "Others"), and its marks outlive a reconnect with a fresh context.
+    A call without `as_agent` is USER's and is never checked.
+- **Instructions from outside** (`dreamteam -p -r <id> "<text>"`, v1 `continue`). `instruct.continue_step(state)`
+  reads the mode from `state["swarm"]["mode"]` (missing = board). In a thread session it never uses
+  `coordinator()`, which stays board-only (its docstring and §21.2 say so):
+  - no goal → `set_goal` (which writes #1 and #2, §22.4); a completed goal → `reopen_goal` with the text as the
+    comment (USER's comment on #1, the votes on #1 cleared); a pending question → a message to the asker, as now;
+  - otherwise the new action `"post"` (`ContinueStep.action` gains it; `to` None): the text becomes a post of kind
+    `post` by USER, its title the first line, shortened as a goal's title is when it is longer than 200 characters
+    (`goal_text.shorten_title`, §3), its text the rest; the text is the whole instruction instead when it has one
+    line, when the rest is blank, or when the first line is longer than 200 characters (as `goal_text.split_goal`
+    keeps a long first line), so nothing of the instruction is lost; `instruct.post_parts(text) -> (title, text)`
+    splits it, so `-p` and v1 cannot drift apart. A post or a comment by USER wakes every member whatever the mode of
+    its feed subscription (§22.3), so the instruction is read at once, by everyone, in the shared feed;
+  - a session paused by the user is resumed after it, as now.
+  - v1: `ApiV1._deliver` calls `swarm.forum.create(USER, title, text)` for `"post"`. A text the forum refuses (a post's
+    text holds at most 20 000 characters, while `continue` takes 50 000) is a ToolError: 409 `conflict` with its
+    text on a running session, `api.error` `conflict` after a start (§21.2), nothing given.
+  - `-p` (`printmode.attach`) carries it out over HTTP as the user: `client.act(sid, "post_create", {"title",
+    "text"})`. Its verbose feed and `stream-json` show the `post.created` (§22.8 rendering), so the posted
+    instruction is visible.
+- **HTTP API v1 (§21).** A thread session answers every route; what changes is additive (§21.1 "Compatibility"):
+  - **Create (§21.4).** `api_v1.CREATE_FIELDS` gains `mode` ("board" | "thread") and `goal_rule` ("democracy" |
+    "veto"). Both go through `sessionopts.overrides_from`, in both of its paths, as `swarm.mode` and
+    `swarm.goal_rule`:
+    - strict (v1): `mode` read with `_strict_choice` against `tools.MODES`, `goal_rule` against the two rules, 400
+      `bad_request` for another value; `null` is not given. The effective mode is `mode`, else the global `[swarm]
+      mode`. `goal_rule` with an effective board mode is 400 `bad_request` ("goal_rule applies to a thread session: give
+      it with mode \"thread\"."), as a program's mistake should fail. The team's role names resolve in the effective
+      mode (`roles.find_role(..., mode=)`: "Critic" / «Критик» resolves in a thread create, the key `reviewer` in both;
+      a board create resolves "Critic" as any other name);
+    - not strict (launcher MCP): the same keys; a bad value is left to the settings' check (`swarm.mode must be
+      'board' or 'thread', got ...`, as `Config.load` words it), which `session_create` answers with "Error: ...";
+      `goal_rule` with an effective board mode is refused with the same text.
+    - `SessionManager.create` writes `swarm.mode` = "thread" and the effective `swarm.goal_rule` into a thread session's
+      overrides (a board session stores neither) and creates the thread database (§22.1, §22.8); v1 writes no second
+      copy.
+    - `mode` is unrelated to `folder.mode` (`copy` | `in_place`, §21.10); §21.4 says so.
+    - `request_digest` covers both as given, so the same `client_ref` with another `mode` is 409 `conflict`.
+    - `clarify: true` keeps its rule (only with `answers: manual`); in a thread session it means §22.4's clarify: the
+      first AI member asks the user the goal's forks in one message with `pause_swarm`, then comments the answers on
+      #2.
+  - **Options (§21.2).** `GET /api/v1/options` gains `"modes": ["board", "thread"]`, `"mode"` (the global default),
+    `"goal_rules": ["democracy", "veto"]` and `"goal_rule"` (the global default). `roles` lists the catalog in the
+    default mode's texts (§22.6: the reviewer is "Critic" in a thread one unless an own role has that name); a
+    role's `key` is the same in both modes.
+  - **PATCH (§21.2).** `api_v1.PATCH_FIELDS` gains `goal_rule` ("democracy" | "veto"), `complete_goal` (bool) and
+    `goal_summary` (string). They apply to a thread session only: in a board session each is 400 `bad_request`
+    ("goal_rule applies to a thread session", "complete_goal applies to a thread session: in a board session the
+    agents complete the goal with goal_complete."). Check order as now (the type, the fields, the session), then
+    every value before anything is written: `goal_rule` one of the rules (400); `complete_goal` a bool (`false`
+    changes nothing); `goal_summary` a string of at most 20 000 characters once stripped (`board.MAX_POST`), only
+    with `complete_goal: true` (400 otherwise); `complete_goal: true` on a session that does not run is 409
+    `not_running` (`api_v1.NOT_RUNNING_TEXT`). Then:
+    - `manager.control(sid, ..., complete_goal=, goal_summary=)`, under the session's lock as now: the limits, then
+      `Swarm.complete_goal_by_user(summary)` (§22.4: decision rule `user`, the summary the user's text or
+      `goal_completed_by_user`), then the wrap-up mode (the order of `swarm_control`, §22.4, so `decision.wrap_up` is
+      the mode as it was before the call). The goal is checked first, under the lock: no goal, or a goal already done,
+      is 409 `conflict` with the swarm's text, nothing written. With `stop_when_done` the session then stops on its
+      `goal.completed` like any completion.
+    - then `goal_rule` through the sessions' partial update (`manager.update(sid, settings={"swarm": {"goal_rule":
+      v}})`, the ⚙ dialog's call, §17.2), never the kv path: a stopped session gets its overrides written and is not
+      loaded; a running one is reconfigured, which re-evaluates the vote (`_goal_rule_changed`, §22.4; a completion it
+      causes has actor None). Clearing it (`""`) is 400, as §22.8 says; `null` is not given.
+    - The answer's `session` shows the new state.
+  - **Summary (§21.7).** It gains `"mode"` (right after `"state"`; "board" for a session without the key),
+    `"goal_vote"` (§22.2's shape `{rule, counted, for, against, needed, met}` with name lists; null in a board
+    session and in a thread one with no #1 yet) and `"posts"` (the number of ordinary posts, kind `post`, the board
+    summary's figure of §22.8; 0 in a board session). Its `goal` gains `"decision"`: `goal.decision` (§22.1) while
+    the goal is done in a thread session, else null, taken from the board summary's `goal` (`read_stats`, §22.8).
+    `ApiV1.summary` copies it next to title, description, status and summary as `stats_goal.get("decision")`, null
+    when missing, never the "" default of the other four. In a thread
+    session `"tasks"` stays `{}`, so clients do not break. A stopped session's figures come from its file
+    (`read_stats(..., mode=, goal_rule=)`, §22.8), never loaded.
+  - **State (§21.7).** No new state. In a thread session `done` means the goal is completed: the counted vote met the
+    rule, or the user completed it. `waiting` comes only from `question` and `mcp` requests (there are no reviews;
+    `message` requests never block). A reopen clears the votes on #1, so `goal_vote.for` and `against` start empty.
+    `stop_when_done` and the resume check of §21.4 are unchanged: a thread session whose goal is completed has no
+    open task either, so it is not resumed.
+  - **Result (§21.7).** `result.build_result` gains `mode="board"`, `posts=None` and `decision=None`, written after
+    `jobs` in this order: `mode`, `posts` (`[{id, kind, title, author, likes, dislikes, comments, created_at,
+    active_at}]`, no texts, in the feed's order: #1, #2, then by `active_at`, newest first; at most 200; [] in a board
+    session) and `decision` (`goal.decision`, null in a board session and when the goal is not done). `tasks` is []
+    in a thread session; `summary` is the goal's summary (the `goal_decided` text, or the user's own words). The
+    artifacts stay `changed_files`: the goal's artifacts are the shared workspace (§22.1), and no other list is kept.
+    - v1 reads a stopped session's posts from its file with `sessions.read_posts(db_path, conn=None)` (the heads
+      above, read-only, as `read_lists`), through `ApiV1._read_db`, and the decision from its summary's `goal`. The
+      kept-result cache needs no change: a done session's decision is final until a `continue` reopens the goal,
+      which changes the journal's head.
+    - `-p` passes `mode`, `posts` (the snapshot's `posts`, §22.8) and `decision` (`swarm.goal.decision`), so its JSON
+      result has the same fields; a board session's gains `mode`, `"posts": []` and `"decision": null`.
+  - **Events (§21.6).** `api_v1.TIMELINE` and §21.6's list gain `post.created`, `post.updated`, `post.comment` and
+    `files.committed` (§22.2). `post.vote` and `subscription.changed` are `detail=all` only: votes can outnumber
+    everything else, and the summary's `goal_vote` gives the vote. The goal's decision reaches the timeline as
+    `goal.completed` (its data holding `goal.decision`) and the user's `u_goal_decided` notification. `eventtext`
+    words the six types as §22.2 says; the thread notifications to the user (`f_*`, `u_goal_decided`,
+    `u_thread_quiet`) are notifications addressed to the user, worded by their journaled text (`_ev_notification`),
+    with no hub path to drop. Post and comment texts are what the agents wrote, quoted as written (§21.1).
+  - **Requests (§21.5).** No new kind: `autoreply.REQUEST_KINDS` and `BLOCKING_KINDS` stay. In a thread session:
+    - `question`: a question pause (§3.1) as now, and, while the snapshot's `clarify_wait` is `{"name", "post_id": 2}`
+      (§22.4), the clarify asker's last message to the user (`pauses_swarm: false`). `autoreply.requests_from`
+      (and so `read_requests`) takes the asker from #2's `data` instead of a clarify card in a thread database
+      (`db.session_mode(conn) == "thread"`, §22.1, checked before any query of the forum tables, so a board file is
+      never queried for `posts`; no clarify request while there is no #2), with `planner_question`'s bounds
+      (`plans=autoreply.PLANS_THREAD`) as §22.4 states them for #2;
+    - `message` and `mcp` as now; no `review` (no tasks);
+    - an @mention of the user, a comment on its post or a reply to its comment is a notification in the timeline,
+      never a request: a client answers with `messages` POST or `continue` (a new post by USER).
+  - **Automatic answers (§21.5).** `answers: "auto"` answers messages and question pauses as now. Its lease
+    (`Swarm.hold_auto_reply()`) makes `Swarm.clarifying` false, so #2 is written without the clarify flag and
+    without `post_plan_clarify`, and nobody asks a user who is not there. The hub never votes and never completes
+    the goal: counted voters are the swarm's own AI agents only.
+  - **A stalled vote.** A veto with one holdout, or a team that never votes, leaves the session `running`, as a
+    stalled board session stays. `u_thread_quiet` {vote, elapsed} (§22.7: from the second `n_thread_quiet` under
+    the goal on, at most once per key, from the first in wrap-up) is the client's signal, a notification to the user
+    in the timeline.
+    It ends by the budget (`stop_when_done` reason `budget`), by `stop`, or by the client's `complete_goal: true`;
+    a client may also write to the team (`continue`, `messages`). No `goal` request kind is added.
+  - **Docs.** docs/en|ru/http-api.md: the create's `mode` and `goal_rule`, the options keys, the PATCH fields, the
+    summary's and the result's new fields, the thread events of the timeline, the stalled vote; docs/TUI.md §2: what
+    `-p -r` does in a thread session, and the `json` result's `mode`, `posts` and `decision` (also the last line of
+    `stream-json`; a board run's `"posts": []` and `"decision": null`).
+  - **Tests** (tests/test_api_v1*.py): create with `mode: "thread"` and a `goal_rule` (session.json holds both; the
+    database has the forum tables before the first start); 400 for another mode or rule and for `goal_rule` with an
+    effective board mode; the options keys; a thread summary (`mode`, `goal_vote`, `posts`, `tasks` {}) and a board one
+    (`goal_vote` null, `posts` 0); a thread result (`posts`, `decision`, `tasks` []) of a running and of a stopped
+    session; the timeline with `post.created`, `post.comment`, `post.updated` and `files.committed`, and without
+    `post.vote`; PATCH `goal_rule` live (the vote re-evaluated, a completion with actor None, `stop_when_done` stopping
+    it) and on a stopped session (overrides only); PATCH `complete_goal` (done, `u_goal_done` not sent, `decision.rule`
+    `user`; 409 with no goal, after done and on a stopped session; 400 in a board session and for `goal_summary` alone);
+    `continue` in a thread session (a post by USER that wakes every member; a first line of 300 characters and a
+    second line give a post whose title has at most 200 characters and whose text is the whole instruction; no goal;
+    a done goal reopened with the votes
+    on #1 cleared, an over-long reopen comment cut to 20 000 on #1; a pending question answered; a text past 20 000
+    characters 409); `answers: "auto"` with `[swarm] clarify` on: #2 without the clarify line; a clarify asker's
+    `question` request.
+- **Export and import (§20).**
+  - The forum tables (§22.1: `posts`, `post_comments`, `votes`, `subscriptions`, `read_marks` (§22.11) and their
+    indexes) are ordinary
+    tables inside `swarm.db` and travel with it, nothing left out. `FORUM_SCHEMA` is part of `known_columns()` and
+    `known_objects()`, so this version takes exports of both modes, and the manifest's `schema.db_columns` lists the
+    forum columns too.
+  - Manifest (§20.2): `schema.toolset_revision` is `frozen.NEWEST_REVISION`, and `schema.toolset_revisions` (NEW) is
+    `{"board": 5, "thread": 6}` (`TOOLSET_REVISIONS`). Each session entry gains `swarm_mode` ("board" | "thread",
+    `db.session_mode` of the copied database); `modes` stays the permission bits. `render_export_report` and
+    `render_import_plan` show a thread session's mode.
+  - `_check_export_db` (§20.4) refuses a database whose `db.max_tools_revision` is above `NEWEST_REVISION` (`its
+    agents use the tool set N, which this DreamTeam does not know (it knows up to 6): update DreamTeam here`) or one
+    with a `tools:*` record whose `mode` is not in `frozen.MODES` (`its agents use a tool set of a mode this DreamTeam
+    does not know: update DreamTeam here`).
+  - A session's effective mode is its database's (`db.session_mode`: kv `swarm_mode`, missing = board), the
+    authority of §22.1, never the global default. In `_plan_session`, a target with the same uid whose effective mode
+    differs from the export's is refused, before the unchanged / settings-only / rewrite decision: `its mode differs
+    here (board/thread): the mode is chosen when a session is created; delete one copy or import it as a new
+    session`. So neither `import_settings` nor a rewrite changes a session's mode. A session without a target is added
+    with its mode.
+  - `swarm.mode` is not in `LOCAL_KEYS`: it travels in the session's overrides. `_session_overrides` keeps it as
+    exported and adds none to a board session that has none, so an older archive's sessions stay board sessions in a
+    home whose
+    default is thread (`_merged` strips the global `mode`, §22.8). When the exported overrides disagree with the
+    exported database (a hand edit: "thread" on a board database, none or "board" on a thread one), `_plan_session`,
+    which reads `db.session_mode` of that database, sets `swarm.mode` to the database's mode ("thread", or no key for a
+    board database) after `_session_overrides` and before `SessionManager.import_overrides` (which sees only the
+    overrides and the model names), with a warning (`its settings named another mode than its database; the database's
+    ({mode}) is kept`), so the plan compares and the import writes the corrected value. `swarm.goal_rule` and
+    `agents.digest_seconds` are ordinary settings that a settings-only rewrite may change.
+  - What 0.4.x does: an export of a thread session is refused by `db.unknown_columns` (`it was made by a newer DreamTeam
+    (its database has posts.…): update DreamTeam here`), so it is never imported as a board session with `swarm.mode`
+    dropped; an export of a board session made by this version imports there (its file has no forum tables, its records
+    are revision 5, its overrides have no `swarm.mode`); a home downgraded to 0.4.x lists each thread session with
+    invalid settings (`Unknown keys for [swarm]: mode`) and starts none of them, while its board sessions work.
+  - Tests (tests/test_transfer*.py): a thread session exported and imported (posts, comments, votes, subscriptions
+    and read marks intact, the session still thread); a 0.4.1 archive imported into a home whose default is thread
+    (every session board); a same-uid target of the other mode refused; a manifest with `swarm_mode` and
+    `toolset_revisions`; a record of an unknown mode refused; a board session created by this version has no
+    `swarm.mode` in session.json, and its export imports into 0.4.1.
+- **Traces (§16).** `tracing.TASK_ARG_KEYS` is unchanged; a thread session's `agent_traces` has no `task` property
+  (§22.5), and the trace REST (§16.3) answers a `task` filter of a thread session with 400 `a thread session has no
+  tasks`. v1 has no trace route.
+
+### 22.10 Not in v1
+Pinning by members; deleting posts; editing comments; subscription kinds beyond the four; switching
+the mode of an existing session (on any surface, an import included); forum trigger functions (waking on likes or
+posts); the user changing members' subscriptions, and subscriptions of the user; a `goal` request kind, and the
+hub completing a stalled vote; a list of the goal's artifacts (the shared workspace and v1's `changed_files` are
+it); a `posts` filter in traces; v1 routes to read a post's comments, to comment and to vote (a client follows the
+`post.*` events, posts through `continue` and writes to members through `messages`); per-session tool lists in the
+launcher MCP (it lists both modes' tools, marked); read marks for messages, votes or subscriptions (what is not in
+the file rule of both modes: §7.3 "Not in this version").
+
+### 22.11 Read before write
+The owner's decision of 2026-11-27, after a thread session in which three agents wrote "I take it" under one post
+within 84 s (c9, c10, c11), none having seen the earlier ones (comments reach their subscribers as digests), and one
+agent then overwrote a file another had written a minute before without ever reading it: **a member writes to an
+object only while it has read the object's current state.** What it read is recorded as a **read mark**; a write to
+an object that changed since, or that the member never read, is refused, and the refusal itself shows what is new and
+counts as reading it, so a retry passes if the member still wants it. The objects are a post (its text and its
+comments), the feed (its posts) and a workspace file. The file rule holds in both modes and is §7.3 (the owner
+extended it to board sessions the same day); this section is the forum's part, thread sessions only, and names the
+file rule where the two meet (the prompt's rule 3, `INSTRUCTIONS_THREAD`, the `wait` after a refusal).
+- **Who.** Every active member, an AI agent or one that joined through MCP (a call with `as_agent`), is checked and
+  has marks. USER is never checked and has none: `/api/act`, the TUI, `-p`, v1 `continue` (`instruct`'s "post"), MCP
+  calls without `as_agent` (`hub_mcp.resolve_actor` gives USER) and `Forum.reopen`'s comment write as USER; nor are
+  the swarm's own writes (actor None: `ensure_system_posts`, `rewrite_goal_rule`). The file rule checks the same
+  members (§7.3 "Who").
+- **Others.** A member never needs to read what it wrote itself, nor what was written or read in a call whose
+  `mailbox.seen_as` included it: an MCP client that acts as several members, or sends as USER (no `as_agent`) and
+  listens as its member, saw it (the rule of §22.3 fan-out step 1, which gives those members no item for it either).
+  This is applied when marks move, never at a check: every mark a call moves (its write, its read, its refusal, a
+  render; below) moves, in the same transaction, for the call's actor when it is a member and for every member in
+  `seen_as(actor)` during that call, USER's calls included. So the checks compare only M's marks with the current
+  state, and the client's membership at check time (`HubClients` may change it) never matters: an author is one of
+  the **others** of member M when it is not M, and USER and retired members are others for everyone. File marks
+  move for the same members (§7.3 "Who"), and files have no others: a change is found by content, whoever made it.
+- **Not checked**: `vote`, `subscribe`, `unsubscribe`, messages, `lock_file`, `shell` and jobs.
+
+**Data**
+- `read_marks` is part of `db.FORUM_SCHEMA` (§22.1), so only thread databases have it; it holds the marks of posts
+  and comments only (file marks are kv rows in both modes, §7.3 "Marks"):
+  ```sql
+  CREATE TABLE IF NOT EXISTS read_marks (
+      member TEXT NOT NULL, target TEXT NOT NULL, version TEXT, ts REAL, PRIMARY KEY (member, target));
+  ```
+  - `target` `p<id>`: a post; `version` the post's version the member read, NULL when it knows the post only by its
+    id, title and author (a `feed` line, an `f_edit`, an `f_post` whose text was cut).
+  - `target` `c<id>`: a comment the member has read; `version` NULL (comments are never edited, §22.2).
+  - `ts`: when the row last moved. `member` a canonical member name, never USER.
+- `forum.post_version(post) -> str`: the first 16 hex digits of sha256 over the UTF-8 of the title, "\0" and the
+  text. What changes a post's title or text changes it: `update` (also the user's edit of a member's post), the new
+  goal's rewrite of #1 and #2 (`ensure_system_posts`) and `rewrite_goal_rule`; votes, `reset_goal_votes`,
+  `set_plan_asker` and `#2`'s `data` do not. A content version, not `edited_at`: no float is compared, no `posts`
+  column is added, and an edit that restores the text a member read leaves its mark valid.
+- Moves are upserts on the primary key: a version with `ON CONFLICT (member, target) DO UPDATE SET version =
+  excluded.version, ts = excluded.ts`; a post known by its title (`version` NULL) and a comment with `ON CONFLICT DO
+  NOTHING`, so a title never erases a version.
+- A table, not columns: a new column of `posts` or `post_comments` would never reach the thread databases that exist
+  (`CREATE TABLE IF NOT EXISTS` changes nothing, and `ADDED_COLUMNS` runs on board databases too, §22.1). In
+  `FORUM_SCHEMA`, `ensure_forum()` creates it at the next open of every thread database, those made before it
+  included; their members start with no marks, which costs each of them at most one refusal per object, the safe
+  direction. No `ADDED_COLUMNS` entry, no `FORMAT_VERSION` bump.
+- Marks are per post and per comment, with no feed watermark and no "read up to cN" scalar: a notification shows
+  single comments, a `feed` listing single posts in `active_at` order, a refusal a part of a thread, so what a member
+  has seen has gaps. A long session holds about members × comments rows, each read through the primary key.
+
+**What moves a mark.** Always to what was shown, never to "the current state at the time of the move". Each move
+below is applied for the members of "Others" (the actor when a member, and `seen_as(actor)`).
+- `post_read`: `p<id>` to the post's version when the result shows its text, and `c<id>` for every comment the
+  result shows. The text is shown unless the page has `since_id` and the caller's `p<id>` mark is already at the
+  current version (then only its head, "Tool results"); a text cut to the budget counts as read anyway, since no tool
+  shows more of a post, and so does a comment cut because it alone exceeds what is left. Comments past the budget
+  or the 200 cap are neither shown nor marked; the comments shown are an id-ordered prefix of at least one comment,
+  so its continuation `… and N more: post_read post_id=9 since_id=c<last shown>.` always names a real comment and
+  every page moves on. `since_id` needs no rule of its own: the comments it skips keep their own marks.
+- `feed`: `p<id>` by title for every post line its result shows, the system posts included; the posts the budget or
+  `limit` left out move nothing ("Tool results").
+- A notification the member is shown. Its data's `_read` (`swarm.READ_KEY`, data only, like `f_file`'s `paths`) is a
+  dict target → version (or null), written at insert from what its text carries whole; `Forum._send_item` writes it:
+  - `f_post`: `p<id>` at the post's version when its `{text}` was not cut (`_clip` left it whole at the item's limit:
+    1500 waking, 200 digest), else by title;
+  - `f_comment`, `f_reply`: `c<id>` when the comment's text was not cut, and `p<id>` by title in either case;
+  - `f_mention`: in a comment as `f_comment`; in the post (its creation or an edit) as `f_post`, at the version after
+    the edit;
+  - `f_edit` and `f_vote`: `p<id>` by title (they carry no text, so an edit never moves a version through them);
+  - `f_file`: nothing (paths only, §22.3).
+  The kickoff notices `n_kickoff_thread`, `n_kickoff_thread_clarify` and `n_goal_updated_thread` carry `p1` and `p2`
+  at the versions written for their goal: they carry that goal whole, and the rest of both texts is the swarm's fixed
+  wording, which the prompt describes. `n_goal_reopened_thread` carries `c<id>` of the comment `Forum.reopen` posted
+  on #1 (`reopen` returns its id, None when it posted none; the notice's `{comment}` is that text whole). The
+  progress lines of `wait_for_events` (a comment's first 80 characters) and every other notice carry nothing.
+- Shown means rendered: `Swarm.render_wake` (a wake-up, an incoming render, a `wait_for_events` result) calls
+  `forum.note_shown(name, rows)` with the rows it prints, every non-digest row and the first `DIGEST_SHOWN` (30) digest
+  rows, in one transaction; a digest row marked delivered but left out (`digest_more`) moves nothing, and a render
+  for USER moves only the marks of its `seen_as` members (USER has none). A version in `_read` is applied only
+  while it is still the post's version, else that target is applied by title: a digest row the scheduler releases
+  late (it keeps its 200 characters) or a staggered kickoff written before a newer goal never moves a mark past
+  what it showed.
+- The writes, inside their transaction: `post_create` → `p<new id>` at its version; `post_update` → `p<id>` at the
+  new version; `comment` → `c<new id>`. For the author the `p` moves keep its own post and edit from blocking it,
+  and `c<new id>` is redundant (own comments never block); for the members in `seen_as` of the call they are the
+  marks that fan-out step 1 gives no item for (USER's writes through such a client included).
+- A refusal of this section moves the member's marks to everything it shows (below), in its check's transaction,
+  committed before the ToolError is raised: a ToolError inside `with db.transaction()` rolls back (§22.1), so the
+  method leaves the block first and raises after it.
+- Marks are never reset: not at compaction (§22.6; the summary keeps what the member decided, and every change after a
+  mark still blocks), not when an external member reconnects with a fresh context, not at a welcome back
+  (`join_swarm(name=)` is the same member), and not by a new goal, whose rewrite of #1 and #2 makes their versions
+  stale by content (`n_goal_updated_thread` says to re-read them). `Swarm.retire` deletes the member's rows with
+  `forum.drop_reads(name)` next to `forum.drop_subscriptions` (§3 `retire`, §22.3 "Retire"; its file marks:
+  `workspace.drop_file_reads`, §7.3); names are never reused (§3), so this only keeps the table small.
+
+**The checks** (`Forum`, the actor a member). The unread news of member M on post P:
+- `post`: M has no `p<P>` row, its `version` is NULL, or it differs from `post_version(P)`;
+- `comments`: the comments of P by others without a `c<id>` row of M, ascending ids.
+Three writes are checked:
+- **`comment` without `reply_to`**: refused while `post` or `comments` holds anything.
+- **`comment` with `reply_to` cN**: refused while the thread of cN, cN itself and every reply under it at any depth
+  (`reply_to` chains within P), has a comment by others that M has not read, or while M has read an earlier version
+  of P (a row whose `version` is set and differs). New top-level comments and replies elsewhere in P do not block it,
+  and a post M never read does not either. The edit blocks because an author edits a post to restate what its whole
+  thread is about (the plan, the claim, the fix), which may settle the comment being answered, and edits are rare;
+  the unread post does not, because the member answers cN, which it must have read, often from the mention or reply
+  that carried cN whole.
+- **`post_update`**, after its present checks (a system post, the author, `Pass title or text.`, the values; an
+  update that changes nothing is `#9 is unchanged.` and checks nothing): refused like a top-level `comment`, so an
+  author never rewrites a plan without seeing the objections under it; `post` holds when the user edited the post.
+- **`post_create`**: refused while the feed has posts of kind `post` by others (the user's included; never #1 or
+  #2, which have no author) of which M has no `p` row; a row by title is enough.
+- **Atomicity.** Each check runs in the transaction of its write (`with self.db.transaction() as db:` holds
+  `Database._lock` and `BEGIN IMMEDIATE`, §22.1), right before its insert or update, so of two top-level comments on
+  one post made at once (or two replies in one thread) the later one always sees the earlier one as unread news. A
+  claim made as a reply, or on another post, is not compared with it (the reply rule above; the checks are per
+  post): that is why rule 3 ("Texts") names one form and one place for a claim. The `Forum` methods also run on the
+  event loop's thread with no await between check and write; the transaction is the stated guarantee. The checks
+  that need no news (an empty or too long text, a bad `reply_to`, `No post #9`) come first, as now.
+- A refused write writes nothing but the marks: no comment, no `active_at`, no event, no fan-out, no mention. So the
+  quiet clock (§22.7) does not move, and a refused comment on #2 is no plan (`PLANS_THREAD`, §22.4): `asks_user`
+  holds until a comment of the clarify asker passes.
+- **The incident, replayed**: Anna Smith's c9 "I take it" passes; Boris Lee and Carla Diaz send their own within 84 s
+  with c9 still in their digests, and both are refused with c9 shown and marked read; each decides again with c9 in
+  front of it, and only a retry that still makes sense is sent. Had Anna and Boris sent at the same instant, the
+  later transaction would have found the earlier comment unread and refused it.
+
+**The refusals** (`ReadRefusal`, a ToolError: §7.3 "A `wait` after a refusal"). The first lines are in the member's
+language (`swarm.language_of`), from the dict `forum.UNREAD_TEXTS` {"en", "ru"} as `_FEED_STAYS` (§22.3), en for an
+unknown language; what follows them is English data in `post_read`'s format (§22.5). `{news}` joins with `; ` the
+parts that apply: `you have not read the post itself` / `ты не читал(а) само объявление` (no version), `the post was
+edited` / `объявление изменено` (another version), `unread comments by others: {n}` / `непрочитанные комментарии
+других: {n}`, and for a reply `unread comments in the thread of c{id}: {n}` / `непрочитанные комментарии в ветке
+c{id}: {n}`.
+- `comment`, key `comment_unread`: en ``Not sent: #{post} "{title}" has what you have not read ({news}). You may write
+  to a post only after reading what is new in it: it is below and now counts as read. If your comment is still
+  needed, send it again (another member may already have said it or taken it on); if it claims work, start that
+  work only once it went through.`` / ru ``Не отправлено: в #{post} «{title}» есть то, чего ты не читал(а) ({news}).
+  Писать в объявление можно, только прочитав новое в нем: оно ниже и теперь считается прочитанным. Если твой
+  комментарий еще нужен, отправь его снова (возможно, другой участник уже сказал это или взялся за это); если он
+  заявляет работу, начинай ее, только когда он прошел.``
+- `post_update`, key `update_unread`: en ``Not changed: #{post} "{title}" has what you have not read ({news}). You
+  may change your post only after reading what is new in it, objections included: it is below and now counts as
+  read. If your edit is still right, send it again.`` / ru ``Не изменено: в #{post} «{title}» есть то, чего ты не
+  читал(а) ({news}). Менять свое объявление можно, только прочитав новое в нем, возражения тоже: оно ниже и теперь
+  считается прочитанным. Если правка еще верна, отправь ее снова.``
+- `post_create`, key `create_unread`: en ``Not posted: the feed has posts by others that you have not seen ({n}). You
+  may post only after seeing what is new in the feed: they are listed below and now count as seen. If one of them is
+  about your topic, comment there instead (`post_read` shows it); otherwise send your post again.`` / ru ``Не
+  опубликовано: в ленте есть объявления других, которых ты не видел(а) ({n}). Публиковать можно, только увидев новое
+  в ленте: они перечислены ниже и теперь считаются просмотренными. Если одно из них о твоей теме, напиши комментарий
+  там (его покажет `post_read`); иначе отправь объявление снова.``
+- What follows the first lines, in this order:
+  - with `post` news: `post_read`'s head line and the whole text (`#9 "Parser plan" by Anna Smith, 10:50 (edited
+    11:02); likes 2, dislikes 0`, then the text; for #1 its goal vote part too);
+  - with comment news: `Unread comments (3):`, then the comments the check found (for a reply, those in the thread of
+    cN) in `_comment_lines`' format, ascending ids (a reply whose comment is not shown stays at the top level with `,
+    reply to c30`; own and read comments are not shown);
+  - for `post_create`: `Posts you have not seen (5), newest first:`, then one line each, `#12 "Parser benchmark" —
+    Anna Smith, 10:55` (`item_time`).
+- **Size.** Every LLM tool result is cut to `[agents] tool_output_chars` by `truncate_middle` (agent.py `_run_tools`),
+  which would drop a refusal's middle unseen, so the whole refusal, `Error: ` included, stays within `max(200,
+  tool_output_chars)` (read at each use) less `workspace.REFUSAL_RESERVE` = 300 characters for the prefix and any note
+  `call_tool` adds. The same budget holds for every caller (an external member's results are not cut, but one rule
+  keeps the texts alike). The first lines always come whole; then the post block (a text that alone exceeds what is
+  left is cut with `[text cut at N of M characters]` and still counts as read, as in `post_read`); then the comments
+  as an id-ordered prefix that fits, or the posts newest first. The items always get at least 200 characters (so at
+  the smallest settings the runtime may still cut a refusal), and at least one item is always shown, cut when it
+  alone exceeds them, so every refusal moves a mark and retries end.
+- Only what a refusal shows is marked, with one exception: a `post_create` refusal counts as reading the whole feed,
+  so the posts past its list are marked by title too and named by their count: ``… and N older posts you have not
+  seen: `feed` lists them.`` (the concurrent posts the rule is for are the newest; a member hired late must not page a
+  long feed through refusals). Unread comments past the list stay unread: ``… and N more unread comments: `post_read`
+  post_id=9 since_id=c<last shown>, or send again to see them.``, and the retry is refused with the next ones.
+- **A `wait` after a refusal** is §7.3's rule, the same in both modes: every refusal of this section is a
+  `ReadRefusal`, so a `wait` later in the same response is not run (its result is `wait_refused`, a shared
+  `prompts.TEXTS` key) and the member decides again in its next step; `[comment, wait]` is the usual shape here, as
+  `[edit_file, wait]` is for files. A `vote` like on `#1` later in that response is held too (`vote_refused`, a
+  `THREAD_KEYS` text, §7.3), so no goal is decided by it without the refused change.
+
+**Files** are §7.3, the same in both modes: the marks (kv `file_read:` rows, not `read_marks`), the checks, the
+refusals (`workspace.UNREAD_FILE_TEXTS`), the limit and the tests. A thread session adds only where the forum meets
+them: rule 3's file sentence and `INSTRUCTIONS_THREAD`'s bullet (below), and `f_file` items and `files.committed`,
+which move no file mark.
+
+**Texts**
+- `SYSTEM_THREAD_EN` / `SYSTEM_THREAD_RU`, "## How you work" (§22.6). Rule 2's last sentence ("Work that needs no
+  agreement ... can start at once: say in #2 what you do, so nobody does it twice.") becomes, so that it no longer
+  says to start first and claim afterwards:
+  ```text
+     ... Work that needs no agreement (research, environment checks, prototypes) needs no plan: claim it as rule 3
+     says, so nobody does it twice.
+  ```
+  ru: «Работе, которой не нужна договоренность (исследования, проверки окружения, прототипы), не нужен план: заяви
+  о ней, как сказано в правиле 3, чтобы никто не делал это дважды.» Rule 3 becomes, the rest of the rule as it is:
+  ```text
+  3. Doing: before you start something, check the feed and #2 for a member already on it, then claim it in a
+     top-level comment (no reply_to) on the one post the work belongs to (#2 for a part of the plan, or for work no
+     other post concerns). Send the claim alone in its response and start only once that comment went through. You
+     write only to what you have read: a comment, a post or an edit of your post is refused while there is news you
+     have not read (comments, an edit, new posts in the feed), and `write_file` or `edit_file` of an existing file is
+     refused if it changed since you last read or wrote it, or you never read it (`write_file` of a long file needs
+     every line read: else use `edit_file`); the refusal shows what is new and then counts as read (a long file it
+     cannot show: read that with `read_file`), so decide again whether your write is still needed. Take small steps
+     and verify the result (...as now)
+  ```
+  ru: «3. Работа: прежде чем что-то начать, проверь ленту и #2: возможно, этим уже занимается другой участник; затем
+  заяви об этом комментарием верхнего уровня (без reply_to) в том объявлении, к которому относится работа (в #2 для
+  части плана или для работы, которая не относится к другому объявлению). Отправь заявку отдельным ответом и
+  начинай, только когда комментарий прошел. Писать можно только в то, что ты прочитал(а): комментарий, объявление
+  или правка твоего объявления не пройдут, пока есть новое, чего ты не читал(а) (комментарии, правка, новые
+  объявления в ленте), а `write_file` или `edit_file` существующего файла не пройдет, если он изменился с тех пор,
+  как ты его читал(а) или писал(а), или ты его не читал(а) (для `write_file` длинного файла нужно прочитать все его
+  строки, иначе используй `edit_file`); отказ покажет новое, и после него оно считается прочитанным (длинный файл,
+  который отказ показать не может, прочитай через `read_file`), так что реши заново, нужна ли еще твоя запись. Делай
+  небольшие шаги…» (the rest as now).
+  Why one form and one place: a reply is checked only against its own thread and a comment only against its own
+  post (§22.11 "The checks"), so a claim sent as a reply, or on another post than a parallel claim, would pass
+  unseen; and the calls of one response all run (§6.2), so work sent with its claim would start even when the claim
+  is refused. Pinned substrings (§22.6): en `start only once that comment went through` / ru «начинай, только когда
+  комментарий прошел»; en `top-level comment (no reply_to)` / ru «комментарием верхнего уровня (без reply_to)»; en
+  `Send the claim alone in its response` / ru «Отправь заявку отдельным ответом»; rule 2's en `claim it as rule 3
+  says` / ru «заяви о ней, как сказано в правиле 3». Rule 3's file part carries the two pinned substrings of §7.3
+  "Texts", shared with the board's rule 4.
+- Members created before this change keep their frozen prompt (§22.6), so every refusal states the rule itself.
+- `hub_mcp.INSTRUCTIONS_THREAD` gains one bullet (§22.9): "read before you write: as a member (`as_agent`),
+  `comment`, `post_update` and `post_create` are refused while the post or the feed has news you have not read, and
+  `write_file` / `edit_file` of an existing file while it changed since you last read or wrote it, or you never read
+  it (`write_file` of a long file needs every line read: else use `edit_file`); the refusal shows what is new and
+  counts as reading it (a long file it cannot show: read that with `read_file`), so a retry passes; claim work in a
+  top-level comment (no `reply_to`) on the post it belongs to (#2 for a part of the plan) and start it only once that
+  comment went through. The user (no `as_agent`) is never refused."
+- Notices (§22.6): `n_kickoff_thread`, the first text every member reads, said to start first and claim afterwards
+  (``Start at once on what needs no agreement, and say so in #2 so nobody does it twice.``), the order rule 3
+  forbids; that sentence becomes ``Claim what needs no agreement in a comment on #2 and start it once your comment
+  went through, so nobody does it twice.`` / ru «Заяви в комментарии к #2 о том, что не требует договоренности, и
+  начинай это, когда комментарий прошел, чтобы никто не делал это дважды.» (replacing «Сразу начинай то, что не
+  требует договоренности, и скажи об этом в #2, чтобы никто не делал это дважды.»). Pinned substrings: en `start it
+  once your comment went through` / ru «начинай это, когда комментарий прошел». The other notices keep their texts:
+  `n_hired_thread` already says to read #2 and the feed, `n_goal_updated_thread` to re-read after a new goal.
+- **Tool results** (§22.5). `post_read` fits its result into `max(200, tool_output_chars)` for every caller, as
+  `Workspace.read` does (today a long one loses its middle to the runtime's cut): the head line, the text, #1's vote
+  part, the `Comments` line, then the comments as the id-ordered prefix that fits after the reserve for the
+  continuation line, rendered as the tree of today; the continuation `… and N more: post_read post_id=9
+  since_id=c<last shown>.` follows when the budget or the 200 cap left any out. So that every page moves on:
+  - while there are comments to show, they always get at least `max(200, budget // 3)`, and the text is cut to the
+    rest with `[text cut at N of M characters]` (it counts as read, "What moves a mark"); with none to show, the text
+    is cut only when it alone exceeds the budget;
+  - with `since_id`, when the caller's `p<id>` mark is already at the current version, the text is only its first
+    200 characters and `[text unchanged since you read it: N characters]` (without `since_id` the text is always
+    shown, so a member that lost it, at a compaction say, can read it again);
+  - at least one comment is always shown, cut with `[comment cut at N of M characters]` when it alone exceeds what
+    is left, and it counts as read, like a cut text; so the continuation always names a real comment and a post
+    of any size is paged to its end.
+- `feed` fits the same budget for every caller: the head line, then the post lines in their order (#1's goal vote
+  line with #1) that fit after the reserve for the continuation line, at least one line (cut when it alone exceeds
+  the room), then ``… and N more: `feed` with limit, by, since or query.``, N the posts the budget or `limit` left
+  out. It marks only the lines it shows ("What moves a mark"), so a post the runtime's cut would have dropped is
+  never counted as seen. `read_file`, `write_file` and `edit_file` keep their results.
+- **The frozen tool sets stay as they are.** No description and no schema changes: `tools/snapshots/llm_r5.json` and
+  `llm_thread_r6.json` are untouched, `TOOLSET_REVISIONS` stays `{"board": 5, "thread": 6}`, and
+  tests/test_frozen_tools.py passes unchanged. Behaviour, refusal texts, results and prompts are not part of a
+  revision (§12 R0′). `write_file`'s "Fails if another member locked the file." still holds; it simply is not the only
+  refusal, as the skills mirror's and the hard-link refusals are not either (§7).
+
+**Interactions**
+- **Wrap-up** (§22.4, §22.7): when every member posts its results at once, the `post_create` rule refuses each member
+  that has not seen the posts made just before its own; the refusal lists them and counts as seeing them, so each
+  retries once (a `wait` sent with the post does not end the turn, §7.3 "A `wait` after a refusal"). The rule stays in
+  wrap-up mode: two results posts for one part are what it prevents.
+- **A member hired late** (`n_hired_thread`): its first `post_create` is refused with the feed listed (one retry:
+  the refusal counts as reading the whole feed). Its first comment on a post it has not read is refused with the
+  post and its unread comments shown: one retry when they fit one refusal, otherwise one refusal per budget-sized
+  part until it has read them all (#2 keeps the comments of earlier goals, §22.4); reading them with `post_read`
+  and `since_id` first costs the same characters and marks the same comments.
+- **Clarify** (§22.4): the asker's first comment on #2 passes when nobody else has commented there, since its kickoff
+  notice marked #2's version; otherwise it is refused with those comments, and `asks_user` holds until it passes.
+- **Delivery** (§22.3) is unchanged: marks gate writes and never select or suppress news; a member is still told of
+  every event its subscriptions match, read or not.
+
+**Export and import** (§20, §22.9)
+- `read_marks` and its primary key are in `FORUM_SCHEMA`, so `db.known_columns()` and `db.known_objects()` include
+  them, the manifest's `schema.db_columns` lists them, and the table travels inside a thread session's `swarm.db` with
+  no transfer code (transfer has no per-table handling; member names are not remapped, and none need be). File
+  marks are kv rows and travel in both modes (§7.3 "Export and import").
+- 0.4.x compatibility is unchanged: board databases never get the table (it is not in `SCHEMA`), and their file marks
+  are kv rows that 0.4.x ignores (§7.3 "Why kv"), so a board session exported by this version still imports into
+  0.4.x; a thread session's export is refused there already, by `db.unknown_columns` (§22.1, §22.9).
+
+**Tests** (tests/test_read_marks.py, new, ScriptedLLM, no network; and the files named; the file rule's: §7.3 "Tests")
+- the schema: a thread database has `read_marks` (also an existing thread database at its next open, through
+  `ensure_forum`), a board database does not; tests/test_thread_foundation.py `FORUM_TABLES`,
+  tests/test_transfer_thread.py `FORUM_TABLES` and tests/test_db_schema.py's forum columns gain it; a thread export
+  imports with its marks;
+- `post_version` changes with the title or the text and with a new goal's rewrite of #1 and #2, not with votes,
+  `reset_goal_votes` or `#2`'s `data`;
+- `comment`: refused after a comment by another member that the caller was not shown; the refusal names the news,
+  shows the comment and marks it, and the same call then passes; refused after the author's edit (the new text shown);
+  a comment by USER from the web UI blocks a member, while a member's comment never blocks the member itself; USER
+  is never refused; votes and subscriptions are never refused;
+- `seen_as`: a comment, a post or an edit written by B, or by USER, in a call whose `seen_as` includes M marks it for
+  M at write time and never refuses M (a client that comments and posts as USER and then comments and posts as its
+  member M passes at once); a `post_read` by the client as B marks for M; a mark written so stays when the client's
+  association changes before M's check;
+- `comment` with `reply_to`: blocked by an unread reply anywhere under cN and by an unread cN, not by a new top-level
+  comment or a reply elsewhere (so a claim sent as a reply passes an unread top-level claim: the limit that rule 3's
+  one form answers); blocked by an edit of a post read in an earlier version, not by a post never read;
+- `post_update`: refused after an unread comment on the post and after the user's edit of it; an unchanged update
+  checks nothing;
+- `post_create`: refused while a post by another member or by USER is unseen, never for #1 or #2; a `feed` listing, an
+  `f_post` shown and `post_read` each count; a refusal with more posts than fit lists the newest and marks them all;
+- atomicity: two `comment` calls whose callers have read the same state, run so that the second checks after the
+  first's insert (two tasks, or a patched transaction), give one comment and one refusal; a refused write leaves no
+  row, no event and no notification, and its marks survive the ToolError (committed);
+- a `wait` after a refusal: a ScriptedLLM response `[comment (refused), wait]` keeps the activation running, the
+  `wait` result is `wait_refused` in the member's language, and the next step's retry passes (`[write_file
+  (refused), wait]`, in both modes, and `[write_file (refused), vote like on #1]`: §7.3 "Tests"); a `wait` alone in
+  the next response ends it;
+- delivery: a waking `f_comment` with a text of 1500 characters or less marks its comment once rendered, a longer one
+  does not; a digest item marks only when its text has 200 characters or less and it is among the 30 shown; an
+  `f_edit` never moves a version; a stale version in `_read` is applied by title only; an external member's
+  `wait_for_events` result marks what it shows; USER's renders mark nothing but for its `seen_as` members; the
+  kickoff marks `p1` and `p2`;
+- `post_read` fits `tool_output_chars` (a post with comments longer than the budget gives the id-ordered prefix and
+  the continuation; a text longer than the budget is cut with its note and counts as read), and marks exactly what it
+  shows; a post whose text is about the budget's length, with comments, and a post with a single 15 000-character
+  comment followed by more comments are each paged with `since_id` to the end, every page showing at least one
+  comment; a `since_id` page of a post whose text the caller has read shows only its head; a refusal stays within
+  the budget at the default settings, and still shows (and marks) one item with `tool_output_chars` = 1;
+- `feed` longer than the budget (100 posts with long titles) lists the lines that fit with the continuation count
+  and marks only the posts shown; a later `post_create` is refused for a post that was left out;
+- files: §7.3 "Tests", whose cases also run in a thread session; a thread database has no file marks in
+  `read_marks`;
+- retire drops the member's rows; a welcome back and a compaction keep them;
+- texts (tests/test_prompts.py): `UNREAD_TEXTS` has the same keys, placeholders and backticked identifiers in en and
+  ru, names only real tools of revision 6, and no ru text contains the dotted letter (U+0451) (`UNREAD_FILE_TEXTS`
+  and `wait_refused`: §7.3); the pinned substrings of rules 2 and 3 are in both thread prompts and those of
+  `n_kickoff_thread` in both its texts, and neither keeps the old "start at once" sentence; `INSTRUCTIONS_THREAD`
+  names the top-level form of a claim; the frozen-tool tests pass with the snapshots unchanged.

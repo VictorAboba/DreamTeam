@@ -318,12 +318,17 @@ def similarity(title: str, goal: str, other_title: str, other_goal: str) -> floa
     return score
 
 
-def similar_tasks(title: str, goal: str, candidates: Iterable[Task], limit: int = SIMILAR_MAX) -> list[Task]:
-    """The candidates that look like a task with this title and goal (similarity >= SIMILAR_SCORE), best first
-    (then the older one), at most `limit`."""
+def similar_items(title: str, goal: str, candidates: Iterable[Any], limit: int = SIMILAR_MAX) -> list[Any]:
+    """The candidates (anything with .id, .title and .goal: tasks, the forum's posts) that look like an item with
+    this title and goal (similarity >= SIMILAR_SCORE), best first (then the lower id), at most `limit`."""
     scored = [(similarity(title, goal, t.title, t.goal), t) for t in candidates]
     hits = sorted(((s, t) for s, t in scored if s >= SIMILAR_SCORE), key=lambda st: (-st[0], st[1].id))
     return [t for _, t in hits[:limit]]
+
+
+def similar_tasks(title: str, goal: str, candidates: Iterable[Task], limit: int = SIMILAR_MAX) -> list[Task]:
+    """The candidates that look like a task with this title and goal (similar_items)."""
+    return similar_items(title, goal, candidates, limit)
 
 
 def _post_dict(row: Any) -> dict[str, Any]:

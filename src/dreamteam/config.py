@@ -173,6 +173,12 @@ class SwarmSettings:
     # true: a new planning task first asks the user about the goal's forks (prompts.PLANNING_CLARIFY), and a member's
     # send_message with pause_swarm pauses the swarm until the user answers (docs/SPEC.md §3 "Clarify mode")
     clarify: bool = False
+    # the work mode of the sessions created from now on: "board" | "thread" (docs/SPEC.md §22); an existing session's
+    # mode is its database's (kv swarm_mode), which Swarm puts here at open
+    mode: str = "board"
+    # how the vote on #1 decides the goal of a thread session: "democracy" | "veto" (docs/SPEC.md §22.4); the default
+    # of new thread sessions, frozen into each at create; board sessions ignore it
+    goal_rule: str = "democracy"
 
 
 @dataclass
@@ -218,6 +224,8 @@ class AgentSettings:
     # a member's repeating trigger wakes it at most once this many seconds; the fires in between come in one notice
     # (0: at every fire)
     trigger_wake_seconds: float = 180.0
+    # thread sessions: an idle AI agent's undelivered digest items wake it once they are this old (docs/SPEC.md §22.3)
+    digest_seconds: float = 60.0
 
 
 @dataclass
@@ -335,13 +343,15 @@ _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSetti
                "ShellSettings": "shell", "WorkspaceSettings": "workspace", "MCPSettings": "mcp",
                "TracingSettings": "tracing", "SkillsSettings": "skills", "ModelProfile": "models",
                "RoleSettings": "roles", "TeamSettings": "teams", "ApiSettings": "api"}
-# numbers are >= 0; these must be >= 1 (counts and sizes where 0 breaks the swarm; [skills] max_proposals = 0
-# turns proposals off; [api] max_running = 0 is no limit)
-_MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
-                      "max_parallel_llm_calls", "max_tokens", "max_tokens_ceiling", "timeout", "max_timeout",
-                      "foreground_max", "job_log_mb", "max_files", "max_attached", "max_mb", "max_archive_mb",
-                      "install_timeout", "lock_ttl_minutes", "copy_max_mb", "copy_max_files", "uploads_pending",
-                      "archive_max_mb"})
+# numbers are >= 0; these have a higher lower bound: >= 1 for counts and sizes where 0 breaks the swarm ([skills]
+# max_proposals = 0 turns proposals off; [api] max_running = 0 is no limit), >= 10 for [agents] digest_seconds
+_MIN: dict[str, int] = {**dict.fromkeys(("max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
+                                         "max_parallel_llm_calls", "max_tokens", "max_tokens_ceiling", "timeout",
+                                         "max_timeout", "foreground_max", "job_log_mb", "max_files", "max_attached",
+                                         "max_mb", "max_archive_mb", "install_timeout", "lock_ttl_minutes",
+                                         "copy_max_mb", "copy_max_files", "uploads_pending", "archive_max_mb"), 1),
+                        "digest_seconds": 10}
+_MIN_ONE = frozenset(key for key, low in _MIN.items() if low == 1)   # the keys whose bound is 1 (the UI tests)
 _MAX = {"port": 65535, "budget_notice_at": 1}
 INT64_LIMIT = 2 ** 63   # a whole-number setting is a 64-bit integer (SQLite's); v1's PATCH bounds max_agents so too
 
@@ -380,7 +390,7 @@ def _checked(where: str, key: str, annotation: str, value: Any) -> Any:
                 value = int(value)
             if not -INT64_LIMIT <= value < INT64_LIMIT:
                 raise _bad(where, key, "a 64-bit integer", value)
-        low, high = (1 if key in _MIN_ONE else 0), _MAX.get(key)
+        low, high = _MIN.get(key, 0), _MAX.get(key)
         if value < low or (high is not None and value > high):
             raise _bad(where, key, f">= {low}" if high is None else f"between {low} and {high}", value)
         return value
@@ -715,6 +725,10 @@ class Config:
             raise ValueError("swarm.language must be 'ru' or 'en'")
         if cfg.swarm.network not in ("on", "off"):
             raise ValueError(f"swarm.network must be 'on' or 'off', got {cfg.swarm.network[:20]!r}")
+        if cfg.swarm.mode not in ("board", "thread"):
+            raise ValueError(f"swarm.mode must be 'board' or 'thread', got {cfg.swarm.mode[:20]!r}")
+        if cfg.swarm.goal_rule not in ("democracy", "veto"):
+            raise ValueError(f"swarm.goal_rule must be 'democracy' or 'veto', got {cfg.swarm.goal_rule[:20]!r}")
         return cfg
 
 
@@ -790,7 +804,9 @@ starting_roles = []           # стартовая команда по поря�
 independent_review = true     # задачу агента принимает другой агент (или вы, если больше некому); false — без ревьюера задача сразу готова
 crew_review = true            # завершённую групповую задачу проверяет целиком, по возможности, агент вне её направлений; false — без второго ревью (направления уже проверены): готова, как только владелец её завершит, даже с назначенным ревьюером
 network = "on"                # "off" — у команд агентов, их фоновых процессов и MCP-серверов нет интернета (LLM работает); строго только в Docker и Linux
-clarify = false               # true — сначала уточнить цель: планировщик задаёт вам вопросы до плана, остальные ждут; важный вопрос агента ставит рой на паузу до ответа
+clarify = false               # true — сначала уточнить цель (на доске планировщик задает вам вопросы до плана, остальные ждут; в треде — вопросы вам в обсуждении #2); важный вопрос агента ставит рой на паузу до ответа
+mode = "board"                # board — доска задач; thread — лента обсуждений (выбирается при создании сессии)
+goal_rule = "democracy"       # в режиме треда: democracy — цель достигнута, когда «за» больше половины ИИ-агентов; veto — все «за», никого «против»
 
 [agents]
 default_model = "default"
@@ -802,6 +818,7 @@ planning_hint_minutes = 10    # то же через столько минут �
 file_settle_seconds = 60      # триггер file_changed срабатывает, когда файл столько секунд не меняется или менявшие его агенты закончили ход (0 — при каждом изменении)
 file_max_wait_seconds = 300   # но не позже, чем через столько секунд после первого изменения (0 — без предела)
 trigger_wake_seconds = 180    # повторяющийся триггер участника будит его не чаще раза в столько секунд; срабатывания между пробуждениями приходят одним уведомлением (0 — будить при каждом)
+digest_seconds = 60           # в режиме треда: подписка «дайджестом» будит не чаще раза в столько секунд (не меньше 10)
 
 [server]
 host = "127.0.0.1"

@@ -694,6 +694,15 @@ def cmd_run(args) -> int:
         config = dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, network=args.network))
     if args.clarify is not None:  # the same for [swarm] clarify (--clarify / --no-clarify)
         config = dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, clarify=args.clarify))
+    if args.goal_rule:  # the same for [swarm] goal_rule (the vote is re-evaluated at the start, docs/SPEC.md §22.4)
+        config = dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, goal_rule=args.goal_rule))
+    if args.mode:  # the mode of a swarm.db made by this run; an existing one keeps its own (docs/SPEC.md §22.8)
+        stored = _project_mode(config.data_dir / "swarm.db")
+        if stored is not None and stored != args.mode:
+            print(f"this project's swarm.db is a {stored} swarm: the mode is chosen when it is created",
+                  file=sys.stderr)
+            return 2
+        config = dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, mode=args.mode))
     host = args.host or config.server.host
     port = args.port or config.server.port
     existing = running_hub(project)  # (before the token check: it creates nothing, and needs no token of this process)
@@ -708,6 +717,30 @@ def cmd_run(args) -> int:
         return run_loop(_serve_swarm(project, config, host, port, args.goal, console, args.open))
     except KeyboardInterrupt:
         return 0
+
+
+def _project_mode(path: Path) -> str | None:
+    """The mode a `dreamteam run` project's swarm.db already has (docs/SPEC.md §22.1), read only: its kv
+    swarm_mode, else "board" for a database with tasks, messages or events (Swarm fixes it so at its next open); None
+    for a missing file or one with neither (it takes the run's mode) and for a file that cannot be read (Swarm then
+    fails the usual way)."""
+    import sqlite3
+
+    from .db import MODE_KEY, reading_file, session_mode
+
+    if not path.is_file():
+        return None
+    try:
+        with reading_file(path, timeout=2.0) as (conn, _immutable):
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if "kv" in tables and conn.execute("SELECT 1 FROM kv WHERE key = ?", (MODE_KEY,)).fetchone():
+                return session_mode(conn)
+            if any(table in tables and conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                   for table in ("tasks", "messages", "events")):
+                return "board"
+    except (sqlite3.Error, OSError):
+        return None
+    return None
 
 
 def cmd_console(args) -> int:
@@ -1023,12 +1056,14 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
                       goal: str | None = None, title: str | None = None, start: str | None = None,
                       stop: asyncio.Event | None = None, workspace: str | None = None,
                       skills: list[str] | None = None, network: str | None = None,
-                      clarify: bool | None = None, copy_from: str | None = None) -> int:
+                      clarify: bool | None = None, copy_from: str | None = None, mode: str | None = None,
+                      goal_rule: str | None = None) -> int:
     """Run the launcher (sessions page, settings, every session's board, MCP) until a stop signal, the
     console's /quit or a server failure. `goal` creates and starts a new session (working in the absolute
     folder `workspace` when given, docs/SPEC.md §17.2; filled with a copy of the folder or .zip `copy_from`,
     §17.2 "Copying files into a new session"; with the skills `skills`, §19; [swarm] network `network`, §7.2;
-    [swarm] clarify `clarify` when not None, §3); a stop signal while it is created (a long copy) undoes the
+    [swarm] clarify `clarify` when not None, §3; the work mode `mode` and its goal rule `goal_rule` when given,
+    §22.8); a stop signal while it is created (a long copy) undoes the
     create, and 130 is returned; its start is not interrupted. `start` starts an existing one. hub.json exists
     exactly while the server listens; all sessions stop at the end."""
     from .copyfrom import copy_text
@@ -1056,7 +1091,8 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
                 focus = start
             if goal:
                 swarm_over = {**({"network": network} if network else {}),
-                              **({"clarify": clarify} if clarify is not None else {})}
+                              **({"clarify": clarify} if clarify is not None else {}),
+                              **({"mode": mode} if mode else {}), **({"goal_rule": goal_rule} if goal_rule else {})}
                 overrides = {"swarm": swarm_over} if swarm_over else None
                 before = set(manager.ids())
                 # only the create races Ctrl+C (a copy may take long; a cancelled create leaves nothing), never the
@@ -1173,6 +1209,14 @@ def cmd_serve(args) -> int:
         print("--clarify needs --goal: it is a setting of the session that --goal creates (an existing session "
               "changes it in its ⚙ settings or with /clarify).", file=sys.stderr)
         return 2
+    if args.mode and not args.goal:
+        print("--mode needs --goal: it is a setting of the session that --goal creates (an existing session keeps "
+              "its mode).", file=sys.stderr)
+        return 2
+    if args.goal_rule and not args.goal:
+        print("--goal-rule needs --goal: it is a setting of the session that --goal creates (an existing session "
+              "changes it in its ⚙ settings or with /rule).", file=sys.stderr)
+        return 2
     skills = None
     if args.skill:
         if not args.goal:
@@ -1197,7 +1241,8 @@ def cmd_serve(args) -> int:
     try:
         return run_loop(_serve_home(home, host, port, console=console, open_browser=not args.no_browser,
                                     goal=args.goal, title=args.title, workspace=workspace, skills=skills,
-                                    network=args.network, clarify=args.clarify, copy_from=copy_from))
+                                    network=args.network, clarify=args.clarify, copy_from=copy_from,
+                                    mode=args.mode, goal_rule=args.goal_rule))
     except KeyboardInterrupt:
         return 0
 
@@ -2110,6 +2155,10 @@ def cmd_tui(args) -> int:
         overrides["network"] = args.network
     if args.clarify is not None:  # the same for swarm.clarify (also --no-clarify over a global true)
         overrides["clarify"] = args.clarify
+    if args.mode:  # the work mode and the goal rule of the new sessions (docs/SPEC.md §22.8): only when given
+        overrides["mode"] = args.mode
+    if args.goal_rule:
+        overrides["goal_rule"] = args.goal_rule
     if args.team is not None:
         try:  # checked here, before a session or the TUI starts (the TUI turns it into swarm.starting_roles)
             if args.print and (args.continue_last or args.resume):
@@ -2153,6 +2202,14 @@ def cmd_tui(args) -> int:
         # (the interactive TUI keeps --clarify with -c / -r: there it is the window's setting for new sessions)
         if args.clarify is not None and (args.continue_last or args.resume is not None):
             print("dreamteam -p: --clarify is a setting of a new session; change an existing one with /clarify in "
+                  "dreamteam tui or in its ⚙ settings on the board.", file=sys.stderr)
+            return 2
+        if args.mode and (args.continue_last or args.resume is not None):
+            print("dreamteam -p: --mode is chosen when a session is created; an existing session keeps its mode.",
+                  file=sys.stderr)
+            return 2
+        if args.goal_rule and (args.continue_last or args.resume is not None):
+            print("dreamteam -p: --goal-rule is a setting of a new session; change an existing one with /rule in "
                   "dreamteam tui or in its ⚙ settings on the board.", file=sys.stderr)
             return 2
         if args.clarify and not args.no_auto_reply:
@@ -2248,6 +2305,13 @@ _CLARIFY_WHAT = ("the planner asks you about its forks before any task while the
                  "critical question pauses the swarm until you answer")
 CLARIFY_HELP = (f"a new session clarifies its goal first: {_CLARIFY_WHAT} ([swarm] clarify; with -p only together "
                 "with --no-auto-reply)")
+MODES = ("board", "thread")
+GOAL_RULES = ("democracy", "veto")
+MODE_HELP = ("the work mode of a new session ([swarm] mode otherwise): board, a task board with owners, statuses and "
+             "reviews; thread, a feed where the agents post, discuss, vote and subscribe, and decide by a vote that "
+             "the goal is reached. Chosen when a session is created")
+GOAL_RULE_HELP = ("how a new thread session's vote decides the goal ([swarm] goal_rule otherwise): democracy, more "
+                  "than half of the AI agents for it; veto, all of them for it and none against")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2300,6 +2364,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--port", type=int, help="port of the launcher started in-process")
     s.add_argument("--network", choices=netoff.NETWORK_MODES, help="a new session's network; " + NETWORK_HELP)
     s.add_argument("--clarify", action=argparse.BooleanOptionalAction, default=None, help=CLARIFY_HELP)
+    s.add_argument("--mode", choices=MODES, default=None, help=MODE_HELP)
+    s.add_argument("--goal-rule", choices=GOAL_RULES, default=None, help=GOAL_RULE_HELP)
     s.set_defaults(func=cmd_tui, dir=None)
 
     s = sub.add_parser("serve", help="start DreamTeam headless: the sessions page, settings, every session's "
@@ -2322,6 +2388,8 @@ def build_parser() -> argparse.ArgumentParser:
                                                                    + NETWORK_HELP)
     s.add_argument("--clarify", action=argparse.BooleanOptionalAction, default=None,
                    help=f"with --goal: that session clarifies its goal first: {_CLARIFY_WHAT} ([swarm] clarify)")
+    s.add_argument("--mode", choices=MODES, default=None, help="with --goal: " + MODE_HELP)
+    s.add_argument("--goal-rule", choices=GOAL_RULES, default=None, help="with --goal: " + GOAL_RULE_HELP)
     s.add_argument("--no-console", action="store_true")
     s.add_argument("--no-browser", action="store_true", help="do not open the browser")
     s.set_defaults(func=cmd_serve)
@@ -2407,6 +2475,12 @@ def build_parser() -> argparse.ArgumentParser:
                                                                    "network otherwise); " + NETWORK_HELP)
     s.add_argument("--clarify", action=argparse.BooleanOptionalAction, default=None,
                    help=f"for this run ([swarm] clarify otherwise): a new goal is clarified first: {_CLARIFY_WHAT}")
+    s.add_argument("--mode", choices=MODES, default=None,
+                   help="the project's work mode, fixed when its swarm.db is first made ([swarm] mode otherwise): "
+                        "board or thread; a later run with another --mode is refused")
+    s.add_argument("--goal-rule", choices=GOAL_RULES, default=None,
+                   help="for this run ([swarm] goal_rule otherwise): how a thread swarm's vote decides the goal, "
+                        "democracy or veto")
     s.set_defaults(func=cmd_run)
 
     s = sub.add_parser("console", help="chat with a running swarm (session) in the terminal")

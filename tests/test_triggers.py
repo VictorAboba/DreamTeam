@@ -1263,6 +1263,7 @@ async def test_a_fire_in_the_pass_that_took_a_writes_event_takes_no_stale_baseli
     turn = swarm.runtimes[BORIS] = Turn()
     swarm.config.agents.trigger_wake_seconds = 0
     (ws.root / "a.md").write_text("v0", encoding="utf-8")
+    ws.read("a.md", actor=BORIS)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     absorbed = fire == "another part"
     trig = engine.create(ANNA, "file_changed('a.md') or message()" if absorbed else "file_changed('a.md')",
                          once=False)
@@ -1297,6 +1298,7 @@ async def test_an_unsure_pass_does_not_settle_a_run_by_the_editors_turns(engine,
     swarm.runtimes[BORIS] = Turn(AgentStatus.IDLE)
     swarm.config.agents.trigger_wake_seconds = 0
     (ws.root / "a.md").write_text("v0", encoding="utf-8")
+    ws.read("a.md", actor=BORIS)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     engine.create(ANNA, "file_changed('a.md')", once=False)
     assert await _pass_probed_before(engine, ws.write(BORIS, "a.md", "v1")) == 0
     assert await engine._evaluate_pass() == 1
@@ -1310,6 +1312,7 @@ async def test_a_change_no_event_explains_keeps_the_shortcut_off_after_a_later_e
     turn = swarm.runtimes[BORIS] = Turn()
     swarm.config.agents.trigger_wake_seconds = 0
     (ws.root / "a.md").write_text("v0", encoding="utf-8")
+    ws.read("a.md", actor=BORIS)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     trig = engine.create(ANNA, "file_changed('a.md')", once=False)
     await ws.write(BORIS, "a.md", "v1")
     clock.advance(1)
@@ -1319,6 +1322,7 @@ async def test_a_change_no_event_explains_keeps_the_shortcut_off_after_a_later_e
     assert await engine._evaluate_pass() == 0 and engine.pending(trig["id"]) == [("a.md", 2, 0.0)]
     turn.state = AgentStatus.IDLE
     clock.advance(1)
+    ws.read("a.md", actor=BORIS)   # the command changed it since his write
     assert await _pass_probed_before(engine, ws.write(BORIS, "a.md", "v2, the last edit")) == 0
     clock.advance(1)
     assert await engine._evaluate_pass() == 0                  # sure now: 2 edits + the command's change
@@ -1344,8 +1348,10 @@ async def test_a_write_in_flight_at_a_fire_is_told_after_it(engine, swarm, clock
     swarm.runtimes[carol] = Turn()
     swarm.config.agents.trigger_wake_seconds = 0
     (ws.root / "a.md").write_text("v0", encoding="utf-8")
+    ws.read("a.md", actor=BORIS)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     trig = engine.create(ANNA, "file_changed('a.md')", once=False)
     await ws.write(BORIS, "a.md", "boris")
+    ws.read("a.md", actor=carol)
     clock.advance(1)
     assert await engine._evaluate_pass() == 0                  # Boris still in his turn
     if fire == "quiet window":
@@ -1399,6 +1405,7 @@ async def test_a_probe_in_the_middle_of_a_write_is_not_a_change(engine, swarm, c
     swarm.runtimes[BORIS] = Turn(AgentStatus.IDLE)          # out of its turn: the shortcut may settle the run
     swarm.config.agents.trigger_wake_seconds = 0
     (ws.root / "a.md").write_text("old text", encoding="utf-8")
+    ws.read("a.md", actor=writer)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     trig = engine.create(ANNA, "file_changed('a.md')", once=False)
     assert await engine._evaluate_pass() == 0
     truncated, go = threading.Event(), threading.Event()
@@ -1443,6 +1450,7 @@ async def test_a_cancelled_write_stays_in_flight_until_its_thread_ends(swarm, mo
     asyncio.get_running_loop().set_exception_handler(lambda _loop, context: errors.append(context))
     ws = await _real_workspace(swarm)
     (ws.root / "a.md").write_text("old", encoding="utf-8")
+    ws.read("a.md", actor=BORIS)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     started, go = threading.Event(), threading.Event()
     original = workspace_mod._write_inside
 
@@ -1496,6 +1504,7 @@ async def _held_write(ws: Any, monkeypatch: Any, actor: str, text: str, phase: s
             original(p, rel, data, root)
 
     monkeypatch.setattr(workspace_mod, "_write_inside", held)
+    ws.read("a.md", actor=actor)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     task = asyncio.create_task(ws.write(actor, "a.md", text))
     assert await asyncio.to_thread(reached.wait, 10)
     monkeypatch.setattr(workspace_mod, "_write_inside", original)
@@ -1517,6 +1526,7 @@ async def test_a_late_write_event_that_cannot_be_recorded(swarm, monkeypatch, ca
     asyncio.get_running_loop().set_exception_handler(lambda _loop, context: errors.append(context))
     ws = await _real_workspace(swarm)
     (ws.root / "a.md").write_text("old", encoding="utf-8")
+    ws.read("a.md", actor=BORIS)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     started, go = threading.Event(), threading.Event()
     original = workspace_mod._write_inside
 
@@ -1727,6 +1737,7 @@ async def test_a_reseed_with_a_write_landing_after_its_probe_counts_no_phantom_c
     trig = engine.create(ANNA, "file_changed('a.md')", once=False)
     clock.advance(10)
     other = _restarted(swarm, clock)
+    ws.read("a.md", actor=BORIS)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     assert await _pass_probed_before(other, ws.write(BORIS, "a.md", "the edit")) == 0
     assert [count for _, count, _ in other.pending(trig["id"])] == [1]
     clock.advance(1)
@@ -1886,6 +1897,7 @@ async def test_a_command_change_after_a_fire_during_a_write_is_counted(engine, s
     swarm.runtimes[carol] = Turn()
     swarm.config.agents.trigger_wake_seconds = 0
     (ws.root / "a.md").write_text("v0", encoding="utf-8")
+    ws.read("a.md", actor=BORIS)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     trig = engine.create(ANNA, "file_changed('a.md')", once=False)
     await ws.write(BORIS, "a.md", "boris")
     clock.advance(1)
@@ -1927,6 +1939,7 @@ async def test_an_event_taken_by_an_unsure_pass_does_not_cancel_a_command_change
     assert await engine._evaluate_pass() == 0 and engine.pending(trig["id"]) == [("a.md", 1, 0.0)]
     clock.advance(1)
     add_message(swarm, BORIS, [ANNA], "see a.md", clock.now)
+    ws.read("a.md", actor=editor)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     assert await _pass_probed_before(engine, ws.write(editor, "a.md", "an edit")) == 1
     expected = "(changes: 2, by Борис Иванов" if editor == BORIS else "(changes: 1 "
     assert last_changes(swarm, ANNA).startswith(" File a.md is still changing " + expected)
@@ -1945,6 +1958,7 @@ async def test_the_owners_edits_in_unsure_passes_do_not_restart_the_cap(engine, 
     engine.create(ANNA, "file_changed('a.md')", once=False)
     (ws.root / "a.md").write_text("a command's change", encoding="utf-8")
     assert await engine._evaluate_pass() == 0
+    ws.read("a.md", actor=ANNA)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     fired_at = None
     for i in range(1, 13):
         clock.advance(48)
@@ -1968,7 +1982,9 @@ async def test_two_edits_between_two_passes_do_not_hide_a_command_change(engine,
     trig = engine.create(ANNA, "file_changed('a.md')", once=False)
     (ws.root / "a.md").write_text("a command's change", encoding="utf-8")
     assert await engine._evaluate_pass() == 0
+    ws.read("a.md", actor=BORIS)   # a member overwrites a file only after reading it (docs/SPEC.md §7.3)
     await ws.write(BORIS, "a.md", "boris")
+    ws.read("a.md", actor=ANNA)
     await ws.write(ANNA, "a.md", "anna, right after")
     turn.state = AgentStatus.IDLE
     clock.advance(1)
@@ -2117,7 +2133,7 @@ class _ModelCheck:
             data = f"{actor[0]}{len(self.recs)}:".encode() + b"x" * (len(self.recs) % 7 + 1)
             rec = {"actor": actor, "data": data, "state": "requested", "gate": asyncio.Event()}
             self.recs.append(rec)
-            rec["task"] = asyncio.ensure_future(self.ws.write(actor, "a.md", data.decode()))
+            rec["task"] = asyncio.ensure_future(self.member_write(actor, data.decode()))
             rec["task"].add_done_callback(lambda task, rec=rec: self.write_done(task, rec))
             await self.drain()
         elif r < 0.40:
@@ -2149,6 +2165,19 @@ class _ModelCheck:
         elif self.with_msg:
             add_message(self.swarm, BORIS, [ANNA], "see the file", self.clock.now)
             self.msg = True
+
+    async def member_write(self, actor: str, text: str) -> str:
+        """The member's write_file of a.md after reading it. When another write or a command changed the file since,
+        the write is refused (docs/SPEC.md §7.3) with the file shown, which counts as reading it, and the member
+        sends its change again: a refused write writes nothing and emits no event."""
+        from dreamteam.models import ReadRefusal
+
+        self.ws.read("a.md", actor=actor)
+        while True:
+            try:
+                return await self.ws.write(actor, "a.md", text)
+            except ReadRefusal:
+                continue
 
     def write_done(self, task: Any, rec: dict) -> None:
         if task.cancelled() or task.exception() is not None:

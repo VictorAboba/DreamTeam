@@ -206,6 +206,36 @@ async def test_stream_events_and_reconnect_after_restart(conn: Connection):
         await feed.close()
 
 
+async def test_posts_of_a_thread_session(conn: Connection):
+    """client.post (GET /api/posts/{id}, docs/SPEC.md §22.8): a thread session's post with its comments and votes,
+    since_id for the later comments; 404 for an unknown post and for every post of a board session."""
+    client = conn.client
+    sid = (await client.create_session("Forum", "Write a poem", overrides={"swarm": {"mode": "thread"}}))["id"]
+    state = await client.state(sid)
+    assert state["swarm"]["mode"] == "thread" and [p["id"] for p in state["posts"][:2]] == [1, 2]
+    ok, text = await client.act(sid, "post_create", {"title": "Rhymes", "text": "Which ones?"})
+    assert ok, text
+    post_id = int(text.split("#")[1].split()[0])
+    for words in ("First thought", "Second thought"):
+        ok, text = await client.act(sid, "comment", {"post_id": post_id, "text": words})
+        assert ok, text
+    detail = await client.post(sid, post_id)
+    assert detail["post"]["title"] == "Rhymes" and detail["post"]["author"] == "user"
+    assert [c["text"] for c in detail["comments"]] == ["First thought", "Second thought"]
+    first = detail["comments"][0]["id"]
+    assert [c["text"] for c in (await client.post(sid, post_id, since_id=f"c{first}"))["comments"]] == \
+        ["Second thought"]
+    goal = await client.post(sid, 1)
+    assert goal["post"]["kind"] == "goal" and goal["goal_vote"]["rule"] == "democracy"
+    with pytest.raises(HubError) as exc:
+        await client.post(sid, 99)
+    assert exc.value.status == 404 and "#99" in exc.value.message
+    board = (await client.create_session("Board", "Plan it"))["id"]
+    with pytest.raises(HubError) as exc:
+        await client.post(board, 1)
+    assert exc.value.status == 404 and "task board" in exc.value.message
+
+
 async def test_stream_stops_when_the_client_closes(conn: Connection):
     sid = (await conn.client.create_session("Close", "Close me"))["id"]
     client = HubClient(conn.base_url)

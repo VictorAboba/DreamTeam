@@ -193,16 +193,17 @@ async def test_a_create_with_a_goal_only_starts_the_session_in_the_background(tm
         status, answer = await hub.create(body)
         assert status == 202, answer
         session = answer["session"]
-        assert list(session) == ["id", "name", "title", "state", "final", "error", "goal", "language", "model",
-                                 "cost_usd", "max_cost_usd", "max_agents", "created_at", "started_at", "finished_at",
-                                 "agents", "tasks", "requests", "answers", "stop_when_done", "client_ref", "via",
-                                 "folder", "board_url", "earlier_version"]
+        assert list(session) == ["id", "name", "title", "state", "mode", "final", "error", "goal", "language",
+                                 "model", "cost_usd", "max_cost_usd", "max_agents", "created_at", "started_at",
+                                 "finished_at", "agents", "tasks", "goal_vote", "posts", "requests", "answers",
+                                 "stop_when_done", "client_ref", "via", "folder", "board_url", "earlier_version"]
         sid, uid = session["name"], session["id"]
         assert len(uid) == 32 and session_uid(hub.manager.meta(sid)) == uid
         assert session["state"] == "starting" and session["final"] is False and session["error"] is None
         assert session["title"] == "Write a haiku" and session["via"] == "api" and session["answers"] == "auto"
         assert session["goal"] == {"title": "Write a haiku", "description": "About spring, in English.",
-                                   "status": "pending", "summary": ""}
+                                   "status": "pending", "summary": "", "decision": None}
+        assert session["mode"] == "board" and session["goal_vote"] is None and session["posts"] == 0
         assert session["stop_when_done"] is True and session["client_ref"] is None and session["folder"] is None
         assert session["started_at"] is None and session["earlier_version"] is False and session["model"] == "default"
         _no_path(answer, tmp_path)

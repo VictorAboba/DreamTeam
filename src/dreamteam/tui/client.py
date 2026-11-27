@@ -309,6 +309,12 @@ class HubClient:
     async def task(self, sid: str | None, task_id: int) -> dict:
         return await self._get(f"{self.session_base(sid)}/api/tasks/{int(task_id)}")
 
+    async def post(self, sid: str | None, post_id: int, since_id: str | int | None = None) -> dict:
+        """GET /api/posts/{id}[?since_id=] of a thread session (docs/SPEC.md §22.8): {post, comments, votes,
+        goal_vote?}; HubError 404 for an unknown post and for every post of a board session."""
+        return await self._get(f"{self.session_base(sid)}/api/posts/{int(post_id)}",
+                               since_id=None if since_id in (None, "") else str(since_id))
+
     async def files(self, sid: str | None, path: str = ".") -> dict:
         return await self._get(f"{self.session_base(sid)}/api/files", path=path)
 

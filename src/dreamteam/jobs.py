@@ -92,6 +92,10 @@ BACKGROUND_ERRORS = {
 WRAP_UP_ERROR = ("The user asked the team to wrap up, so no new background jobs are started. If the command is quick, "
                  "run it without background (it is stopped at its timeout); otherwise finish your task with what you "
                  "have (task_complete with the result so far and what is left).")
+# ... in a thread session (docs/SPEC.md §22.7): no task to finish, the member posts what it has
+WRAP_UP_ERROR_THREAD = ("The user asked the team to wrap up, so no new background jobs are started. If the command is "
+                        "quick, run it without background (it is stopped at its timeout); otherwise post what you have "
+                        "(post_create, or a comment on your post: the result so far and what is left).")
 NOTES = {
     "limit_member": "It was not moved to the background: you already have {n} background jobs ({ids}), the most "
                     "allowed. Stop one you no longer need (job_stop) or wait for one to end.",
@@ -104,6 +108,12 @@ NOTES = {
                "are started. Finish your task with the results you have and say what is left.",
     "wrap_up_left": "They were not kept as a background job: the user asked the team to wrap up, so no new "
                     "background jobs are started.",
+}
+# the notes a thread session says in its own words (ShellOutcome.mode; docs/SPEC.md §22.7): no task named
+NOTES_THREAD = {
+    "wrap_up": "It was not moved to the background: the user asked the team to wrap up, so no new background jobs "
+               "are started. Post what you have (post_create, or a comment on your post: the result so far and what "
+               "is left).",
 }
 # {wait}: the tool that sleeps until the end is announced: `wait` (AI agents), `wait_for_events` (external members)
 FOOTERS = {
@@ -120,6 +130,11 @@ FOOTERS = {
                 "when the session stops or after {job_max}, and you are told when they have all ended (only at your "
                 "next wake-up unless you hold a task in progress). jobs with job_id \"j{id}\" shows their latest "
                 "output; job_stop stops them.]",
+}
+# the footers a thread session says in its own words (docs/SPEC.md §22.7); `started` and `background` are shared
+FOOTERS_THREAD = {
+    "detached": FOOTERS["detached"].replace("(only at your next wake-up unless you hold a task in progress)",
+                                            "(at once while the goal is active, else at your next wake-up)"),
 }
 CONSOLE_MARK = " [dreamteam]"
 
@@ -343,11 +358,14 @@ class ShellOutcome:
     note_args: dict = field(default_factory=dict)
     max_output: int = 12000
     serial: int | None = None  # the command's (RunningCommand.serial)
+    mode: str = "board"        # the session's: a thread session's notes and footers name no task (NOTES_THREAD)
 
     def _note_text(self, cfg: Any) -> str:
         if self.note not in NOTES:
             return ""
-        return NOTES[self.note].format(max=fmt_duration(cfg.max_timeout, "en"), **self.note_args)
+        notes = NOTES_THREAD if self.mode == "thread" else {}
+        return notes.get(self.note, NOTES[self.note]).format(max=fmt_duration(cfg.max_timeout, "en"),
+                                                             **self.note_args)
 
     def render(self, *, cfg: Any, has_wait: bool = True) -> str:
         """The result text (docs/SPEC.md §7.1). The head line and the footer are never cut: when the whole text
@@ -372,7 +390,8 @@ class ShellOutcome:
             else:
                 head = (f"exit code: {self.code} [{shell}]; processes it started keep running as background job "
                         f"j{job_id}")
-            template = FOOTERS[self.state]
+            template = (FOOTERS_THREAD.get(self.state, FOOTERS[self.state]) if self.mode == "thread"
+                        else FOOTERS[self.state])
             minutes = int(getattr(cfg, "job_max_minutes", _SETTING_DEFAULTS["job_max_minutes"]) or 0)
             footer = template.format(id=job_id, log=self.job.log_shown if self.job else "",
                                      max=fmt_duration(cfg.max_timeout, "en"),
@@ -448,8 +467,9 @@ class JobManager:
         if actor in self._forbidden:
             raise ToolError(LEAVING_ERROR)
         cfg = self.swarm.config.shell
+        mode = getattr(self.swarm, "mode", "board")
         if background and self.wrapping_up(actor):
-            raise ToolError(WRAP_UP_ERROR)
+            raise ToolError(WRAP_UP_ERROR_THREAD if mode == "thread" else WRAP_UP_ERROR)
         if background:
             note = self.check_start(actor)
             if note is not None:
@@ -470,7 +490,7 @@ class JobManager:
 
         def outcome(state: str, **kw: Any) -> ShellOutcome:
             return ShellOutcome(state, kw.pop("code", None), kw.pop("output", "") or "", cmd.name, wait,
-                                max_output=max_output, serial=cmd.serial, **kw)
+                                max_output=max_output, serial=cmd.serial, mode=mode, **kw)
 
         try:
             if not self._may_start(actor):  # stop_all or forbid() came while the command started
@@ -1070,9 +1090,17 @@ class JobManager:
             return False
         return any(t.status == Status.IN_PROGRESS for t in board.open_tasks_of(name))
 
+    def _works_on(self, name: str) -> bool:
+        """`name` has work in progress: an in_progress task, or in a thread session the goal is active (docs/SPEC.md
+        §22.7 "Jobs")."""
+        if getattr(self.swarm, "mode", "board") == "thread" and self._goal_status() == "active":
+            return True
+        return self._holds_in_progress(name)
+
     def busy(self, name: str) -> bool:
         """D18: a running `timeout` job, or a `background` job younger than max_timeout while the member holds an
-        in_progress task or a review. A busy member is not idle for the scheduler."""
+        in_progress task or a review (a thread session: while the goal is active, _works_on). A busy member is not
+        idle for the scheduler."""
         if self._ending.get(name):  # one of those jobs has just ended, its end notice is not out yet
             return True
         jobs = self.running_of(name)
@@ -1083,7 +1111,7 @@ class JobManager:
         if not any(j.origin == "background" and now - j.started_at < limit for j in jobs):
             return False
         board = getattr(self.swarm, "board", None)
-        return bool(self._holds_in_progress(name) or (board is not None and board.reviews_of(name)))
+        return bool(self._works_on(name) or (board is not None and board.reviews_of(name)))
 
     def _goal_status(self) -> str | None:
         goal = self.swarm.goal()
@@ -1091,11 +1119,12 @@ class JobManager:
 
     def wakes(self, job: Job) -> bool:
         """Would the end of `job` wake its owner now (docs/SPEC.md §7.1)? timeout/background: unless the goal is
-        done; detached: only under an active goal while the owner holds an in_progress task."""
+        done; detached: only under an active goal while the owner holds an in_progress task (a thread session: the
+        goal is active, _works_on)."""
         status = self._goal_status()
         if job.origin in ("timeout", "background"):
             return status != "done"
-        return status == "active" and self._holds_in_progress(job.owner)
+        return status == "active" and self._works_on(job.owner)
 
     def awaited(self, owner: str) -> list[Job]:
         """The owner's running jobs whose end will wake it (the `wait` result names them)."""

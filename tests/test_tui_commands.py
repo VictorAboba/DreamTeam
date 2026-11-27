@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -1233,3 +1234,321 @@ def test_skills_registry_and_texts():
     text = render.to_plain(render.role_detail(render.RenderContext(lang="en"), {"name": "Tester", "skills": ["pdf"]}),
                            100)
     assert "Role skills (from the library): pdf" in text
+
+
+# ---- a thread session's commands (docs/SPEC.md §22.8 "TUI") -------------------------------------------------------
+POSTS = [{"id": 1, "kind": "goal", "title": "Goal reached?", "author": None, "likes": 0, "comments": 0},
+         {"id": 2, "kind": "plan", "title": "Let's plan the work", "author": None, "likes": 0, "comments": 1},
+         {"id": 9, "kind": "post", "title": "Rhymes", "author": ANNA, "likes": 4, "comments": 2},
+         {"id": 12, "kind": "post", "title": "Metre", "author": BORIS, "likes": 0, "comments": 0}]
+COMMENTS = [{"id": 31, "author": BORIS, "text": "Cross rhymes, please", "reply_to": None},
+            {"id": 32, "author": ANNA, "text": "Agreed", "reply_to": 31}]
+
+
+def post_counts(post: dict) -> str:
+    return f"likes {post.get('likes', 0)} · comments {post.get('comments', 0)}"
+
+
+def thread_state(mode: str = "thread", goal: dict | None = None) -> dict:
+    return {"swarm": {"mode": mode, "goal_rule": "democracy",
+                      "goal": goal if goal is not None else {"title": "A poem", "status": "active"}},
+            "agents": [{"name": ANNA, "status": "idle"}, {"name": BORIS, "status": "idle"},
+                       {"name": "Old Timer", "status": "retired"}],
+            "tasks": [], "posts": [dict(p) for p in POSTS] if mode == "thread" else [],
+            "goal_vote": {"rule": "democracy", "counted": 2, "for": [], "against": [], "needed": 2, "met": False}
+            if mode == "thread" else None}
+
+
+class ThreadApp(HubApp):
+    """HubApp of an attached session in `mode` (TUI.mode): its snapshot, GET /api/posts, the PATCH of /rule, and the
+    confirmation dialogs answered with `answer`."""
+
+    def __init__(self, mode: str = "thread", attached: bool = True, answer: Any = True):
+        super().__init__(attached=attached)
+        self.mode = mode
+        self.state = thread_state(mode)
+        self.session = {"id": self.sid, "title": "Poem", "mode": mode} if attached else None
+        self.answer = answer
+        self.asked: list[ConfirmDialog] = []
+        self.open_post: dict | None = None
+
+        async def post(sid, post_id, since_id=None):
+            self.calls.append(("post", sid, post_id))
+            if post_id == 99:
+                raise HubError(404, "No post #99")
+            return {"post": {"id": post_id, "kind": "post", "title": "Rhymes", "text": "Which ones?", "author": ANNA,
+                             "likes": 4, "dislikes": 0, "comments": 2, "my_vote": None},
+                    "comments": [dict(c) for c in COMMENTS], "votes": []}
+
+        async def update_session(sid, settings):
+            self.calls.append(("update_session", sid, settings))
+            return {"session": {"id": sid, "goal_rule": settings["swarm"].get("goal_rule")}}
+
+        async def settings():
+            self.calls.append(("settings",))
+            return {"settings": {"swarm": {"goal_rule": "veto", "mode": "board"}}}
+
+        self.client.post, self.client.update_session, self.client.settings = post, update_session, settings
+
+    async def refresh_state(self) -> dict:
+        self.calls.append(("state",))
+        return self.state
+
+    async def ask(self, dialog):
+        self.asked.append(dialog)
+        return self.answer
+
+    def hub_error(self, exc: HubError) -> str:
+        return exc.message
+
+    def ask_post(self) -> None:
+        self.calls.append(("ask_post",))
+
+    async def ensure_running(self) -> None:
+        self.calls.append(("ensure_running",))
+
+
+async def test_thread_commands_send_the_forum_tools():
+    app = ThreadApp()
+    for line, args in (("/like 9", {"target": "#9", "value": "like"}),
+                       ("/like #9", {"target": "#9", "value": "like"}),
+                       ("/dislike c31", {"target": "c31", "value": "dislike"}),
+                       ("/unvote p9", {"target": "p9", "value": "none"})):
+        await execute(app, line)
+        assert app.acts[-1] == ("vote", args), line
+        assert app.out[-1].endswith("vote ok")   # the user's vote: the tool's answer (its event is verbose only)
+    for line in ("/like x", "/like 0", "/dislike c", "/unvote 9 10"):
+        await execute(app, line)
+        assert app.out[-1].startswith("⚠ Usage: /") and "N|cN" in app.out[-1], line
+    acts = len(app.acts)
+    await execute(app, "/comment 9 Nice idea")
+    await execute(app, "/comment #9 c31 Yes, like that")
+    await execute(app, "/comment 9 first line\nsecond line")
+    assert app.acts[acts:] == [("comment", {"post_id": 9, "text": "Nice idea"}),
+                               ("comment", {"post_id": 9, "reply_to": "c31", "text": "Yes, like that"}),
+                               ("comment", {"post_id": 9, "text": "first line\nsecond line"})]
+    assert not [line for line in app.out[-3:] if "comment ok" in line]   # the post.comment line says it
+    assert app.calls.count(("ensure_running",)) == 3   # a comment to a stopped session starts it
+    for line in ("/comment 9", "/comment 9 c31", "/comment x text"):
+        await execute(app, line)
+        assert app.out[-1] == "⚠ Usage: /comment N [cM] text", line
+    assert len(app.acts) == acts + 3
+
+    await execute(app, "/post")
+    assert app.calls[-1] == ("ask_post",)
+    await execute(app, "/post 9")
+    assert app.calls[-1] == ("post", "001-x", 9) and app.open_post["post"]["id"] == 9
+    assert "#9 Rhymes" in app.out[-1] and "c31 Борис Петров" in app.out[-1]
+    await execute(app, "/post 99")
+    assert app.out[-1] == "⚠ No post #99"
+    await execute(app, "/post nine")
+    assert app.out[-1] == "⚠ Usage: /post [N]"
+
+    acts = len(app.acts)
+    for line in ("/feed", "/board", "/feed rhymes", "/feed @Анна rhymes", "/feed @Old Timer", "/feed @user",
+                 "/feed @пользователь draft"):
+        await execute(app, line)
+        assert app.out[-1].startswith("📎 feed ok"), line
+    assert [args for _, args in app.acts[acts:]] == [{}, {}, {"query": "rhymes"}, {"by": ANNA, "query": "rhymes"},
+                                                     {"by": "Old Timer"}, {"by": "user"},
+                                                     {"by": "user", "query": "draft"}]
+    assert {tool for tool, _ in app.acts[acts:]} == {"feed"}
+    await execute(app, "/feed @Nobody rhymes")
+    assert app.out[-1] == "⚠ No such member: Nobody" and len(app.acts) == acts + 7
+
+    # the board's commands: a thread has no tasks; /approve name of MCP is unchanged
+    for line in ("/task 3", "/approve 3", "/reject #3 fix it"):
+        await execute(app, line)
+        assert app.out[-1] == "⚠ A thread has no tasks: /post N, /comment N, /like N", line
+    assert len(app.acts) == acts + 7
+    await execute(app, "/approve calc")
+    assert app.calls[-1] == ("mcp", "calc", True, "", "")
+
+    # /done: asked first, «No» preselected
+    app.answer = False
+    await execute(app, "/done")
+    assert app.out[-1].endswith("The goal is unchanged") and app.acts[-1][0] != "swarm_control"
+    dialog = app.asked[-1]
+    assert dialog.title == "Mark the goal reached?" and dialog.select.index == 1
+    assert "whatever the vote on #1" in dialog.text
+    app.answer = True
+    await execute(app, "/done")
+    await execute(app, "/done All verses written")
+    assert app.acts[-2:] == [("swarm_control", {"complete_goal": True}),
+                             ("swarm_control", {"complete_goal": True, "goal_summary": "All verses written"})]
+
+
+async def test_thread_commands_in_a_board_session_and_without_one():
+    board = ThreadApp(mode="board")
+    for line in ("/feed", "/post 9", "/post", "/comment 9 x", "/like 9", "/dislike c3", "/unvote 9"):
+        await execute(board, line)
+        assert board.out[-1] == "⚠ This session works on a task board: /board, /task N", line
+    await execute(board, "/done")
+    assert board.out[-1] == "⚠ On a task board the agents complete the goal (goal_complete)"
+    assert board.acts == [] and board.asked == [] and ("ask_post",) not in board.calls
+    await execute(board, "/approve 3")
+    assert board.acts == [("task_review", {"task_id": 3, "approve": True, "comment": ""})]
+    board.ctx.lang = "ru"
+    await execute(board, "/feed")
+    assert board.out[-1] == "⚠ В этой сессии доска задач: /board, /task N"
+    await execute(board, "/done")
+    assert board.out[-1] == "⚠ На доске цель завершают агенты (goal_complete)"
+    none = ThreadApp(attached=False)
+    await execute(none, "/feed")
+    assert "No current session" in none.out[-1] and none.acts == []
+
+
+async def test_help_and_suggestions_list_the_commands_of_the_mode():
+    board = [info.name for info in commands.infos("en")]
+    thread = [info.name for info in commands.infos("en", "thread")]
+    own = ["feed", "post", "comment", "like", "dislike", "unvote", "done"]
+    assert {"board", "task"} <= set(board) and not set(own) & set(board)
+    assert set(own) <= set(thread) and not {"board", "task"} & set(thread)
+    assert {"rule", "mode", "clarify", "approve", "goal", "help"} <= set(board) & set(thread)
+    assert thread.index("feed") == thread.index("goal") + 1
+    assert find("approve").usage("en", "thread") == "/approve name [sha256]"
+    assert find("approve").usage("en") == "/approve name [sha256] | N [comment]"
+    assert "#2" in find("clarify").description("ru", "thread") and "#2" not in find("clarify").description("ru")
+    assert find("comment").usage("ru") == "/comment N [cM] текст" and find("feed").usage("en") == "/feed [@Name] [text]"
+    assert find("rule").usage("en") == "/rule [democracy|veto]" and find("mode").usage("ru") == "/mode [board|thread]"
+    assert find("rule").launcher and find("mode").launcher and find("done").session and find("like").required
+    app = ThreadApp()
+    await execute(app, "/help")
+    assert "/feed" in app.out[-1] and "/unvote" in app.out[-1] and "# for posts" in app.out[-1]
+    assert not re.search(r"^ +/(task|board) ", app.out[-1], re.M)
+    board_app = ThreadApp(mode="board")
+    await execute(board_app, "/help")
+    assert re.search(r"^ +/task +N ", board_app.out[-1], re.M) and "/feed" not in board_app.out[-1]
+    assert "# for tasks" in board_app.out[-1]
+    found = suggest("/li", commands=commands.infos("en", "thread"))
+    assert [s.label for s in found] == ["/like N|cN", "/dislike N|cN"] and not found[0].runnable
+    # a name typed in full comes first, before a longer one listed earlier (Enter runs it)
+    assert [s.label for s in suggest("/mode", commands=commands.infos("en"))][:2] == ["/mode [board|thread]",
+                                                                                      "/model [profile]"]
+
+
+async def test_rule_and_mode_commands():
+    thread = ThreadApp()
+    await execute(thread, "/rule")
+    assert said(thread) == "⎿ Goal decision in this session: democracy"
+    await execute(thread, "/rule VETO")
+    assert ("update_session", "001-x", {"swarm": {"goal_rule": "veto"}}) in thread.calls
+    assert said(thread) == "⎿ Goal decision in this session is now: veto" and thread.session["goal_rule"] == "veto"
+    await execute(thread, "/rule демократия")
+    assert thread.calls[-2] == ("update_session", "001-x", {"swarm": {"goal_rule": "democracy"}})
+    await execute(thread, "/rule maybe")
+    assert thread.out[-1] == "⚠ Usage: /rule [democracy|veto]"
+    await execute(thread, "/mode")
+    assert said(thread) == "⎿ This session's work mode: thread"
+    for arg in ("board", "тред"):
+        await execute(thread, f"/mode {arg}")
+        assert thread.out[-1] == "⚠ The mode is chosen when a session is created"
+    thread.ctx.lang = "ru"
+    await execute(thread, "/rule")
+    assert said(thread) == "⎿ Решение о цели в этой сессии: демократия"
+    await execute(thread, "/mode доска")
+    assert thread.out[-1] == "⚠ Режим выбирается при создании сессии"
+    assert thread.overrides == {}
+
+    board = ThreadApp(mode="board")
+    board.sid = "main"
+    for line in ("/rule", "/rule veto"):
+        await execute(board, line)
+        assert said(board) == "⎿ The goal decision applies only to a thread session"
+    assert not [c for c in board.calls if c[0] == "update_session"]
+    await execute(board, "/mode")
+    assert said(board) == "⎿ This session's work mode: task board"
+
+    window = ThreadApp(attached=False)
+    await execute(window, "/rule")
+    assert said(window) == "⎿ Goal decision in this window's new thread sessions: veto (as in the general settings)"
+    await execute(window, "/rule democracy")
+    assert window.overrides == {"swarm": {"goal_rule": "democracy"}}
+    assert said(window) == "⎿ New thread sessions from this window decide the goal by: democracy"
+    await execute(window, "/rule")
+    assert said(window).endswith("democracy (this window's setting)")
+    await execute(window, "/mode")
+    assert said(window) == "⎿ Work mode of this window's new sessions: task board (as in the general settings)"
+    await execute(window, "/mode тред")
+    assert window.overrides == {"swarm": {"goal_rule": "democracy", "mode": "thread"}}
+    assert said(window) == "⎿ New sessions from this window work as: thread"
+    await execute(window, "/mode")
+    assert said(window) == "⎿ Work mode of this window's new sessions: thread (this window's setting)"
+    await execute(window, "/mode x")
+    assert window.out[-1] == "⚠ Usage: /mode [board|thread]"
+    assert not [c for c in window.calls if c[0] == "update_session"]
+    assert session_overrides({"mode": "thread", "goal_rule": "veto"}) == \
+        ({"swarm": {"mode": "thread", "goal_rule": "veto"}}, None)
+    swarm_hub = HubApp(mode="swarm", attached=True)
+    await execute(swarm_hub, "/rule veto")
+    await execute(swarm_hub, "/mode")
+    assert swarm_hub.text.count("needs a session launcher") == 2
+
+
+async def test_goal_and_clarify_in_a_thread_session():
+    app = ThreadApp(answer=False)
+    await execute(app, "/goal")
+    panel = " ".join(app.out[-1].replace("│", " ").split())
+    assert "A poem" in panel and "Goal vote (#1, democracy): 0 of 2 for, 0 against; needs 2." in panel
+    await execute(app, "/goal A sonnet")
+    assert app.asked[-1].title == "Set a new goal?" and app.asked[-1].select.index == 1
+    assert "Posts #1 and #2 will be rewritten and the goal votes cleared. Continue?" in app.asked[-1].text
+    assert said(app).endswith("The goal is unchanged") and app.acts == []
+    app.answer = True
+    await execute(app, "/goal A sonnet")
+    assert app.acts == [("set_goal", {"title": "A sonnet"})]
+    app.state = thread_state(goal={})   # no goal yet: nothing to rewrite, nothing asked
+    asked = len(app.asked)
+    await execute(app, "/goal A haiku")
+    assert len(app.asked) == asked and app.acts[-1] == ("set_goal", {"title": "A haiku"})
+    board = ThreadApp(mode="board")
+    await execute(board, "/goal A sonnet")
+    assert board.asked == [] and board.acts == [("set_goal", {"title": "A sonnet"})]
+    await execute(board, "/goal")
+    assert "Goal vote" not in board.out[-1]
+
+    clarify = ClarifyApp(attached=True)
+    clarify.mode = "thread"
+    await execute(clarify, "/clarify on")
+    assert said(clarify).endswith("This session clarifies the goal: before the work starts, the agents ask you about "
+                                  "the unclear points of the goal in the discussion #2, and an agent's critical "
+                                  "question pauses the swarm until you answer (a #2 already posted stays as it is)")
+    await execute(clarify, "/clarify off")
+    assert said(clarify).endswith("This session no longer clarifies the goal: agents' questions no longer pause the "
+                                  "swarm")
+
+
+def test_thread_suggestions_list_posts_and_the_open_posts_comments():
+    thread = {"posts": POSTS, "comments": COMMENTS, "open_post": 9, "counts": post_counts}
+    found = suggest("see #", **thread)
+    assert [s.label for s in found] == ["#1 Goal reached?", "#2 Let's plan the work", "#9 Rhymes", "#12 Metre"]
+    assert found[2].description == "likes 4 · comments 2" and found[2].apply("see #") == ("see #9 ", 7)
+    assert [s.label for s in suggest("#1", **thread)] == ["#1 Goal reached?", "#12 Metre"]
+    assert [s.label for s in suggest("#rhy", **thread)] == ["#9 Rhymes"]
+    assert [s.kind for s in suggest("#", tasks=STATE["tasks"])] == ["task", "task", "task"]   # a board: its tasks
+    found = suggest("/like ", **thread)
+    assert [s.label for s in found] == ["#1 Goal reached?", "#2 Let's plan the work", "#9 Rhymes", "#12 Metre",
+                                        "c31", "c32"]
+    assert found[4].description == "Борис: Cross rhymes, please"
+    assert [s.label for s in suggest("/dislike c3", **thread)] == ["c31", "c32"]
+    assert suggest("/unvote C32", **thread)[0].apply("/unvote C32") == ("/unvote C32 ", 12)
+    nine = suggest("/like 9", **thread)
+    assert nine[0].label == "#9 Rhymes" and nine[0].insert == "9 "   # typed in full: Enter sends it as typed
+    assert suggest("/like #9", **thread)[0].insert == "#9 "
+    assert [s.label for s in suggest("/post 1", **thread)] == ["#1 Goal reached?", "#12 Metre"]
+    assert [s.label for s in suggest("/comment ", **thread)][:2] == ["#1 Goal reached?", "#2 Let's plan the work"]
+    assert [s.label for s in suggest("/comment 9 ", **thread)] == ["c31", "c32"]
+    assert suggest("/comment 9 c32", **thread)[0].apply("/comment 9 c32") == ("/comment 9 c32 ", 15)
+    assert suggest("/comment 2 ", **thread) == []   # another post than the open one: its comments are not known
+    assert suggest("/comment 9 nice", **thread) == []
+    assert [s.label for s in suggest("/comment 9 hi @Ан", members=[ANNA], **thread)] == [f"@{ANNA}"]
+    assert suggest("/like 9", posts=None) == []   # a board session: no thread arguments
+
+
+def test_the_session_picker_marks_a_thread_session():
+    sessions = [{"id": "001-a", "title": "A", "status": "stopped", "mode": "thread", "via": "api"},
+                {"id": "002-b", "title": "B", "status": "stopped", "mode": "board"},
+                {"id": "003-c", "title": "C", "status": "stopped"}]
+    text = plain(SessionPicker("en", sessions).fragments(80))
+    assert "001-a · stopped · thread · HTTP API" in text and text.count("thread") == 1
+    assert "тред" in plain(SessionPicker("ru", sessions).fragments(80))

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import prompts
 from .db import dumps, loads, utf8_safe
+from .forum import vote_line
 from .llm.base import LLMError, LLMResponse, accepts_max_tokens, estimate_tokens
 from .mailbox import MAX_TEXT
 from .models import USER, AgentStatus, Status, ToolError
@@ -88,6 +89,9 @@ class AgentRuntime:
         self.stalled_at = 0.0
         self.llm_steps = 0  # LLM replies of this runtime's activations (swarm: the planning hint counts them)
         self.trace: Trace | None = None  # the trace of the running activation (docs/SPEC.md §16)
+        # the tool of a read-before-write refusal in the response being run (tools.call_tool sets it): the response's
+        # later wait, task_complete, goal_complete and like on #1 are held (docs/SPEC.md §7.3)
+        self.read_refused: str | None = None
         member = swarm.member(name) or {}
         self.language: str = member.get("language") or swarm.language
         self.system_prompt: str = member.get("system_prompt") or ""
@@ -108,9 +112,10 @@ class AgentRuntime:
     def _load_tools(self) -> None:
         """The agent's tool set, stored at its first runtime start (it never changes until a compaction)."""
         db = self.swarm.db
-        rec = frozen.read(db, self.name)
+        mode = getattr(self.swarm, "mode", "board")
+        rec = frozen.read(db, self.name, mode)
         if rec is None:
-            rec = frozen.current_record(self.language)
+            rec = frozen.current_record(self.language, mode)
             frozen.write(db, self.name, rec)
         self._set_tools(rec)
 
@@ -126,7 +131,9 @@ class AgentRuntime:
 
     def _ended_mid_activation(self) -> bool:
         """True when the stored history stops inside an activation (the process died or the agent was
-        stopped while working): a finished one ends with an assistant reply or the result of `wait`."""
+        stopped while working): a finished one ends with an assistant reply or the result of a `wait` that ended
+        the turn. A `wait` result with is_error did not (held after a read-before-write refusal, arguments that did
+        not parse, a repaired `interrupted` result): the member decides again (docs/SPEC.md §7.3)."""
         row = self.swarm.db.one("SELECT msg FROM history WHERE agent = ? ORDER BY seq DESC LIMIT 1", (self.name,))
         if row is None:
             return False
@@ -134,7 +141,7 @@ class AgentRuntime:
         if last.get("role") == "assistant":
             return bool(last.get("tool_calls"))
         if last.get("role") == "tool":
-            return last.get("name") != "wait"
+            return last.get("name") != "wait" or bool(last.get("is_error"))
         return True
 
     # ---- control ------------------------------------------------------------------------------
@@ -485,6 +492,10 @@ class AgentRuntime:
                 if from_user:
                     self._forward_reply(reply)
                 reply.clear()
+                if getattr(swarm, "mode", "board") == "thread":
+                    # no task to name: the in-activation task nudge is the board's (docs/SPEC.md §22.7)
+                    summary = "Answered without tool calls"
+                    break
                 # a clarify planner that waits for the user's answers is not nudged (Swarm.asks_user; getattr: test
                 # doubles have none)
                 asks = getattr(swarm, "asks_user", None)
@@ -589,6 +600,7 @@ class AgentRuntime:
     async def _run_tools(self, response: LLMResponse) -> None:
         limit = self.swarm.config.agents.tool_output_chars
         trace = self._tr
+        self.read_refused = None  # a read-before-write refusal holds calls of its own response only (§7.3)
         for call in response.tool_calls:
             span = trace.tool_start(call.id, call.name, call.arguments)
             if call.parse_error:
@@ -732,7 +744,11 @@ class AgentRuntime:
         """Prompt size that triggers a compaction: the context limit minus room for the answer and for the
         compaction request itself. When context_tokens is the model's real window (local models; vLLM counts
         prompt + max_tokens against it), the summary call must still fit, or the agent could never compact."""
-        return self._prompt_room() - estimate_tokens(prompts.t(self.language, "compaction_request"))
+        return self._prompt_room() - estimate_tokens(prompts.t(self.language, self._key("compaction_request")))
+
+    def _key(self, key: str) -> str:
+        """`key`'s thread twin in a thread session (prompts.mode_key, docs/SPEC.md §22.6)."""
+        return prompts.mode_key(key, getattr(self.swarm, "mode", "board"))
 
     def _prompt_estimate(self) -> int:
         """The size of the next step's prompt: the last prompt plus the response to it (its output tokens), then
@@ -763,7 +779,7 @@ class AgentRuntime:
     async def _compact(self) -> None:
         """Simple compaction (SPEC §6.1). On failure the history is kept and `_last_error` is set, except
         for a context overflow or another non-retryable 400, which fall back to a compaction without the LLM."""
-        request = {"role": "user", "content": prompts.t(self.language, "compaction_request")}
+        request = {"role": "user", "content": prompts.t(self.language, self._key("compaction_request"))}
         trace = self._tr
         span = trace.start("compaction", "compaction",
                            {"messages": len(self.history), "prompt_tokens": self.last_prompt_tokens})
@@ -807,14 +823,19 @@ class AgentRuntime:
         # the notebook survives compaction (update_notes promises it): shown right away, not only at the next wake
         notes = self._notes()
         # The only safe point to move the agent to the current tool set: the new history holds no assistant
-        # turn (no thinking block) bound to the old one. `!=`: after a code downgrade it realigns here too.
-        upgrade = frozen.current_record(self.language) if self.tools_rev != frozen.TOOLSET_REVISION else None
+        # turn (no thinking block) bound to the old one. `!=`: after a code downgrade it realigns here too. Only
+        # within the session's mode: the mode never changes, so neither does the mode of the tool set.
+        mode = getattr(self.swarm, "mode", "board")
+        current_rev = frozen.TOOLSET_REVISIONS[mode]
+        upgrade = frozen.current_record(self.language, mode) if self.tools_rev != current_rev else None
         added = [n for n in frozen.names(upgrade["tools"]) if n not in self.tool_names] if upgrade else []
         # the attached skills too: the compacted context forgets the index an earlier wake-up showed
         skills = getattr(self.swarm, "skills", None)
         index = skills.index_text(self.name) if skills is not None else ""
-        text = (prompts.t(self.language, "compacted", summary=summary)
+        vote = self._my_goal_vote()
+        text = (prompts.t(self.language, self._key("compacted"), summary=summary)
                 + ("\n\n" + prompts.t(self.language, "notes", notes=notes) if notes else "")
+                + ("\n\n" + vote if vote else "")
                 + ("\n\n" + index if index else "")
                 + ("\n\n" + prompts.t(self.language, "tools_added", tools=", ".join(f"`{n}`" for n in added))
                    if added else "")
@@ -834,6 +855,19 @@ class AgentRuntime:
         self.swarm.bus.emit("agent.compacted", self.name, agent=self.name, chars=len(summary),
                             tools_revision=self.tools_rev)
         return epoch
+
+    def _my_goal_vote(self) -> str:
+        """A thread session's compaction keeps the agent's own vote on #1 while the goal is active (my_goal_vote,
+        docs/SPEC.md §22.6): the wake-up's vote line shows only the counts. "" otherwise."""
+        forum = getattr(self.swarm, "forum", None)
+        goal = self.swarm.goal() if forum is not None else None
+        if not goal or goal.get("status") != "active":
+            return ""
+        tally = forum.goal_vote()
+        if tally is None:
+            return ""
+        return prompts.t(self.language, "my_goal_vote", value=forum.my_vote(self.name, "p1") or "none",
+                         vote=vote_line(self.language, tally))
 
     def _tail_start(self) -> int:
         """Index of the trailing run of user messages (never the summary of an earlier compaction)."""

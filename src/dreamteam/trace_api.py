@@ -52,6 +52,9 @@ def trace_routes(swarm: "Swarm") -> list[Route]:
 
     async def traces(request: Request):
         q = request.query_params
+        if q.get("task") not in (None, "") and getattr(swarm, "mode", "board") == "thread":
+            # a thread session has no tasks (docs/SPEC.md §22.9): its traces never list any
+            return JSONResponse({"error": "a thread session has no tasks"}, status_code=400)
         items = tracer().list_traces(q.get("agent") or None, limit=_int(request, "limit", 50, 1, 500),
                                      before=_int(request, "before", None), status=q.get("status") or None,
                                      task=_int(request, "task", None), kind=q.get("kind") or None)

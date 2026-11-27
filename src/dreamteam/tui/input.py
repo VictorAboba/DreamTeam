@@ -25,12 +25,17 @@ EXPLICIT_ADDRESSEE_SECONDS = 60.0
 _MENTION = re.compile(r"(?:^|(?<=\s))@([^@\n]{0,60})$")
 _TASK_REF = re.compile(r"(?:^|(?<=\s))#(\w{0,40})$")
 _UNLOCK = re.compile(r"/unlock\s+([^\n]*)\Z", re.IGNORECASE)   # "/unlock docs/A": the locked paths
+# a thread session's command arguments (docs/SPEC.md §22.8 "Suggestions"): a vote's target (a post or a comment of the
+# open post), the post of /post and /comment, the comment a /comment replies to
+_VOTE_ARG = re.compile(r"/(?:like|dislike|unvote)\s+([#pPcC]?\d*)", re.IGNORECASE)
+_POST_ARG = re.compile(r"/(?:post|comment)\s+([#pP]?\d*)", re.IGNORECASE)
+_REPLY_ARG = re.compile(r"/comment\s+[#pP]?(\d+)\s+([cC]\d*)?", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class Suggestion:
-    kind: str                # "command" | "member" | "task" | "path"
-    label: str               # "/board", "@Анна Смирнова", "#3 Title", "docs/AUDIT.md"
+    kind: str                # "command" | "member" | "task" | "path" | "post" | "comment"
+    label: str               # "/board", "@Анна Смирнова", "#3 Title", "docs/AUDIT.md", "c31"
     description: str         # dim text after the label
     start: int               # text[start:end] is replaced by `insert`
     end: int
@@ -57,10 +62,16 @@ class CommandInfo:
 def suggest(text: str, cursor: int | None = None, *, commands: Sequence[CommandInfo] = (),
             members: Iterable[str] = (), tasks: Iterable[dict] = (),
             everyone: str = "", status: Callable[[str], str] | None = None,
-            locks: Iterable[dict] = ()) -> list[Suggestion]:
+            locks: Iterable[dict] = (), posts: Iterable[dict] | None = None, comments: Iterable[dict] = (),
+            open_post: int | None = None, counts: Callable[[dict], str] | None = None) -> list[Suggestion]:
     """Suggestions for the word being typed at `cursor`: commands after a leading `/`, members (plus
     `all`) after `@`, tasks after `#`, the locked paths (`locks`: {path, owner}) after `/unlock `. `everyone`
-    describes `all` (e.g. «все»); `status` turns a task status into its label (e.g. «к работе»)."""
+    describes `all` (e.g. «все»); `status` turns a task status into its label (e.g. «к работе»).
+
+    A thread session passes its `posts` (the snapshot's, in the feed's order; None on a board): `#` then lists them
+    (`#3 Title` and `counts(post)`, «нравится 4 · комментариев 2») instead of tasks, so do the arguments of /post,
+    /comment, /like, /dislike and /unvote, and a vote's target or a /comment's reply also lists the `comments` of
+    the post `/post N` opened last (`open_post`) as `cM`."""
     cursor = len(text) if cursor is None else max(0, min(cursor, len(text)))
     before = text[:cursor]
     if before.startswith("/") and not any(ch.isspace() for ch in before):
@@ -68,10 +79,16 @@ def suggest(text: str, cursor: int | None = None, *, commands: Sequence[CommandI
     unlock = _UNLOCK.match(before)
     if unlock is not None:
         return _lock_suggestions(text, unlock, locks)
+    if posts is not None:
+        found = _thread_arg_suggestions(before, cursor, list(posts), list(comments), open_post, counts)
+        if found is not None:
+            return found
     mention = _MENTION.search(before)
     if mention is not None:
         return _member_suggestions(text, cursor, mention, members, everyone)
     ref = _TASK_REF.search(before)
+    if ref is not None and posts is not None:
+        return _post_suggestions(list(posts), ref.group(1), ref.start(0), cursor, counts, "#")
     if ref is not None:
         return _task_suggestions(text, cursor, ref, tasks, status)
     return []
@@ -92,6 +109,8 @@ def _command_suggestions(text: str, query: str, commands: Sequence[CommandInfo])
         for name in names:
             if name.casefold().startswith(query):
                 rank, label = 0 if name == cmd.name else 1, name
+                if name.casefold() == query:   # typed in full: before a longer name ("/mode" before "/model")
+                    rank = -1
                 break
         if rank is None:
             if query and any(query in name.casefold() for name in names):
@@ -147,6 +166,73 @@ def _task_suggestions(text: str, cursor: int, match: re.Match, tasks: Iterable[d
                          cursor, f"#{tid} ")
         (closed_rows if task.get("status") in ("done", "failed", "cancelled") else open_rows).append(row)
     return (open_rows + closed_rows)[:MAX_SUGGESTIONS]
+
+
+def _post_suggestions(posts: list[dict], query: str, start: int, cursor: int,
+                      counts: Callable[[dict], str] | None, prefix: str) -> list[Suggestion]:
+    """`#3 Title` rows of a thread's posts (the feed's order) whose number starts with `query` or whose title holds
+    it, the number typed in full first; `prefix` is what the inserted reference starts with ("#" after a bare `#`,
+    else what was typed before the number in a command's argument), so a number typed in full is sent as it is."""
+    query = query.casefold()
+    exact: list[Suggestion] = []
+    rest: list[Suggestion] = []
+    for post in posts:
+        if not isinstance(post, dict) or post.get("id") is None:
+            continue
+        pid = str(post.get("id"))
+        title = " ".join(str(post.get("title") or "").split())
+        if query and not (pid.startswith(query) or query in title.casefold()):
+            continue
+        row = Suggestion("post", f"#{pid} {title}".rstrip(), counts(post) if counts else "", start, cursor,
+                         f"{prefix}{pid} ")
+        (exact if pid == query else rest).append(row)
+    return (exact + rest)[:MAX_SUGGESTIONS]
+
+
+def _comment_suggestions(comments: list[dict], query: str, start: int, cursor: int,
+                         prefix: str = "c") -> list[Suggestion]:
+    """`c31` rows of the open post's comments (its author's first name and the start of its text) whose number
+    starts with `query`, the number typed in full first."""
+    rows: list[Suggestion] = []
+    for comment in comments:
+        if not isinstance(comment, dict) or comment.get("id") is None:
+            continue
+        cid = str(comment.get("id"))
+        if query and not cid.startswith(query):
+            continue
+        author = " ".join(str(comment.get("author") or "").split()).split(" ")[0]
+        line = " ".join(str(comment.get("text") or "").split())
+        line = line if len(line) <= 60 else line[:59].rstrip() + "…"
+        rows.append(Suggestion("comment", f"c{cid}", f"{author}: {line}" if author else line, start, cursor,
+                               f"{prefix}{cid} "))
+    rows.sort(key=lambda s: s.label != f"c{query}")   # stable: the comments' order otherwise
+    return rows[:MAX_SUGGESTIONS]
+
+
+def _thread_arg_suggestions(before: str, cursor: int, posts: list[dict], comments: list[dict],
+                            open_post: int | None, counts: Callable[[dict], str] | None) -> list[Suggestion] | None:
+    """The arguments of a thread session's commands; None when `before` is none of them."""
+    vote = _VOTE_ARG.fullmatch(before)
+    if vote is not None:
+        word = vote.group(1)
+        if word[:1] in ("c", "C"):
+            return _comment_suggestions(comments, word[1:], vote.start(1), cursor, word[:1])
+        head = word[:1] if word[:1] in ("#", "p", "P") else ""
+        found = _post_suggestions(posts, word[len(head):], vote.start(1), cursor, counts, head)
+        return found + (_comment_suggestions(comments, "", vote.start(1), cursor) if not word else [])
+    reply = _REPLY_ARG.fullmatch(before)
+    if reply is not None:
+        if open_post is None or int(reply.group(1)) != open_post:
+            return []
+        word = reply.group(2) or ""
+        start = reply.start(2) if reply.group(2) is not None else cursor
+        return _comment_suggestions(comments, word[1:], start, cursor, word[:1] or "c")
+    target = _POST_ARG.fullmatch(before)
+    if target is not None:
+        word = target.group(1)
+        head = word[:1] if word[:1] in ("#", "p", "P") else ""
+        return _post_suggestions(posts, word[len(head):], target.start(1), cursor, counts, head)
+    return None
 
 
 def _lock_suggestions(text: str, match: re.Match, locks: Iterable[dict]) -> list[Suggestion]:
@@ -237,6 +323,14 @@ def members_of(state: dict | None) -> list[str]:
             if isinstance(a, dict) and a.get("name") and a.get("status") != "retired"]
 
 
+def session_mode(state: dict | None, summary: dict | None = None) -> str:
+    """The work mode of a session (docs/SPEC.md §22.8): the snapshot's swarm.mode, else its summary's; "board" for
+    anything else (a missing mode is a board session's)."""
+    swarm = (state or {}).get("swarm")
+    mode = (swarm.get("mode") if isinstance(swarm, dict) else None) or (summary or {}).get("mode")
+    return "thread" if mode == "thread" else "board"
+
+
 def planning_assignee(state: dict | None) -> str | None:
     members = set(members_of(state))
     for task in (state or {}).get("tasks") or []:
@@ -286,5 +380,5 @@ def save_prefs(home: Path, **updates: Any) -> None:
 __all__ = [
     "ALL", "ALL_ALIASES", "MAX_ROWS", "Suggestion", "CommandInfo", "suggest", "window", "parse_command", "bash_command",
     "is_bash", "split_mention", "resolve_member", "did_you_mean", "number", "members_of", "planning_assignee",
-    "default_addressee", "history_path", "load_prefs", "save_prefs",
+    "default_addressee", "session_mode", "history_path", "load_prefs", "save_prefs",
 ]

@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from ..models import ToolError
-from . import ToolContext, tool
+from . import ToolContext, swapped, tool
 from .fmt import trim
 
 _TEMPLATE = '''from mcp.server.mcpserver import MCPServer
@@ -22,34 +22,52 @@ if __name__ == "__main__":
     mcp.run()'''
 
 
+_CREATE_EN = (
+    "Build a new MCP server (a reusable tool set) from Python code using the mcp 2.x SDK, test it and "
+    "register it for the swarm. The code must follow this template (type hints and docstrings become the "
+    "tool schema; any library from `requirements` can be imported):\n" + _TEMPLATE + "\n"
+    "name: lowercase snake_case. scope: swarm (everyone, default; also saved to the cross-run library), "
+    "task (people of task_id) or private. Calling it again with the same name replaces your server. "
+    "If the smoke test fails you get the error log: fix the code and call again. Build one only for a "
+    "capability that will be reused; for one-off work use shell."
+)
+_CREATE_RU = (
+    "Создать новый MCP-сервер (переиспользуемый набор инструментов) из кода на Python с SDK mcp 2.x, "
+    "проверить его и зарегистрировать в рое. Код должен следовать шаблону (аннотации типов и docstring "
+    "становятся схемой инструмента; можно импортировать библиотеки из `requirements`):\n" + _TEMPLATE + "\n"
+    "name: латиница snake_case. scope: swarm (все, по умолчанию; сохраняется и в общую библиотеку между "
+    "запусками), task (участники задачи task_id) или private. Повторный вызов с тем же name заменяет твой "
+    "сервер. Если проверка не прошла, вернётся лог ошибки: исправь код и вызови снова. Создавай сервер "
+    "только для переиспользуемой возможности; для разовой работы используй shell."
+)
+_CREATE_PROPS = {
+    "name": {"type": "string", "description": "e.g. csv_tools"},
+    "description": {"type": "string", "description": "What the tools are for (one sentence)"},
+    "code": {"type": "string", "description": "Full server.py source"},
+    "scope": {"type": "string", "enum": ["swarm", "task", "private"]},
+    "task_id": {"type": "integer", "description": "For scope=task"},
+    "requirements": {"type": "array", "items": {"type": "string"}, "description": "pip packages, e.g. [\"httpx\"]"},
+}
+
+
 @tool(
     "mcp_create",
-    en="Build a new MCP server (a reusable tool set) from Python code using the mcp 2.x SDK, test it and "
-       "register it for the swarm. The code must follow this template (type hints and docstrings become the "
-       "tool schema; any library from `requirements` can be imported):\n" + _TEMPLATE + "\n"
-       "name: lowercase snake_case. scope: swarm (everyone, default; also saved to the cross-run library), "
-       "task (people of task_id) or private. Calling it again with the same name replaces your server. "
-       "If the smoke test fails you get the error log: fix the code and call again. Build one only for a "
-       "capability that will be reused; for one-off work use shell.",
-    ru="Создать новый MCP-сервер (переиспользуемый набор инструментов) из кода на Python с SDK mcp 2.x, "
-       "проверить его и зарегистрировать в рое. Код должен следовать шаблону (аннотации типов и docstring "
-       "становятся схемой инструмента; можно импортировать библиотеки из `requirements`):\n" + _TEMPLATE + "\n"
-       "name: латиница snake_case. scope: swarm (все, по умолчанию; сохраняется и в общую библиотеку между "
-       "запусками), task (участники задачи task_id) или private. Повторный вызов с тем же name заменяет твой "
-       "сервер. Если проверка не прошла, вернётся лог ошибки: исправь код и вызови снова. Создавай сервер "
-       "только для переиспользуемой возможности; для разовой работы используй shell.",
-    properties={
-        "name": {"type": "string", "description": "e.g. csv_tools"},
-        "description": {"type": "string", "description": "What the tools are for (one sentence)"},
-        "code": {"type": "string", "description": "Full server.py source"},
-        "scope": {"type": "string", "enum": ["swarm", "task", "private"]},
-        "task_id": {"type": "integer", "description": "For scope=task"},
-        "requirements": {"type": "array", "items": {"type": "string"}, "description": "pip packages, e.g. [\"httpx\"]"},
-    },
+    en=_CREATE_EN,
+    ru=_CREATE_RU,
+    properties=_CREATE_PROPS,
     required=["name", "description", "code"],
     audience=("llm", "external"),
+    # a thread session has no tasks (docs/SPEC.md §22.5): no scope=task and no task_id
+    thread={
+        "en": swapped(_CREATE_EN, (", task (people of task_id) or private.", " or private.")),
+        "ru": swapped(_CREATE_RU, (", task (участники задачи task_id) или private.", " или private."), plain_e=True),
+        "properties": {**{k: v for k, v in _CREATE_PROPS.items() if k != "task_id"},
+                       "scope": {"type": "string", "enum": ["swarm", "private"]}},
+    },
 )
 async def mcp_create(ctx: ToolContext, args: dict[str, Any]) -> str:
+    if ctx.mode == "thread" and args.get("scope") == "task":  # behind the thread schema's enum
+        raise ToolError("scope=task is for board sessions: this session has no tasks; use swarm or private.")
     forge = ctx.swarm.forge
     report = await forge.create(
         ctx.actor, args["name"], args["description"], args["code"],

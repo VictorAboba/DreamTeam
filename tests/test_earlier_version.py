@@ -763,7 +763,7 @@ async def test_a_session_that_ran_and_was_rewritten_to_revision_4_is_refused(tmp
         if names and frozen.read(swarm.db, names[0]):
             break
         await asyncio.sleep(0.05)
-    assert frozen.read(swarm.db, names[0])["rev"] == frozen.TOOLSET_REVISION
+    assert frozen.read(swarm.db, names[0])["rev"] == frozen.TOOLSET_REVISIONS["board"]
     await manager.stop(sid)
     assert manager.summary(sid)["earlier_version"] is False
     path = manager.dir_of(sid) / ".dreamteam" / "swarm.db"
@@ -807,5 +807,5 @@ async def test_sessions_without_anything_frozen_open_as_usual(tmp_path):
         if frozen.read(swarm.db, "Anna"):
             break
         await asyncio.sleep(0.05)
-    assert frozen.read(swarm.db, "Anna")["rev"] == frozen.TOOLSET_REVISION
+    assert frozen.read(swarm.db, "Anna")["rev"] == frozen.TOOLSET_REVISIONS["board"]
     await manager.shutdown()

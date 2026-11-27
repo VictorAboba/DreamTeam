@@ -144,6 +144,8 @@ code { font-family: var(--mono); font-size: .92em; }
 .goal:hover { border-color: var(--border-strong); }
 .goal-label { color: var(--accent); white-space: nowrap; font-size: 10.5px; letter-spacing: .12em; }
 .goal-title { font-weight: 500; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* a thread session's status carries #1's count: it may shrink, cut with an ellipsis, beside the goal's title */
+.goal .badge.vote { display: inline-block; min-width: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
 .top-stats { display: flex; align-items: center; gap: 12px; flex: none; }
 .stat { min-width: 132px; }
 .stat.compact { min-width: 0; }
@@ -528,6 +530,73 @@ label.field .hint { font-weight: 400; color: var(--faint); }
 #pane-files .files { flex: 1; height: auto; }
 .files-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; font-size: 12px; color: var(--muted); min-width: 0; }
 .files-head:empty { display: none; }
+
+/* the thread tab of a thread session (docs/SPEC.md §22.8): the feed of posts on the left, the open post on the right */
+.thread-layout { display: grid; grid-template-columns: minmax(240px, 340px) minmax(0, 1fr); gap: 12px; height: 100%; min-height: 400px; }
+.thread-feed, .thread-post { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: auto; min-width: 0; }
+.thread-feed { padding: 6px; display: flex; flex-direction: column; gap: 2px; }
+.thread-post { padding: 14px 18px; display: flex; flex-direction: column; }
+.tfeed-row {
+  display: flex; flex-direction: column; gap: 5px; width: 100%; min-width: 0; padding: 8px 10px; border: 0; border-radius: var(--radius-sm);
+  background: none; color: var(--text); text-align: left; cursor: pointer; flex: none;
+}
+.tfeed-row:hover { background: var(--hover); }
+.tfeed-row.active { background: var(--accent-soft); }
+.tfeed-row.system { box-shadow: inset 2px 0 0 var(--accent-line); }
+.tfeed-row:focus-visible { outline: 2px solid var(--accent-fill); outline-offset: -2px; }
+.tfeed-top { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+.tfeed-title { flex: 1; min-width: 0; font-weight: 600; font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }
+.tfeed-new { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-fill); flex: none; align-self: center; }
+.tfeed-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; min-width: 0; font-size: 11.5px; color: var(--faint); }
+.tfeed-count { display: inline-flex; align-items: center; gap: 3px; font: 11px var(--mono); font-variant-numeric: tabular-nums; }
+.tfeed-meta time { margin-left: auto; font: 11px var(--mono); }
+.tpost-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.tpost-head .card-id { font-size: 12px; }
+.tpost-title { flex: 1; min-width: 0; margin: 0; font-size: 16px; font-weight: 650; line-height: 1.35; overflow-wrap: anywhere; }
+.tpost-meta { margin-top: 6px; }
+.tpost-body { margin-top: 12px; overflow-wrap: anywhere; }
+.tpost-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.tpost-composer { margin-top: auto; padding-top: 8px; }
+.votes { display: inline-flex; gap: 4px; }
+.vote-btn {
+  display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--panel); color: var(--muted); font: 11px var(--mono); font-variant-numeric: tabular-nums; cursor: pointer;
+}
+.vote-btn > span { font-size: 9px; }
+.vote-btn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
+.vote-btn:disabled { opacity: .55; cursor: default; }
+.vote-btn.like.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.vote-btn.dislike.on { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); background: color-mix(in srgb, var(--err) 10%, transparent); }
+.vote-btn:focus-visible { outline: 2px solid var(--accent-fill); outline-offset: 1px; }
+.tcomm .post-actions { display: inline-flex; align-items: center; gap: 8px; }
+.tcomm .vote-btn { height: 20px; padding: 0 6px; }
+.tvotes { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 10px; font-size: 12px; }
+.tvotes-label { color: var(--muted); }
+.tvotes.apart { padding-top: 6px; border-top: 1px dashed var(--border); }
+.vote-chip .vote-mark { font-size: 9px; }
+.vote-chip.like .vote-mark { color: var(--ok); }
+.vote-chip.dislike .vote-mark { color: var(--err); }
+.goal-card {
+  display: flex; flex-direction: column; gap: 8px; margin-top: 12px; padding: 12px 14px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--panel-2);
+}
+.goal-card .tvotes { margin-top: 0; }
+.goal-rule { font-size: 12.5px; color: var(--muted); }
+.goal-bar { position: relative; height: 6px; border-radius: 3px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--border); }
+.goal-bar-fill { height: 100%; border-radius: 3px; background: var(--accent-fill); transition: width .3s; }
+.goal-bar.met .goal-bar-fill { background: var(--ok); }
+.goal-bar-mark { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--text); }
+.goal-bar-text { font: 11.5px var(--mono); color: var(--faint); }
+.goal-decision { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: var(--ok); }
+.goal-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.goal-note { margin: -4px 0 0; font-size: 12px; color: var(--warn); }
+/* the ⚙ dialog's work mode; a member's subscriptions in its drawer */
+.mode-line { font-size: 12px; margin: -6px 0 12px; }
+.drawer-subs { display: flex; flex-direction: column; gap: 5px; padding: 8px 16px; border-bottom: 1px solid var(--border); font-size: 12px; background: var(--bg); max-height: 30vh; overflow: auto; }
+.drawer-subs-title { color: var(--muted); font-weight: 500; }
+.drawer-sub { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.drawer-sub code { background: var(--panel-2); padding: 1px 6px; border-radius: 4px; font: 11.5px var(--mono); overflow-wrap: anywhere; }
+.drawer-sub .sub-id { color: var(--faint); font: 11px var(--mono); }
 .ws-label { white-space: nowrap; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
 .ws-label .ic { color: var(--accent); }
 .ws-path { color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 5px; padding: 2px 8px; cursor: copy; min-width: 0; overflow-wrap: anywhere; word-break: break-all; }
@@ -654,6 +723,9 @@ pre.skill-md { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 v
   .files { grid-template-columns: 1fr; height: auto; }
   .file-tree { max-height: 40vh; }
   .file-view { min-height: 300px; }
+  .thread-layout { grid-template-columns: 1fr; height: auto; }
+  .thread-feed { max-height: 40vh; }
+  .thread-post { min-height: 300px; }
   .cards-list, .feed { max-width: none; }
 }
 @media (max-width: 600px) {

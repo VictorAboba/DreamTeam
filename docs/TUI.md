@@ -67,12 +67,13 @@ class HubClient:
     async def create_session(self, title: str, goal: str, description: str = "", overrides: dict | None = None,
                              start: bool = True, workspace: str | None = None,
                              skills: list[str] | None = None, copy_from: str | None = None) -> dict
-        # POST /api/sessions -> ["session"]; `workspace` (an absolute folder, SPEC §17.2): the summary then has
-        # "workspace_result" (the hub's "result": mode "created" | "adopted", git, ...); `skills`: references or
-        # sources attached before its first start (`--skill`, `/skills add` without a session; "via": "cli");
-        # `copy_from`: a folder or .zip on the hub's computer copied into the new session's folder first (SPEC
-        # §17.2 "Copying files into a new session"): the summary then has "copy_result" (the hub's "copy"). With
-        # `workspace` or `copy_from` the timeout is 900 s (MOVE_TIMEOUT), else 120 s
+        # POST /api/sessions -> ["session"] (`overrides.swarm.mode` "thread" and `goal_rule` make a thread session,
+        # SPEC §22.8; a summary has `mode`, else it is a board one); `workspace` (an absolute folder, SPEC §17.2): the
+        # summary then has "workspace_result" (the hub's "result": mode "created" | "adopted", git, ...); `skills`:
+        # references or sources attached before its first start (`--skill`, `/skills add` without a session; "via":
+        # "cli"); `copy_from`: a folder or .zip on the hub's computer copied into the new session's folder first
+        # (SPEC §17.2 "Copying files into a new session"): the summary then has "copy_result" (the hub's "copy").
+        # With `workspace` or `copy_from` the timeout is 900 s (MOVE_TIMEOUT), else 120 s
     async def start_session(self, sid: str, skills: list[str] | None = None) -> dict
         # POST /api/sessions/{sid}/start [{"skills", "via": "cli"}] -> ["session"]
     async def stop_session(self, sid: str) -> dict
@@ -106,6 +107,9 @@ class HubClient:
     async def messages(self, sid, with_: str | None = None, limit: int = 50) -> list[dict]
     async def mark_read(self, sid, with_: str | None = None) -> None
     async def task(self, sid, task_id: int) -> dict                # {task, discussion, events}
+    async def post(self, sid, post_id: int, since_id=None) -> dict
+        # GET {base}/api/posts/{id}[?since_id=c31] of a thread session (SPEC §22.8): {post, comments, votes,
+        # goal_vote?} (goal_vote for #1 only); HubError 404 for an unknown post and for every post of a board session
     async def files(self, sid, path: str = ".") -> dict
     async def events(self, sid, since: int = 0, limit: int = 200, types: list[str] | None = None) -> list[dict]
     async def traces(self, sid, **filters) -> list[dict]           # agent, status, task, limit, before
@@ -184,6 +188,12 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     becomes its goal (`set_goal`). A session paused by the user (not by the budget) is resumed: the prompt
     is a new instruction to work on. A session paused for a member's question (the state's `swarm.question`,
     SPEC §3.1) is not resumed: the prompt goes to the asker instead, which makes it the answer.
+  - A thread session (the state's `swarm.mode`, SPEC §22.9) has no coordinator: a goal set, a completed goal
+    reopened (the prompt as the user's comment on #1, the votes on #1 cleared) and a pending question answered as
+    above, otherwise the prompt becomes a post of the user, `post_create` with `instruct.post_parts`: its first line
+    the title (shortened past 200 characters), the rest the text; a prompt of one line, or one whose first line is
+    longer than 200 characters, is the text whole. The user's post wakes every member, and the verbose feed and
+    `stream-json` show its `post.created`.
   - A session made by an earlier version (summary `earlier_version`, SPEC §17.2) is never opened and nothing is
     created: `-r ID` of one exits 1 with its message (English, `sessions.earlier_version_text` with the hub's home
     and version); `-c` whose most recent session is one exits 1 with `continue_earlier`.
@@ -220,11 +230,12 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
   through the HTTP API, SPEC §21.5; `autoreply.hub_answers(summary)`, kept in `_PrintRun.hub_replies`; `answers` never
   changes after the create): the run sends no auto-reply, no review approval and no answer to a question pause of its
   own, with or without `auto_reply`, and writes none of the `asked`, `asked_timeout` and `question` lines below (the
-  hub answers), so nothing is answered twice. With `verbose` `err` gets once (`hub_answers`; not in `stream-json`):
-  - ru: «Эта сессия создана через HTTP API с answers = "auto": на вопросы и ревью агентов за вас отвечает сам хаб,
-    этот запуск автоответов не шлёт.»
-  - en: "This session was created through the HTTP API with answers "auto": the hub itself answers the agents'
-    questions and reviews in your place, so this run sends no automatic replies."
+  hub answers), so nothing is answered twice. With `verbose` `err` gets once (`hub_answers`; not in `stream-json`;
+  worded for both modes, SPEC §22.8):
+  - ru: «Эта сессия создана через HTTP API с answers = "auto": на вопросы агентов (и, на доске задач, ревью) за вас
+    отвечает сам хаб, этот запуск автоответов не шлет.»
+  - en: "This session was created through the HTTP API with answers = "auto": the hub itself answers the agents'
+    questions (and, on the task board, reviews) in your place, so this run sends no automatic replies."
 - Questions that pause the swarm (`[swarm] clarify`, SPEC §3.1):
   - With `auto_reply` the client sends `X-DreamTeam-Auto-Reply: 1` (`client.auto_reply`; `run_print` gives it back
     its earlier value at the end) on every request and on the stream's handshake. That holds the session's
@@ -273,19 +284,28 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
 - Output:
   - `text`: on success, the goal summary is printed to `out` (plain text); on failure, a one-line reason goes
     to `err`. With `verbose`, a compact progress feed goes to `err`: the plain-text rendering of the
-    `render.event()` lines at verbosity "normal".
+    `render.event()` lines at verbosity "normal" (in a thread session the post, comment and #1 vote lines of §3.1;
+    the user's `f_comment`, `f_reply` and `f_mention` notices are not printed there, their lines say it; after a vote
+    on #1 the run fetches the snapshot again and prints its `goal_vote` line under the vote's line; not in
+    stream-json). An event `render` cannot show falls back to `_summary_line`, which names a post (`post.*`) as `#9
+    title` and a comment as `#9 c31: text`.
   - `text` and `json`: a `notification` to the user of kind `u_cost_unknown` (a model profile's calls count as
     $0: no prices, and the provider reports no cost; SPEC §10), `u_budget_low` (most of the money budget is spent,
     SPEC §3 `record_usage`), `u_team_asleep` (nobody in the team works and nothing is set to wake the team, SPEC §3
-    scheduler item 9) or `u_team_waits` (the same, and every open task is held by the user or an external member,
-    so no member is woken) writes its text to `err` once per text, also without `verbose` (the kinds are
-    `printmode.STDERR_NOTES`, written by `on_user_notice`; the verbose feed already shows it as a notice line). The
-    run goes on waiting after `u_team_asleep` or `u_team_waits`, until `--timeout` when one is given. `stream-json`
-    carries the event itself.
+    scheduler item 9), `u_team_waits` (the same, and every open task is held by the user or an external member,
+    so no member is woken) or `u_thread_quiet` (a thread session's team went quiet with the goal undecided, SPEC
+    §22.7) writes its text to `err` once per text, also without `verbose` (the kinds are `printmode.STDERR_NOTES`,
+    written by `on_user_notice`; the verbose feed already shows it as a notice line). The run goes on waiting after
+    `u_team_asleep`, `u_team_waits` or `u_thread_quiet`, until `--timeout` when one is given, the budget or Ctrl+C.
+    `stream-json` carries the event itself.
   - `json`: one object on `out` at the end:
     `{"type":"result","status":"done|budget|timeout|error|interrupted","session":id,"goal":{...},
     "summary":str,"tasks":[{id,title,status,assignee}],"cost_usd":float,"duration_s":float,"agents":[names],
-    "jobs":[{id,label,owner,command,origin}]}`. `jobs`: the agents' background jobs still running at the end.
+    "jobs":[{id,label,owner,command,origin}],"mode":"board|thread","posts":[...],"decision":{...}|null}`. `jobs`:
+    the agents' background jobs still running at the end. `mode` is the session's; `posts` a thread session's posts
+    without their texts (`{id,kind,title,author,likes,dislikes,comments,created_at,active_at}`, in the feed's order,
+    at most 200) and `decision` its goal's `decision` once the goal is done (SPEC §22.9); a board run has
+    `"posts": []` and `"decision": null`. The last line of `stream-json` is the same object.
   - `text` against a hub of another process (`conn.owned` false): when background jobs are still running at the
     end, one more line on `err` lists them (`label (owner: command)`, the command clipped to 60 characters):
     - ru: «Ещё работают фоновые процессы агентов: {jobs}. Они остановятся вместе с сессией (остановить раньше можно
@@ -297,10 +317,11 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
 
 ## 3. Rendering (i18n.py and uitext.py, theme.py and symbols.py, render.py)
 
-All render functions are **pure** (input: dicts as returned by the API, plus a `RenderContext`) and return
-rich renderables (or `None` when nothing is shown at the current verbosity). `to_ansi(renderable, width)`
-renders through `rich.Console(file=StringIO, force_terminal=True, color_system="truecolor", width=width,
-legacy_windows=False)`; `to_plain(renderable, width)` renders without styles (tests, `-p` text output).
+All render functions are **pure** (input: dicts as returned by the API, plus a `RenderContext`; `event` only records
+the context's `last_post_event`) and return rich renderables (or `None` when nothing is shown at the current
+verbosity). `to_ansi(renderable, width)` renders through `rich.Console(file=StringIO, force_terminal=True,
+color_system="truecolor", width=width, legacy_windows=False)`; `to_plain(renderable, width)` renders without styles
+(tests, `-p` text output).
 
 ```python
 VERBOSITY = ("quiet", "normal", "verbose")
@@ -311,6 +332,7 @@ class RenderContext:
     width: int = 100
     unicode: bool = True          # False -> ASCII symbols (theme.SYMBOLS_ASCII)
     me: str = "user"
+    last_post_event: str = ""     # set by render.event: the last post.created / post.comment / post.updated (§3.1)
 ```
 
 ### 3.1 Style (Claude Code look)
@@ -323,8 +345,10 @@ class RenderContext:
   lines, then `… +N строк`. Calls and results of the housekeeping tools `wait` / `wait_for_events` show
   only in verbose (errors always). So do those of the tools whose effect has its own line
   (`render.ECHOED_TOOLS`: `send_message`, `task_claim`, `task_create`, `task_complete`, `task_comment`,
-  `goal_complete`, `hire_agent`, `retire_agent`): in normal verbosity the message, the task line, the goal
-  panel or the team line says it once; a failed call still shows (`⏺ Анна · send_message` + the error).
+  `goal_complete`, `hire_agent`, `retire_agent`, and a thread session's `post_create`, `post_update`, `comment`):
+  in normal verbosity the message, the task line, the post or comment line, the goal panel or the team line says it
+  once; a failed call still shows (`⏺ Анна · send_message` + the error). A thread session's `subscribe`,
+  `unsubscribe` and `vote` (`render.VERBOSE_TOOLS`) show in verbose only too: their events are verbose lines.
 - An agent's step emits all its calls first and then the results, while other agents interleave, so the
   printed feeds (the TUI, `-p --verbose`) pair them with `ToolPairs`: a call is held until its result and
   both are printed together. A call still running after 1 s is printed alone; its result then gets a
@@ -355,7 +379,29 @@ class RenderContext:
     (the verbose change line `✎ #4 … · изменена: групповая задача (участников)` and the `/task` history
     `групповая задача (участников): обычная задача → 3`), as the web's `fmtValue`.
 - Goal: `goal.set` renders as a rounded panel titled «Цель» / "Goal". `goal.completed` renders as a green
-  rounded panel «✓ Цель достигнута» with the summary as markdown.
+  rounded panel «✓ Цель достигнута» with the summary as markdown; a thread session's goal adds its decision
+  (`goal.decision`, SPEC §22.4): «Цель достигнута голосованием (демократия): за 3 из 4 — Анна, Борис» (plus «(в
+  режиме завершения)» in wrap-up mode) / "Goal reached by vote (democracy): 3 of 4 for — …", or «Цель завершена
+  решением пользователя» / "Goal completed by the user's decision" (rule `user`).
+- A thread session's forum (SPEC §22.2, §22.8; a board session has none of these events):
+  - `post.created` at every verbosity: `📎 #9 Title — Анна` (the title only; a system post has no author). The
+    system posts #1 and #2, and #1's vote line, carry the pin `📌` (`*` in ASCII), every other post the clip `📎`
+    (`#` in ASCII), here, in the feed rows and in `/post N`;
+  - `post.comment` from normal on, one folded line `💬 Анна → #9: first line…` (`#9 ↳ c31` for a reply; verbose: the
+    text, clipped);
+  - a vote on #1 (`post.vote` target `p1`) from normal on, `↑ Анна ставит «нравится» #1`, followed by the vote line
+    of the refreshed snapshot's `goal_vote` under it (`  ⎿  Голосование по цели (#1, демократия): за 2 из 3, против
+    0; нужно 2.`, the TUI and `-p --verbose` in the text and json formats, for a live event; `_PrintRun.goal_vote`,
+    not in stream-json);
+  - verbose only: the other votes, `post.updated` (`✎ #9 изменено — Анна`; `#1: голоса сброшены` for a reset),
+    `subscription.changed`, `files.committed`;
+  - a post or a comment by someone else that names the user (`@user` / `@пользователь`) is highlighted (warn colour,
+    `· упоминает вас` / "· mentions you"): the user's `f_mention`, `f_comment` and `f_reply` notices are not printed at
+    normal and verbose (the line says it), only in quiet, which shows `post.created` and those notices but no comment
+    lines. An edit has no highlighted line (its post may name the user from before the edit, and the forum mentions
+    only the names an edit adds): the user's `f_mention` right after a `post.updated` is printed at normal and
+    verbose too, in the warn colour (`RenderContext.last_post_event`, the type of the last `post.created`,
+    `post.comment` or `post.updated` rendered: the one piece of state `render.event` keeps).
 - Thinking (verbose only): `✻ Анна думает…` with the text dim italic, max 12 lines.
 - `wake` (verbose only): `⏰ Анна проснулась: <first line>`. Nudge and compaction lines appear only in
   verbose. Errors are always shown in red with `⚠`.
@@ -377,8 +423,9 @@ class RenderContext:
   `u_auto_reply_limit` (the hub no longer answers the members' messages of an `answers: "auto"` session in this run,
   SPEC §21.5), `u_budget_low` (most of the money budget is spent, SPEC §3 `record_usage`), `u_team_asleep` (the
   whole team asleep with nothing set to wake the team, SPEC §3 scheduler item 9) and `u_team_waits` (the same, with
-  every open task held by the user or an external member: only the user can unblock the run), all in
-  `render._WARN_NOTES`.
+  every open task held by the user or an external member: only the user can unblock the run) and
+  `u_thread_quiet` (a thread session's team quiet with the goal undecided, SPEC §22.7), all in `render._WARN_NOTES`.
+  `u_goal_decided` (the vote decided the goal) is not printed (`_QUIET_SKIP_NOTES`: the goal panel says it).
   `u_paused_jobs` (the user's pause while jobs run) is a plain bell line, like `u_jobs_running`.
 - Skills (normal and verbose; quiet has the notices): `⏺ вы · подключил(а) скилл pdf · library` (обновил(а) for a
   replace, отключил(а)), `⏺ Анна · предлагает скилл x` (warn), `⏺ вы · сохранил(а) скилл x в библиотеку` / «не
@@ -414,7 +461,25 @@ def tips(ctx, has_sessions: bool) -> RenderableType      # "Советы для 
 def event(ctx, ev: dict) -> RenderableType | None        # every bus event type from SPEC §9 + trace.* (-> None)
 def user_echo(ctx, text: str, to: str | None) -> RenderableType
 def agent_message(ctx, msg: dict) -> RenderableType      # msg from /api/messages or message.sent data.message
-def goal_panel(ctx, goal: dict | None) -> RenderableType
+def goal_panel(ctx, goal: dict | None, *, vote=None, rule=None) -> RenderableType
+    # a thread session's goal adds its decision once done; /goal passes #1's vote line (`vote`: the snapshot's
+    # goal_vote, which names the rule) or, before #1 exists, the session's `rule` («Решение о цели: демократия»)
+def goal_decision_line(ctx, decision) -> str             # «Цель достигнута голосованием (демократия): за 3 из 4 — …» /
+                                                         # «Цель завершена решением пользователя»
+def goal_vote_text(ctx, tally) -> str                    # prompts' goal_vote_line (veto: goal_vote_line_veto)
+def goal_vote_line(ctx, tally, *, cont=False) -> RenderableType | None   # `📌 <vote line>` (on attach), or under a
+                                                         # vote on #1 (`  ⎿  …`); None without a tally
+def post_counts(ctx, post) -> str                        # `нравится 4 · комментариев 2` (the `#` suggestions)
+def feed_rows(ctx, posts, limit=None) -> RenderableType  # the snapshot's posts, one line each: `📎 #3 Title — Анна ·
+    # нравится 4 · не нравится 1 · комментариев 2 · ваш голос: нравится`; with `limit` the first rows and «… еще N:
+    # /feed»; none: «Объявлений пока нет»
+def feed_text(ctx, text) -> RenderableType               # /feed: the `feed` tool's text, its first line bold
+def post_view(ctx, data) -> RenderableType               # /post N from GET /api/posts/N: the post (author or
+    # «система», time, edited, likes, dislikes, the user's vote), its text as markdown, who liked / disliked it (#1:
+    # the vote line, «За: …; против: …» and «Показаны, но не учитываются: вы (нравится)»), «Комментарии (n)» as a
+    # tree (`💬 c31 Борис · 12:31 · ↑2 ↓0 · ваш голос: нравится`, replies 2 cells deeper under their comment, a reply
+    # to a comment not shown with `↳ c30`), then the hint «Ответить: /comment 9 текст · /comment 9 cM текст · /like
+    # 9 · /like cM»
 def board(ctx, tasks: list[dict]) -> RenderableType      # grouped by column, todo symbols, assignee, deps, 💬n;
     # one line per card as the web's board (board_cards): a subtask is its own line only as an open subtask of a
     # terminal parent or under a parent missing from the snapshot, other subtasks are dots in their card's line;
@@ -478,7 +543,8 @@ def trace_detail(ctx, trace: dict) -> RenderableType     # header + spans as ⏺
 def span_detail(ctx, span: dict) -> RenderableType
 def context_view(ctx, context: dict, offset=0, limit=30) -> RenderableType
 def files_view(ctx, data: dict) -> RenderableType        # dir listing or syntax-highlighted file (rich Syntax by extension)
-def help_view(ctx, commands: list) -> RenderableType     # command table (name, args, description)
+def help_view(ctx, commands: list, *, thread=False) -> RenderableType   # command table (name, args, description);
+    # `thread`: the footer says `#` lists posts («# — объявления»)
 def shortcuts_view(ctx) -> RenderableType                # the "?" help: keys in 2 columns
 def info(ctx, text: str) -> RenderableType               # dim "  ⎿  text"
 def error(ctx, text: str) -> RenderableType              # red "⚠ text"
@@ -549,12 +615,20 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
     команду и начнёт работу»;
   - with one: «Напишите сообщение… (@имя — кому, / — команды, ! — консоль)»;
   - while `/new` or `/goal` waits for the goal: «Опишите цель: первая строка — заголовок, следующие (Alt+Enter)
-    — подробности…».
+    — подробности…»;
+  - while `/post` waits for a thread session's new post (the box title «новое объявление» / "new post"):
+    «Объявление: первая строка — заголовок, следующие (Alt+Enter) — текст…».
 - Suggestions appear under the status line, at most 8 rows: the matching item plus a description. Up/Down
   moves the selection, Tab completes, Enter runs the selected command. They come from:
-  - `/` at the start — commands;
+  - `/` at the start — the commands of the session's work mode (a thread session lists its own and not `/board`,
+    `/task`; without a session the board's set), a name typed in full first (`/mode` before `/model`);
   - `@` — agents plus `all`;
-  - `#` — tasks: `#3 Title` and the translated status;
+  - `#` — tasks: `#3 Title` and the translated status; in a thread session its posts instead (the snapshot's `posts`
+    in the feed's order: `#3 Title` and `нравится 4 · комментариев 2`), the number typed in full first;
+  - in a thread session, the argument of `/post`, `/comment` (its post), `/like`, `/dislike`, `/unvote` — the posts
+    (inserted as typed: `3`, `#3`, `p3`, so Enter sends a number typed in full), and of a vote, or after `/comment N `
+    when N is the post `/post N` opened last, the comments of that post as `c31` (its author and the start of its
+    text);
   - after `/unlock ` — the locked paths of the state (`locks`) that contain what is typed, with their owner (the
     path typed in full first, then those that start with it); the suggestion replaces the whole argument. Enter
     sends a typed path as it is (it never takes another path that contains it); Tab, or a suggestion picked with
@@ -573,10 +647,11 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 - `@Имя Фамилия текст` / `@all текст` sends to that member and makes them the sticky addressee. A first
   name alone is enough when unique, as in console.match_addressee.
 - The default addressee is the agent who last messaged the user, else the planning task's assignee, else
-  `all`. It is shown in the box title. A question pause (SPEC §3.1) makes its asker the addressee at once (even
-  within the 60 s of an explicit choice; once per question, so a later `@Name` of the user stands, and a state
-  refresh does not take it back), and other agents' messages do not take it away while the question is pending,
-  so plain text answers it. A message sent to someone else meanwhile (not the asker, not `all`) prints
+  `all` (a thread session has no planning task). It is shown in the box title. A question pause (SPEC §3.1) makes
+  its asker the addressee at once (even within the 60 s of an explicit choice; once per question, so a later `@Name`
+  of the user stands, and a state refresh does not take it back), and other agents' messages do not take it away
+  while the question is pending, so plain text answers it. A message sent to someone else meanwhile (not the asker,
+  not `all`) prints
   «Рой всё ещё ждёт вашего ответа агенту Анна (вопрос #12): @Анна <ответ>».
 - `!command` is bash mode. It runs `command` in the session's folder when the hub is local
   (`conn.owned` or the hub's home == conn.home) with a 120 s timeout, using the shell from settings
@@ -593,6 +668,8 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 - History: Up/Down when no suggestions are shown. It is persisted in `<home>/.dreamteam/tui_history`
   (prompt_toolkit FileHistory).
 - Every sent message is echoed with `user_echo`.
+- In a thread session, the input after `/post` alone is a new post (`post_create`): its first line the title, the
+  rest the text; Esc or Ctrl+C cancel it. The user's posts and comments wake every member (SPEC §22.3).
 
 ### 4.3 Commands (commands.py; descriptions ru/en; `/help` lists them)
 
@@ -603,9 +680,14 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/team [команда \| роль*N, …]` | the starting team of the sessions this window creates next (like `--team`; `/team -` back to the settings); a bare word is a team saved in the settings first (`roles.team_choice`, SPEC §17.3 "Saved teams"), then a catalog role; with teams saved any other bare word is refused (`word*1` makes a new role), and so are a saved team's name that is no catalog role in a list or with `*N`, and a team with a role the catalog lacks; quotes around the argument, or around each item of a list, are dropped, as in other commands; the window copies the team when it is chosen, so a later edit of the team reaches the window only after `/team NAME` again; without an argument shows the team the window holds and lists the saved teams; the settings stay as they are |
 | `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up"; a session made by an earlier version (SPEC §17.2) reads «прежняя версия» / "earlier version" (before any other status; the picker's hint `id · status · goal` is plain text with no task count; a session created through the HTTP API, summary `via` "api", adds `HTTP API` after its status, uitext `sess_api`, SPEC §21.4): Enter and `/resume ID` print its message (`earlier_session`, or the legacy `main`'s `earlier_main`) and attach nothing, the picker closing; Del deletes it as usual |
 | `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it; the legacy `main`: `delete_legacy`, and when it was made by an earlier version its message instead, which names the file to remove by hand |
-| `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description) |
-| `/board` | the board (`board`): one line per card, a parent's subtasks as dots in its line |
+| `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description); in a thread session the panel adds #1's vote line (it names the rule; «Решение о цели: …» before #1 exists) and the decision once done, and a new goal while one is set asks first «Посты #1 и #2 будут переписаны, голоса за цель сброшены. Продолжить?» («Нет» preselected) |
+| `/board` | the board (`board`): one line per card, a parent's subtasks as dots in its line; in a thread session `/feed` |
 | `/task N` | task with discussion (`task_detail` with the snapshot's tasks: a crew task's line «Групповая задача: до N участников, сейчас работают M» and the direct subtasks indented under «Направления (k)» / «Подзадачи (k)», between the description and the result; when the snapshot cannot be fetched, the task prints without them) |
+| `/feed [@Имя] [текст]` | a thread session's feed (the `feed` tool, its text printed): an argument that starts with `@` is split by `console.match_addressee` over every `agents[]` name of the snapshot, retired ones included, plus `user` / `пользователь` (the user's posts, `by` "user"): the name is `by`, the rest `query` (the posts' titles and texts); an `@` that matches nobody prints «Нет такого участника: …» and sends nothing; without `@` the whole argument is `query` |
+| `/post [N]` | a thread session's post N (`#N`, `pN` too) from GET /api/posts/N (`post_view`: the post, its votes, #1's vote line and voters, the comment tree with `cM` ids and votes; its comments feed the `cM` suggestions); `/post` alone: the next input is a new post (first line = title, the rest = text) |
+| `/comment N [cM] текст` | comment on post N (`comment`); a second word `cM` makes it a reply to comment M (`reply_to`; a comment of another post is refused by the forum, `No comment c31 on #9`); the text is required; the post.comment line says it |
+| `/like N\|cN`, `/dislike N\|cN`, `/unvote N\|cN` | `vote` with `like`, `dislike`, `none`: a bare number N is sent as `#N`, `#N`, `pN`, `cN` as typed; the tool's answer is printed (the user's votes are shown, never counted) |
+| `/done [итог]` | a thread session's goal completed by the user (`swarm_control` `complete_goal`, `goal_summary` when given) after a `ConfirmDialog` «Отметить цель достигнутой?» («Нет» preselected); in a board session «На доске цель завершают агенты (goal_complete)» |
 | `/agents` | team table |
 | `/roles [роль]` | the role catalog (`roles_table`) / one role in full (`role_detail`) |
 | `/skills`, `/skills lib`, `/skills add X [--pick a,b] [--replace]`, `/skills update X`, `/skills rm X`, `/skills show X` | the session's skills (`skills_table` from the state; without a session: the next new session's) / the library, the host's and Claude Code's skills / attach a reference (`pdf`, `claude-user:pdf`) or import a folder, .zip (a relative path or `~` resolved here when the hub is on this computer) or Git URL and attach it (`skill_attach`); without a session it is kept for the next new session, as `--skill` / again from its own source (`<from>:X` with replace; refused for a member's proposal) / `skill_detach` / the session's copy of an attached skill, else the library's (`claude-user:x`: that one) |
@@ -624,6 +706,8 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/pause` | pause / resume the swarm (toggle, `swarm_control`; a successful result is not printed (a refusal is): the `⏸` line and, with jobs running, the `u_paused_jobs` line say it); during a question pause it resumes without the answer (the asker takes its own defaults) |
 | `/wrapup [off]` | wrap-up mode on (`on`/`вкл` or nothing) or off (`off`/`выкл`): the agents finish their tasks with what they have, start no new computations, and no new background jobs start (`swarm_control` wrap_up; the `swarm.wrap_up` event prints the change, a no-op prints the tool's answer) |
 | `/clarify [on\|off]` | clarify mode, `[swarm] clarify` (SPEC §3.1): questions before the plan, and an agent's critical question pauses the swarm (`on`/`вкл`, `off`/`выкл`; anything else: the usage line). In a session: that session's setting (`update_session` {"swarm": {"clarify": bool}}; «В этой сессии цель уточняется: …» / «…не уточняется: …»; the planning task already on the board stays as it is), without an argument its state («Уточнение цели в этой сессии: вкл (своя настройка сессии)», or «как в общих настройках»); `main` has no settings of its own: without an argument it shows the general setting as its state («Уточнение цели в этой сессии: вкл (как в общих настройках)»: main has no overrides), and `on` / `off` change nothing and send no PATCH («У сессии main нет своих настроек: уточнение цели задаётся в общих настройках»). Without a session: the window's new sessions (§4.5), without an argument their state (source «настройка этого окна» or «как в общих настройках»). Launcher only |
+| `/rule [democracy\|veto]` | (also `демократия\|вето`) a thread session's goal rule: without an argument «Решение о цели в этой сессии: демократия», with one `update_session` {"swarm": {"goal_rule": …}} (live: the vote is counted again); in a board session, `main` included, «Решение о цели действует только в сессии-треде» and no PATCH; without a session the rule of the thread sessions this window creates (§4.5), as `/clarify`. Launcher only |
+| `/mode [board\|thread]` | (also `доска\|тред`) without a session the work mode of the sessions this window creates (§4.5); in a session its mode («Режим работы этой сессии: тред»), an argument refused with «Режим выбирается при создании сессии». Launcher only |
 | `/budget N`, `/max N` | limits |
 | `/approve имя [sha256]`, `/approve N [комментарий]` | MCP approval (`mcp_approve`; `sha256`: the digest the dialog, `mcp_list` or the MCP card shows, in full or its first 8 or more hex digits; without it, the digest of the last dialog shown for that server, put off with Esc, so code created again since is refused); accept a task in review (`task_review`) |
 | `/reject имя [почему]`, `/reject N что исправить` | MCP rejection; return a task in review (the comment is required; after N it is free text taken as typed, without one pair of quotes around all of it) |
@@ -636,6 +720,14 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/exit`, `/quit` | quit |
 
 Unknown command: `⚠ Неизвестная команда /x. /help — список.` with "did you mean" suggestions.
+
+A thread session (SPEC §22.8): `/help` and the `/` suggestions list the commands of the session's mode (the
+`modes` of a `Command`; `cmd_<name>_thread` / `cmdargs_<name>_thread` word `/clarify`, `/approve` and `/reject`
+for it, and the footer says `#` lists posts). `/task N`, and `/approve N` or `/reject N` with a number, print «В
+треде нет задач: /post N, /comment N, /like N» and send nothing (`/approve имя` and `/reject имя` of MCP are
+unchanged). In a board session the thread commands print «В этой сессии доска задач: /board, /task N». `/clarify
+on` in a thread session says that the agents ask the user in #2 before the work starts and that a #2 already posted
+stays as it is.
 
 ### 4.4 Keys
 
@@ -661,7 +753,9 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
 - After attaching to an existing session:
   - print the goal panel, a one-line board summary (`Задачи: ☐ 3 · ◐ 2 · ☒ 5`; every task, directions included)
     and the last 6 messages between the user and agents (the newest messages of everyone merged with the user's
-    inbox, so an old question to the user is not lost behind agent-to-agent traffic);
+    inbox, so an old question to the user is not lost behind agent-to-agent traffic); a thread session (the
+    snapshot's `swarm.mode`, else the summary's `mode`) prints #1's vote line and the feed's first 5 rows
+    (`feed_rows`) in place of the board summary;
   - then follow `client.stream(sid)`; every event goes through `render.event` at the current verbosity.
   - Attaching is transactional: the start, the event baseline, the state and the history are fetched first;
     only then is the current session left. A failed `/resume` or picker choice keeps the current session.
@@ -698,6 +792,17 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   are not lost silently: after the confirmation a `ChoiceDialog` «Скиллы ждут решения» names them and offers
   «Сохранить в библиотеку и удалить» (`skills=save`; a clash with the library refuses the delete, printed) /
   «Удалить вместе с ними» (`discard`) / «Отмена».
+- The work mode and the goal rule of new sessions (SPEC §22.8): `--mode board|thread` and `--goal-rule
+  democracy|veto`, and `/mode`, `/rule` without a session, are window-wide like `--clarify`: they set
+  `overrides["swarm"]["mode"]` / `["goal_rule"]` of every session this window creates (with a launcher and nothing
+  attached the start prints «Новые сессии из этого окна работают в режиме: тред»). The hub stores a thread session's
+  mode and rule and drops both for a board session; an existing session keeps its mode (`/mode X` in it is
+  refused), and its rule changes with `/rule X`.
+- After a live vote on #1 (`post.vote` target `p1`) the snapshot is fetched again and its `goal_vote` printed under
+  the vote's line (not in quiet, nor for a replayed vote). The `post.*` events refresh the snapshot (its `posts` feed
+  the `#` suggestions) and are replayed after a reconnect (`CATCHUP_TYPES`; a board session has none).
+- The session picker's hint says «тред» / "thread" after the status of a thread session (uitext `sess_thread`, before
+  `HTTP API`).
 - Clarify mode of new sessions (SPEC §3.1): `--clarify` / `--no-clarify` and `/clarify on|off` without a session are
   window-wide, like `/team` (not one-shot, like `/cd`): both set `overrides["swarm"]["clarify"]` (an explicit bool)
   of every session this window creates from then on («Новые сессии из этого окна сначала уточняют цель (/clarify off
@@ -808,9 +913,9 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
 - On connection loss the status line shows «нет связи…» and input stays usable (commands fail with a clear
   error; a hub that does not answer: «Хаб … недоступен»). On reconnect the TUI re-syncs: state, plus the
   journaled events of the gap (messages, notifications, goal, tasks, hires, swarm, MCP, skills). The replay covers
-  only those types, so it is no high-water mark: a live event is dropped only when the live stream or the
-  replay already handled its id. A stream the hub refuses for a session that no longer exists (404 over
-  REST) ends the attachment with «Сессии … больше нет».
+  only those types (a thread session's posts, comments and votes, `post.*`, too), so it is no high-water mark: a live
+  event is dropped only when the live stream or the replay already handled its id. A stream the hub refuses for a
+  session that no longer exists (404 over REST) ends the attachment with «Сессии … больше нет».
 - On exit, if `conn.owned`, print «Сессии остановлены — продолжить: dreamteam -c» and close the
   connection.
 
@@ -850,6 +955,10 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   session"). `~` and relative paths are resolved against the current directory; a file that is not a .zip, and
   `-c` / `-r`, are refused (exit 2). With `--workspace` the copy goes into that folder, which must be empty or
   missing.
+- `--mode board|thread` and `--goal-rule democracy|veto` (default: the settings) are the work mode and the goal rule
+  of the sessions this window creates (`overrides["mode"]`, `overrides["goal_rule"]`, window-wide like `/mode` and
+  `/rule` without a session, §4.5; with `-c` / `-r` too). `-p` with `-c` / `-r` refuses either (exit 2: an existing
+  session keeps its mode; its rule changes with `/rule` or in its ⚙ settings).
 - `--clarify` / `--no-clarify` (default: the settings) is `[swarm] clarify` of the sessions this window creates
   (`overrides["clarify"]`, window-wide like `/clarify` without a session, §4.5; with `-c` / `-r` too). With `-p`,
   `--clarify` needs `--no-auto-reply` (else exit 2: with automatic replies nobody answers the questions, and the

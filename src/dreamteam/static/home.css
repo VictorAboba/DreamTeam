@@ -201,6 +201,14 @@ textarea.mono { font-family: var(--mono); font-size: 12px; }
   min-width: 0;
 }
 .ns-ws-box[hidden] { display: none; }
+/* «Режим работы» and «Решение о цели» (docs/SPEC.md §22.8): the same frame as «Рабочая папка»; the rule only for a thread */
+.ns-ws[hidden] { display: none; }
+/* a thread session's card: the vote on #1 in place of the task bar, a tick at the needed votes */
+.sc-thread > span:last-child { margin-left: auto; }
+.sc-progress .meter.sc-vote { position: relative; overflow: visible; }
+.sc-progress .meter.sc-vote div { background: var(--accent-fill); }
+.sc-progress .meter.sc-vote.met div { background: var(--ok); }
+.sc-vote > i { position: absolute; top: -2px; bottom: -2px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--muted); }
 .ns-ws-box > label.field { margin-top: 2px; }
 .sc-copied > span { flex: none; }
 .session-card .sc-warn.link { background: none; border: none; padding: 0; cursor: pointer; text-align: left; }

@@ -877,3 +877,75 @@ async def test_the_result_lists_the_jobs_still_running(tmp_path, monkeypatch):
     finally:
         await conn.close()
     assert kids.check() == [], "child processes were left running"
+
+
+# ---- a thread session in print mode (docs/SPEC.md §22.8 "Print mode") ----------------------------------------------
+def test_the_progress_summary_line_of_posts_and_comments():
+    post = {"id": 9, "kind": "post", "title": "Lexer first", "author": "Anna Smith"}
+    assert printmode._summary_line({"type": "post.created", "actor": "Anna Smith", "data": {"post": post}}) == (
+        "· post.created Anna Smith: #9 Lexer first")
+    comment = {"id": 31, "post_id": 9, "author": "Bob", "text": "Agreed,\n  with one change"}
+    assert printmode._summary_line({"type": "post.comment", "actor": "Bob",
+                                    "data": {"post_id": 9, "comment": comment}}) == (
+        "· post.comment Bob: #9 c31: Agreed, with one change")
+    # the board's task.comment carries a discussion post (no title): its line is as before the thread mode
+    board = {"type": "task.comment", "actor": "Anna", "data": {"task_id": 3, "post": {"id": 57, "task_id": 3,
+                                                                                       "text": "x"}}}
+    assert printmode._summary_line(board) == "· task.comment Anna"
+
+
+def test_the_thread_texts_of_print_mode():
+    assert "u_thread_quiet" in printmode.STDERR_NOTES
+    assert printmode.TEXTS["en"]["hub_answers"] == (
+        'This session was created through the HTTP API with answers = "auto": the hub itself answers the agents\' '
+        "questions (and, on the task board, reviews) in your place, so this run sends no automatic replies.")
+    assert printmode.TEXTS["ru"]["hub_answers"] == (
+        'Эта сессия создана через HTTP API с answers = "auto": на вопросы агентов (и, на доске задач, ревью) за вас '
+        "отвечает сам хаб, этот запуск автоответов не шлет.")
+
+
+async def test_a_thread_run_says_the_quiet_team_once_and_ends_with_the_vote(launch):
+    """A `-p` run of a new thread session: the user's u_thread_quiet goes to stderr once (the run keeps waiting),
+    and the vote on #1 that meets the rule ends the run with the generated decision summary."""
+    holder: dict[str, Any] = {}
+
+    from dreamteam.forum import vote_line
+    from dreamteam.models import USER
+
+    def voter(system, messages, tools):
+        if holder.get("voted"):
+            return call("wait")
+        swarm = next(iter(holder["conn"].manager.swarms.values()))
+        for _ in range(2):   # the same notice twice: told once
+            swarm.notify(USER, "u_thread_quiet", vote=vote_line(swarm.language, swarm.forum.goal_vote()),
+                         elapsed="10 min")
+        holder["voted"] = True
+        return call("vote", target="#1", value="like")
+
+    conn = await launch(voter)
+    holder["conn"] = conn
+    code, out, err = await run(conn, f"Write a {MARK}", overrides={"swarm": {"mode": "thread"}})
+    assert code == 0, err
+    sessions = await conn.client.sessions()
+    assert sessions[0]["mode"] == "thread" and sessions[0]["goal"]["status"] == "done"
+    assert sessions[0]["goal"]["decision"]["rule"] == "democracy"
+    assert out.strip() == sessions[0]["goal"]["summary"]
+    quiet = prompts.t("en", "u_thread_quiet", vote="X", elapsed="10 min").split("X")[0].strip()
+    assert err.count(quiet) == 1, err
+
+
+async def test_a_verbose_thread_run_prints_the_goal_vote_under_a_vote_on_1(launch):
+    """`-p --verbose` (docs/SPEC.md §22.8 "TUI", render.event through print mode): a vote on #1 is followed by the
+    vote line of the refreshed snapshot's goal_vote, as in the TUI."""
+    def voter(system, messages, tools):
+        if any(m.get("role") == "tool" for m in messages):
+            return call("wait")
+        return call("vote", target="#1", value="like")
+
+    conn = await launch(voter)
+    code, out, err = await run(conn, f"Write a {MARK}", overrides={"swarm": {"mode": "thread"}}, verbose=True)
+    assert code == 0, err
+    lines = err.splitlines()
+    vote = next(i for i, line in enumerate(lines) if line.startswith("  ⎿  Goal vote (#1, democracy):"))
+    assert "#1" in lines[vote - 1] and "like" in lines[vote - 1], err
+    assert lines[vote].startswith("  ⎿  Goal vote (#1, democracy): 1 of 1 for, 0 against"), err

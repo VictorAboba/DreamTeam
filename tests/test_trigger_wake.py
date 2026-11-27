@@ -62,6 +62,7 @@ async def test_five_edits_in_one_turn_wake_the_trigger_owner_once(tmp_path):
         editor, owner = [m["name"] for m in swarm.members()]
         (swarm.workspace.root / "docs").mkdir()
         (swarm.workspace.root / "docs" / "AUDIT.md").write_text("v0", encoding="utf-8")
+        swarm.workspace.read("docs/AUDIT.md", actor=editor)   # the editor has read it (docs/SPEC.md §7.3)
         trig = swarm.triggers.create(owner, "file_changed('docs/AUDIT.md')", once=False)
         who.update(editor=editor, edits=0)
         swarm.mail.send(USER, editor, "Edit the audit.")
@@ -104,6 +105,7 @@ async def test_a_last_edit_with_wait_in_one_response_fires_once(tmp_path, settle
         editor, owner = [m["name"] for m in swarm.members()]
         (swarm.workspace.root / "docs").mkdir()
         (swarm.workspace.root / "docs" / "AUDIT.md").write_text("v0", encoding="utf-8")
+        swarm.workspace.read("docs/AUDIT.md", actor=editor)   # the editor has read it (docs/SPEC.md §7.3)
         trig = swarm.triggers.create(owner, "file_changed('docs/AUDIT.md')", once=False)
         who.update(editor=editor, edits=0)
         swarm.mail.send(USER, editor, "Edit the audit.")

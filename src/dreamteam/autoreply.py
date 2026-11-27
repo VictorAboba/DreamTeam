@@ -23,7 +23,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable
 
-from .db import loads, reading_file
+from .db import loads, reading_file, session_mode
 from .models import API_VIA, USER, AgentStatus, Status, ToolError
 from .prompts import CLARIFY_TAG
 
@@ -96,6 +96,9 @@ QUESTION_DROPPED = ("SELECT 1 FROM events WHERE type IN ('swarm.resumed', 'swarm
                     "AND json_extract(data, '$.question.outcome') = 'dropped' LIMIT 1")
 # `name` has created a task since the planning card with id `task_id`: it plans already (name, task_id)
 PLANS = "SELECT 1 FROM tasks WHERE created_by = ? AND id > ? LIMIT 1"
+# the thread mode's PLANS (docs/SPEC.md §22.4): `name` has commented on #2 since its last write (name, 2, since)
+PLANS_THREAD = "SELECT 1 FROM post_comments WHERE author = ? AND post_id = ? AND ts >= ? LIMIT 1"
+PLAN_POST = 2   # forum.PLAN_POST: a thread session's #2, whose data names the clarify asker (docs/SPEC.md §22.4)
 # LAST_TO for every sender to the user (since 0): (sender, newest id) rows, read through the inbox_recipient index;
 # (USER,)
 _LAST_TO_USER = ("SELECT m.sender, MAX(m.id) FROM messages m JOIN inbox i ON i.message_id = m.id "
@@ -122,7 +125,8 @@ _REQUEST_ID = re.compile(r"(?:(?P<kind>[qm])(?P<mid>[1-9][0-9]{0,18})"
 ID_MAX = (1 << 63) - 1   # the largest id SQLite holds (a message's, a task's, an event's)
 
 
-def planner_question(scalar: Callable[[str, tuple], Any], name: str, task_id: int, since: Any) -> int | None:
+def planner_question(scalar: Callable[[str, tuple], Any], name: str, task_id: int, since: Any, *,
+                     plans: str = PLANS) -> int | None:
     """The question the clarify planner `name` waits for the user to answer, about its clarify planning card (`task_id`,
     created at `since`): the id of `name`'s last message to the user since the card was created, when it is newer than
     the user's last message to `name` (named or through "all"), `name` has created no task since the card (it plans
@@ -130,8 +134,9 @@ def planner_question(scalar: Callable[[str, tuple], Any], name: str, task_id: in
     pause in its place: n_question_unanswered told the planner so). None otherwise. Both bounds keep an old message (an
     earlier goal) or a note to the user after planning started from counting for ever. `scalar(sql, params)`: the first
     value of a query (Database.scalar). Swarm.asks_user (the nag guard, the snapshot's `clarify_wait`) and the requests
-    use it, so they cannot drift apart."""
-    if scalar(PLANS, (name, task_id)):
+    use it, so they cannot drift apart. `plans`: the "plans already" query (PLANS_THREAD in a thread session, whose
+    `task_id` is #2 and whose parameters add `since`)."""
+    if scalar(plans, (name, task_id) if plans is PLANS else (name, task_id, since)):
         return None
     asked = scalar(LAST_TO, (name, USER, since))
     if not asked or asked <= (scalar(LAST_TO, (USER, name, since)) or 0):
@@ -172,7 +177,10 @@ def requests_from(conn: sqlite3.Connection, *, clarify: bool) -> list[dict[str, 
     swarm's, under its Database's lock, or a file's: nothing is written), oldest first:
     - `question` q<message id>: the question that holds a question pause (`pauses_swarm` true), and, with `clarify`
       (the session's [swarm] clarify), the last message to the user of a clarify planner that waits for the user's
-      answers (`pauses_swarm` false; planner_question, the snapshot's `clarify_wait`); the full text;
+      answers (`pauses_swarm` false; planner_question, the snapshot's `clarify_wait`); the full text. In a thread
+      database (db.session_mode, read before any query of the forum tables) the planner is the kickoff asker of a
+      clarify #2 (its data's `asker`, docs/SPEC.md §22.9 "Requests"), with the bounds counted from #2's last write
+      (PLANS_THREAD); none while there is no #2;
     - `message` m<message id>: the last message of each active member to the user that no message of the user to that
       member followed (one per member), unless it is listed as a question; retired members' never;
     - `review` r<task id>-<event id>: a task in review for the user; the event is the newest task.updated that put it
@@ -201,7 +209,17 @@ def requests_from(conn: sqlite3.Connection, *, clarify: bool) -> list[dict[str, 
             mid = paused["message_id"]
             questions.add(mid)
             found.append(_message_request("question", mid, paused["asker"], message(mid), pauses_swarm=True))
-        if clarify:
+        if clarify and session_mode(conn) == "thread":
+            plan = cur.execute("SELECT data, created_at, edited_at FROM posts WHERE id = ?", (PLAN_POST,)).fetchone()
+            data = _json(plan["data"], {}) if plan is not None else {}
+            asker = data.get("asker") if isinstance(data, dict) and data.get("clarify") else None
+            if isinstance(asker, str) and asker:
+                since = plan["edited_at"] or plan["created_at"]
+                asked = planner_question(scalar, asker, PLAN_POST, since, plans=PLANS_THREAD)
+                if asked is not None and asked not in questions:
+                    questions.add(asked)
+                    found.append(_message_request("question", asked, asker, message(asked), pauses_swarm=False))
+        elif clarify:
             open_marks = ", ".join("?" * len(Status.OPEN))
             cards = cur.execute(f"SELECT id, assignee, tags, created_at FROM tasks WHERE assignee IS NOT NULL "
                                 f"AND status IN ({open_marks}) ORDER BY id", tuple(sorted(Status.OPEN))).fetchall()
@@ -505,6 +523,6 @@ class SessionAutoReply:
 
 
 __all__ = ["AUTO_REPLY", "AUTO_REVIEW", "AUTO_REPLY_MAX", "BLOCKING_KINDS", "ID_MAX", "JOURNAL_BATCH", "LAST_TO",
-           "PLANS", "QUESTION_DROPPED", "REQUEST_KINDS", "SessionAutoReply", "blocking_requests", "follow_journal",
-           "hub_answers", "journal_head", "listed_requests", "planner_question", "read_requests", "reply_text",
-           "request_key", "requests_from", "requests_of", "review_key", "review_text", "wants_reply"]
+           "PLANS", "PLANS_THREAD", "QUESTION_DROPPED", "REQUEST_KINDS", "SessionAutoReply", "blocking_requests",
+           "follow_journal", "hub_answers", "journal_head", "listed_requests", "planner_question", "read_requests",
+           "reply_text", "request_key", "requests_from", "requests_of", "review_key", "review_text", "wants_reply"]

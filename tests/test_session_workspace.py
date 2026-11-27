@@ -1190,6 +1190,7 @@ async def test_a_required_filter_the_hub_does_not_run_never_blocks_the_folder(tm
         sid = (await manager.create("Crypt", start=False, workspace=str(project)))["id"]
         swarm = await manager.start(sid)
         member = swarm.members()[0]["name"]
+        swarm.workspace.read("secret/key.txt", actor=member)   # an existing file: read first (docs/SPEC.md §7.3)
         await swarm.workspace.write(member, "secret/key.txt", "changed by an agent\n")
         await swarm.workspace.write(member, "notes.txt", "n\n")
         await manager.stop(sid)

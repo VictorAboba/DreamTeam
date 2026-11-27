@@ -129,10 +129,18 @@ const I18N = {
     f_network: "Без интернета для агентов", sw_network: "Интернет для команд агентов", net_on: "есть", net_off: "нет",
     net_badge: "Без интернета",
     api_badge: "API",
-    api_hint_auto: "Создана через HTTP API (/api/v1): это задание клиента API. На вопросы и ревью агентов за вас отвечает сам хаб. dreamteam -c её не выбирает.",
+    api_hint_auto: "Создана через HTTP API (/api/v1): это задание клиента API. На вопросы агентов (и, на доске задач, ревью) за вас отвечает сам хаб. dreamteam -c ее не выбирает.",
     api_hint_manual: "Создана через HTTP API (/api/v1): это задание клиента API. На вопросы агентов отвечает клиент API (или вы на доске). dreamteam -c её не выбирает.",
     f_clarify: "Сначала уточнить цель",
     f_clarify_hint: "планировщик сначала задаст вам вопросы по неясным местам цели, остальные агенты подождут план и не потратят токены; важный вопрос агента поставит весь рой на паузу до вашего ответа",
+    // the work mode of a new session and the goal rule of a thread one (docs/SPEC.md §22.8)
+    f_mode: "Режим работы", f_mode_board: "Доска задач", f_mode_board_hint: "задачи с исполнителями, статусами и ревью",
+    f_mode_thread: "Тред",
+    f_mode_thread_hint: "без заданной структуры: агенты публикуют объявления, обсуждают, голосуют и подписываются; цель решается голосованием",
+    f_rule: "Решение о цели", f_rule_democracy: "Демократия — больше половины ИИ-агентов за",
+    f_rule_veto: "Вето — все ИИ-агенты за, никто против",
+    f_clarify_thread_hint: "агенты сначала спросят вас о неясных местах цели в обсуждении #2; важный вопрос агента поставит весь рой на паузу до вашего ответа",
+    thread_badge: "Тред", goal_votes: "Голоса за цель: {for} из {counted} (нужно {needed})", posts_n: "объявлений: {n}",
     net_hint_docker: "Команды агентов, их фоновые процессы и MCP-серверы идут от отдельного пользователя, чью сеть закрывает файрвол контейнера. LLM и localhost работают.",
     net_hint_netns: "Команды агентов, их фоновые процессы и MCP-серверы работают в общем для них сетевом пространстве Linux, где есть только свой localhost: сервер, запущенный одной командой, виден другим, а localhost самой машины — нет. LLM работает.",
     net_hint_env: "Здесь это не строгая изоляция: прокси указывают на закрытый порт, pip, uv, npm и git переведены в офлайн, удалённые MCP-серверы не подключаются, но программа, которая этого не учитывает (сырой сокет, веб-команды Windows PowerShell 5.1), выйдет в сеть. Строго — в Docker (dreamteam sandbox) и на Linux.",
@@ -230,9 +238,9 @@ const I18N = {
     sw_budget_notice_hint: "При этой доле потраченного бюджета агенты и вы получаете одно предупреждение " +
       "(0.8 — 80 %); 0 или 1 — без него.",
     sw_review: "Независимое ревью задач",
-    sw_review_hint: "Задачу агента принимает другой агент, а если больше некому — вы. Выключите для дешёвых прогонов: тогда задача без ревьюера сразу готова.",
+    sw_review_hint: "Задачу агента принимает другой агент, а если больше некому — вы. Выключите для дешевых прогонов: тогда задача без ревьюера сразу готова. Только на доске задач.",
     sw_crew_review: "Проверять групповую задачу целиком",
-    sw_crew_review_hint: "Завершённую владельцем групповую задачу проверяет, по возможности, агент вне её направлений: сочетаются ли они; будет ли ревью вообще, решает независимое ревью. Выключено — без второго ревью, ведь каждое направление уже проверено: задача готова, как только владелец её завершит, даже с назначенным ревьюером.",
+    sw_crew_review_hint: "Завершенную владельцем групповую задачу проверяет, по возможности, агент вне ее направлений: сочетаются ли они; будет ли ревью вообще, решает независимое ревью. Выключено — без второго ревью, ведь каждое направление уже проверено: задача готова, как только владелец ее завершит, даже с назначенным ревьюером. Только на доске задач.",
     sw_clarify: "Сначала уточнять цель",
     sw_clarify_hint: "По умолчанию для новых сессий: планировщик сначала задаёт вам вопросы, а важный вопрос агента ставит рой на паузу до вашего ответа. В dreamteam -p с автоответами не действует: там всё как раньше.",
     r_builtin: "встроенная", r_custom: "своя", r_customized: "изменена", r_hidden: "скрыта", r_name: "Название",
@@ -256,6 +264,12 @@ const I18N = {
     ag_file_max_wait_hint: "у файла, который всё ещё меняется, — через столько секунд после первого изменения; 0 — без предела",
     ag_trigger_wake: "Повторяющийся триггер будит не чаще, с",
     ag_trigger_wake_hint: "Срабатывания между пробуждениями приходят одним уведомлением; 0 — будить при каждом",
+    ag_digest: "Сводка подписок, с",
+    ag_digest_hint: "Только в режиме треда: бездействующий агент получает накопленные уведомления своих подписок одним пробуждением, не чаще раза в столько секунд (не меньше 10).",
+    sw_mode: "Режим работы",
+    sw_mode_hint: "Выбирается при создании сессии: уже созданные сессии сохраняют свой режим.",
+    sw_goal_rule: "Решение о цели", sw_rule_democracy: "Демократия", sw_rule_veto: "Вето",
+    sw_goal_rule_hint: "Только в режиме треда. Демократия — цель достигнута, когда «за» больше половины ИИ-агентов; вето — все «за», никого «против». Новая сессия получает это значение, в созданной его меняют в ее ⚙ настройках.",
     sh_program: "Оболочка", sh_timeout: "Ожидание команды по умолчанию, с", sh_max_timeout: "Наибольший тайм-аут команды, с",
     sh_max_timeout_hint: "столько же от запуска живёт команда, ушедшая в фон по тайм-ауту; само ожидание ИИ-агента ограничено следующим полем, по MCP — 600 с",
     sh_fg_max: "ИИ-агент ждёт команду не дольше, с", sh_fg_max_hint: "дальше она работает в фоне",
@@ -472,10 +486,17 @@ const I18N = {
     f_network: "No internet for the agents", sw_network: "Internet for the agents' commands", net_on: "on", net_off: "off",
     net_badge: "No internet",
     api_badge: "API",
-    api_hint_auto: "Created through the HTTP API (/api/v1): a job of an API client. The hub itself answers the agents' questions and reviews in your place. dreamteam -c does not pick it.",
+    api_hint_auto: "Created through the HTTP API (/api/v1): a job of an API client. The hub itself answers the agents' questions (and, on the task board, reviews) in your place. dreamteam -c does not pick it.",
     api_hint_manual: "Created through the HTTP API (/api/v1): a job of an API client. The API client answers the agents' questions (or you, on the board). dreamteam -c does not pick it.",
     f_clarify: "Clarify the goal first",
     f_clarify_hint: "the planner first asks you about the unclear points of the goal while the other agents wait for the plan without spending tokens; an agent's critical question pauses the whole swarm until you answer",
+    f_mode: "Work mode", f_mode_board: "Task board", f_mode_board_hint: "tasks with owners, statuses and reviews",
+    f_mode_thread: "Thread",
+    f_mode_thread_hint: "no set structure: the agents post, discuss, vote and subscribe; the goal is decided by a vote",
+    f_rule: "Goal decision", f_rule_democracy: "Democracy: more than half of the AI agents for it",
+    f_rule_veto: "Veto: all AI agents for it, none against",
+    f_clarify_thread_hint: "the agents first ask you about the unclear points of the goal in the discussion #2; an agent's critical question pauses the whole swarm until you answer",
+    thread_badge: "Thread", goal_votes: "Goal votes: {for} of {counted} (needs {needed})", posts_n: "posts: {n}",
     net_hint_docker: "The agents' commands, their background jobs and MCP servers run as a separate user whose network the container's firewall closes. The LLM and localhost work.",
     net_hint_netns: "The agents' commands, their background jobs and MCP servers share a separate Linux network namespace that has only its own localhost: a server one command starts is reachable from the others, the machine's own localhost is not. The LLM works.",
     net_hint_env: "Not strict isolation here: proxies point at a closed port, pip, uv, npm and git are set offline and remote MCP servers are not connected, but a program that ignores this (a raw socket, Windows PowerShell 5.1's web cmdlets) still gets out. Strict in Docker (dreamteam sandbox) and on Linux.",
@@ -575,9 +596,9 @@ const I18N = {
     sw_budget_notice_hint: "At this share of the budget spent, the agents and you get one notice " +
       "(0.8 = 80 %); 0 or 1: none.",
     sw_review: "Independent review of tasks",
-    sw_review_hint: "An agent's task is approved by another agent, or by you when there is nobody else. Turn it off for cheap runs: a task without a reviewer is then done at once.",
+    sw_review_hint: "An agent's task is approved by another agent, or by you when there is nobody else. Turn it off for cheap runs: a task without a reviewer is then done at once. Task board only.",
     sw_crew_review: "Check a crew task as a whole",
-    sw_crew_review_hint: "A crew task its owner completed is checked, preferably by a member outside its directions, for how they fit together; whether there is a review at all follows independent review. Off: no second review, since each direction was reviewed already: the task is done once its owner completes it, even with a reviewer named.",
+    sw_crew_review_hint: "A crew task its owner completed is checked, preferably by a member outside its directions, for how they fit together; whether there is a review at all follows independent review. Off: no second review, since each direction was reviewed already: the task is done once its owner completes it, even with a reviewer named. Task board only.",
     sw_clarify: "Clarify the goal first",
     sw_clarify_hint: "The default of new sessions: the planner asks you first, and an agent's critical question pauses the swarm until you answer. No effect in dreamteam -p with automatic replies: it works as before.",
     r_builtin: "built-in", r_custom: "your own", r_customized: "changed", r_hidden: "hidden", r_name: "Name",
@@ -601,6 +622,12 @@ const I18N = {
     ag_file_max_wait_hint: "for a file that keeps changing: this long after its first change; 0 = no limit",
     ag_trigger_wake: "Repeating trigger wakes at most every, s",
     ag_trigger_wake_hint: "Fires in between arrive in one notice; 0 wakes at every fire",
+    ag_digest: "Subscription digest, s",
+    ag_digest_hint: "Thread mode only: an idle agent gets what its digest subscriptions gathered in one wake-up, at most once per this many seconds (at least 10).",
+    sw_mode: "Work mode",
+    sw_mode_hint: "Chosen when a session is created: existing sessions keep their mode.",
+    sw_goal_rule: "Goal decision", sw_rule_democracy: "Democracy", sw_rule_veto: "Veto",
+    sw_goal_rule_hint: "Thread mode only. Democracy: the goal is reached when more than half of the AI agents are for it; veto: all for, none against. A new session takes this value; an existing one changes it in its ⚙ settings.",
     sh_program: "Shell", sh_timeout: "Default wait for a command, s", sh_max_timeout: "Largest command timeout, s",
     sh_max_timeout_hint: "a command that went to the background at its timeout lives this long from its start; an AI agent's wait itself is capped by the next field, 600 s over MCP",
     sh_fg_max: "An AI agent waits for a command at most, s", sh_fg_max_hint: "then it goes on in the background",
@@ -973,6 +1000,20 @@ function apiBadge(s) {
   return `<span class="badge plain" title="${esc(t(s.answers === "auto" ? "api_hint_auto" : "api_hint_manual"))}">${esc(t("api_badge"))}</span>`;
 }
 
+/** A thread session's card line in place of the task bar (docs/SPEC.md §22.8): the vote on #1 («Голоса за цель: 2
+ * из 5 (нужно 3)», the rule in words as its tooltip; no bar while there is no vote) and the count of posts. */
+function threadProgress(s) {
+  const gv = s.goal_vote && typeof s.goal_vote === "object" ? s.goal_vote : null;
+  const posts = `<span>${esc(t("posts_n", { n: Number(s.posts) || 0 }))}</span>`;
+  if (!gv) return `<div class="sc-progress sc-thread">${posts}</div>`;
+  const pro = Array.isArray(gv.for) ? gv.for.length : 0, counted = Number(gv.counted) || 0, needed = Number(gv.needed) || 0;
+  const pct = counted ? Math.min(100, Math.round((100 * pro) / counted)) : 0;
+  const mark = counted ? Math.min(100, Math.round((100 * needed) / counted)) : 100;
+  const tip = esc(t(gv.rule === "veto" ? "f_rule_veto" : "f_rule_democracy"));
+  return `<div class="sc-progress sc-thread" title="${tip}"><div class="meter sc-vote${gv.met ? " met" : ""}"><div style="width:${pct}%"></div>`
+    + `<i style="left:${mark}%"></i></div><span>${esc(t("goal_votes", { for: pro, counted, needed }))}</span>${posts}</div>`;
+}
+
 function sessionCard(s) {
   const state = sessionState(s);
   const earlier = state === "earlier";   // listed and deleted only: no link, no Open, Start or Stop, no proposals
@@ -1002,10 +1043,11 @@ function sessionCard(s) {
       <span class="badge ${badgeCls}"${badgeTip}>${esc(asks ? t("st_question") : t("st_" + state))}</span>
       ${state === "running" && s.wrap_up ? `<span class="badge warn" title="${esc(t("st_wrap_up_hint"))}">${esc(t("st_wrap_up"))}</span>` : ""}
       ${s.network === "off" ? `<span class="badge warn" title="${esc(networkHint(H.isolation))}">${esc(t("net_badge"))}</span>` : ""}
-      ${apiBadge(s)}
+      ${s.mode === "thread" ? `<span class="badge plain">${esc(t("thread_badge"))}</span>` : ""}${apiBadge(s)}
     </div>
     ${goal}
-    <div class="sc-progress"><div class="meter"><div style="width:${pct}%"></div></div><span>${esc(t("tasks_done", { done: Number(tasks.done) || 0, total: Number(tasks.total) || 0 }))}</span></div>
+    ${s.mode === "thread" ? threadProgress(s)
+      : `<div class="sc-progress"><div class="meter"><div style="width:${pct}%"></div></div><span>${esc(t("tasks_done", { done: Number(tasks.done) || 0, total: Number(tasks.total) || 0 }))}</span></div>`}
     <div class="sc-meta">
       <span><i class="ic ic-users"></i><b>${Number(agents.total) || 0}</b> ${esc(t("agents_n"))}${agents.working ? ` · <b>${Number(agents.working) || 0}</b> ${esc(t("working_n"))}` : ""}</span>
       <span><i class="ic ic-coin"></i><b>${esc(budget)}</b></span>
@@ -1217,7 +1259,9 @@ function teamInner(id) {
     }
     const desc = role ? `<div class="team-desc" title="${esc(role.description)}">${esc(roleSummary(role.description))}</div>`
       : `<div class="team-desc hint">${esc(t(saved ? "tm_role_gone" : "team_custom_hint"))}</div>`;
-    // the order of a saved team's rows is who is woken first and who plans (the other composers fill a session's team)
+    // the order of a saved team's rows is who is woken first and, in a board session, who plans (in a thread session
+    // it only chooses the clarify asker, the first AI member; the wake order is shuffled per goal); the other composers
+    // fill a session's team
     const move = (kind, label, mark, end) => `<button class="btn small" type="button" ${attrs(kind, i)}${end ? " disabled" : ""}
       title="${esc(t(label))}" aria-label="${esc(t(label))}">${mark}</button>`;
     // no badge on a row with no catalog role: a gone one has no model, and the name typed in «Своя роль…» may be a role
@@ -1666,7 +1710,8 @@ async function newSessionModal() {
         <label class="field full"><span>${esc(t("f_title"))}</span><input id="ns-title" maxlength="120" placeholder="${esc(t("f_title_ph"))}"></label>
         <label class="field full"><span><i class="ic ic-goal"></i>${esc(t("f_goal"))} * <span class="hint">${esc(t("f_goal_hint"))}</span></span><textarea id="ns-goal" rows="4" placeholder="${esc(t("f_goal_ph"))}"></textarea></label>
         <label class="field full"><span>${esc(t("f_desc"))}</span><textarea id="ns-desc" rows="3" placeholder="${esc(t("f_desc_ph"))}"></textarea></label>
-        <label class="check full"><input type="checkbox" id="ns-clarify"${sw.clarify ? " checked" : ""}> <span>${esc(t("f_clarify"))} <span class="hint">${esc(t("f_clarify_hint"))}</span></span></label>
+        ${nsModeHtml(sw)}
+        <label class="check full"><input type="checkbox" id="ns-clarify"${sw.clarify ? " checked" : ""}> <span>${esc(t("f_clarify"))} <span class="hint">${esc(t(sw.mode === "thread" ? "f_clarify_thread_hint" : "f_clarify_hint"))}</span></span></label>
         ${nsWorkingFolderHtml()}
         <label class="field two"><span>${esc(t("f_model"))} <span class="hint">${esc(t("f_model_hint"))}</span></span><select id="ns-model">${modelOpts}</select></label>
         <label class="field"><span>${esc(t("f_lang"))}</span><select id="ns-lang">
@@ -1706,8 +1751,37 @@ async function newSessionModal() {
   loadSkills();
   $("#ns-run").addEventListener("change", (e) => { $("#ns-submit").textContent = t(e.target.checked ? "create_open" : "create"); });
   $("#ns-form").addEventListener("submit", submitNewSession);
+  for (const value of ["board", "thread"]) $(`#ns-mode-${value}`)?.addEventListener("change", nsModeSync);
   nsWorkingFolderWire();
   nsCopySandbox();
+}
+
+/** «Режим работы» of the new-session dialog (docs/SPEC.md §22.8), checked from the saved [swarm] mode, and «Решение о
+ * цели» under it, shown only while «Тред» is chosen, checked from the saved [swarm] goal_rule. */
+function nsModeHtml(sw) {
+  const thread = sw.mode === "thread";
+  const radio = (name, value, label, hint, checked) => `<label class="check"><input type="radio" name="${name}" `
+    + `id="${name}-${value}" value="${value}"${checked ? " checked" : ""}> <span>${esc(t(label))}`
+    + `${hint ? ` <span class="hint">${esc(t(hint))}</span>` : ""}</span></label>`;
+  return `<fieldset class="full ns-ws ns-mode" id="ns-mode"><legend>${esc(t("f_mode"))}</legend>
+          ${radio("ns-mode", "board", "f_mode_board", "f_mode_board_hint", !thread)}
+          ${radio("ns-mode", "thread", "f_mode_thread", "f_mode_thread_hint", thread)}
+        </fieldset>
+        <fieldset class="full ns-ws ns-rule" id="ns-rule"${thread ? "" : " hidden"}><legend>${esc(t("f_rule"))}</legend>
+          ${radio("ns-rule", "democracy", "f_rule_democracy", "", sw.goal_rule !== "veto")}
+          ${radio("ns-rule", "veto", "f_rule_veto", "", sw.goal_rule === "veto")}
+        </fieldset>`;
+}
+/** The chosen work mode ("board" | "thread") and goal rule ("democracy" | "veto"). */
+function nsMode() { const el = $('input[name="ns-mode"]:checked'); return el && el.value === "thread" ? "thread" : "board"; }
+function nsRule() { const el = $('input[name="ns-rule"]:checked'); return el && el.value === "veto" ? "veto" : "democracy"; }
+/** «Тред» chosen: the rule shows, and the clarify hint says what clarifying means there (questions in #2). */
+function nsModeSync() {
+  const thread = nsMode() === "thread";
+  const rule = $("#ns-rule");
+  if (rule) rule.hidden = !thread;
+  const hint = $("#ns-clarify")?.closest?.("label")?.querySelector(".hint");
+  if (hint) hint.textContent = t(thread ? "f_clarify_thread_hint" : "f_clarify_hint");
 }
 
 /** The block «Рабочая папка» of the new-session dialog (docs/SPEC.md §18.4 "Working folder"): one choice of three,
@@ -1979,6 +2053,14 @@ function sessionOverrides(v, form) {
   if (form.offline !== undefined && !!form.offline !== (sw.network === "off")) swarm.network = form.offline ? "off" : "on";
   // [swarm] clarify (docs/SPEC.md §3 "Clarify mode"): the same, as an explicit bool (false overrides a saved true)
   if (form.clarify !== undefined && !!form.clarify !== !!sw.clarify) swarm.clarify = !!form.clarify;
+  // the work mode (docs/SPEC.md §22.8): only when it differs from the saved default; the goal rule only with «Тред»
+  // chosen and when it differs (a rule picked while «Доска задач» is on is never sent; the server writes a thread
+  // session's mode and rule in any case)
+  if (form.mode === "board" || form.mode === "thread") {
+    if (form.mode !== (sw.mode === "thread" ? "thread" : "board")) swarm.mode = form.mode;
+    const rule = form.goalRule === "veto" ? "veto" : "democracy";
+    if (form.mode === "thread" && form.goalRule && rule !== (sw.goal_rule === "veto" ? "veto" : "democracy")) swarm.goal_rule = rule;
+  }
   return overrides;
 }
 
@@ -1991,7 +2073,7 @@ async function submitNewSession(e) {
   const overrides = sessionOverrides(savedDefaults(), {
     lang: $("#ns-lang").value, max: $("#ns-max").value, budget: $("#ns-budget").value, team: H.teams.ns,
     model: $("#ns-model").value, steps: $("#ns-steps").value, approval: $("#ns-approval").checked,
-    offline: $("#ns-offline").checked, clarify: $("#ns-clarify").checked,
+    offline: $("#ns-offline").checked, clarify: $("#ns-clarify").checked, mode: nsMode(), goalRule: nsRule(),
     pinned: !!$("#ns-team")?.value,   // (any edit of the rows resets the select)
   });
   const run = $("#ns-run").checked;
@@ -2498,6 +2580,11 @@ function renderSettings(fromServer) {
       field("sw_review", "swarm.independent_review", "bool", { full: true, hint: "sw_review_hint" }),
       field("sw_crew_review", "swarm.crew_review", "bool", { full: true, hint: "sw_crew_review_hint" }),
       field("sw_clarify", "swarm.clarify", "bool", { full: true, hint: "sw_clarify_hint" }),
+      // the work mode of new sessions and the goal rule a new thread session freezes (docs/SPEC.md §22.8)
+      field("sw_mode", "swarm.mode", "select", { options: [["board", t("f_mode_board")], ["thread", t("f_mode_thread")]],
+                                                 hint: "sw_mode_hint" }),
+      field("sw_goal_rule", "swarm.goal_rule", "select", { options: [["democracy", t("sw_rule_democracy")], ["veto", t("sw_rule_veto")]],
+                                                           hint: "sw_goal_rule_hint" }),
       field("sw_network", "swarm.network", "select", { full: true, options: [["on", t("net_on")], ["off", t("net_off")]],
                                                        hintText: networkHint(H.isolation) }),
     ]))}
@@ -2513,6 +2600,7 @@ function renderSettings(fromServer) {
       field("ag_file_settle", "agents.file_settle_seconds", "float", { min: 0, step: 10, hint: "ag_file_settle_hint" }),
       field("ag_file_max_wait", "agents.file_max_wait_seconds", "float", { min: 0, step: 30, hint: "ag_file_max_wait_hint" }),
       field("ag_trigger_wake", "agents.trigger_wake_seconds", "float", { min: 0, step: 30, hint: "ag_trigger_wake_hint" }),
+      field("ag_digest", "agents.digest_seconds", "float", { min: 10, step: 10, hint: "ag_digest_hint" }),
     ]))}
     ${section("shell", grid([
       field("sh_program", "shell.program", "select", { options: ["auto", "bash", "sh", "powershell", "pwsh", "cmd"].map((x) => [x, x]) }),
@@ -3118,6 +3206,8 @@ if (typeof module !== "undefined" && module.exports) {
     // the working folder of a new session, «Сменить папку…» (folders.js)
     FO, nsWorkingFolderHtml, nsWsChoice, nsWsShow, nsProjectSync, nsCopyRoots, changeFolderModal, onModalEscape,
     onModalBackdrop, findSession,
+    // a thread session (docs/SPEC.md §22.8): the dialog's work mode and goal rule, the card's vote line
+    nsModeHtml, nsMode, nsRule, nsModeSync, threadProgress,
   };
 } else if (typeof document !== "undefined") {
   init();

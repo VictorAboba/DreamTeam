@@ -672,6 +672,7 @@ def test_question_pause_rendering():
     left = ev("notification", None, recipient="user", kind="u_question_left", text="Анна Смирнова left the swarm")
     assert plain(render.event(ctx(lang="en"), left)) == "🔔 Анна Смирнова left the swarm"
     assert "u_question_left" in render._WARN_NOTES and "u_question" in render._QUIET_SKIP_NOTES
+    assert "u_goal_decided" in render._QUIET_SKIP_NOTES  # goal.completed shows the decision (docs/SPEC.md §22.4)
 
     report = plain(render.status_report(ctx(lang="en"), {"network": {"mode": "on"}, "clarify": True,
                                                         "question": "Анна Смирнова, #12: «Which colour?»",
@@ -839,6 +840,194 @@ def test_event_types_cover_the_server():
     agent_src = (src / "agent.py").read_text(encoding="utf-8")
     kinds = set(re.findall(r"self\._activity\(\"([a-z_]+)\"", agent_src))
     assert kinds and kinds <= set(render.ACTIVITY_KINDS), kinds - set(render.ACTIVITY_KINDS)
+
+
+def test_thread_events_by_verbosity():
+    """docs/SPEC.md §22.8: post.created at every verbosity; post.comment folded on one line from normal on; a vote on
+    #1 from normal on, the other votes, post.updated, subscription.changed and files.committed in verbose only."""
+    post = {"id": 9, "kind": "post", "title": "План", "text": "Весь текст", "author": ANNA}
+    created = ev("post.created", ANNA, post=post)
+    comment = ev("post.comment", BORIS, post_id=9, comment={"id": 31, "post_id": 9, "author": BORIS,
+                                                             "text": "Первая строка\nвторая", "reply_to": None})
+    reply = ev("post.comment", ANNA, post_id=9, comment={"id": 32, "post_id": 9, "author": ANNA, "text": "Да",
+                                                          "reply_to": 31})
+    goal_vote = ev("post.vote", BORIS, target="p1", voter=BORIS, value="like", likes=1, dislikes=0)
+    other_vote = ev("post.vote", BORIS, target="c31", voter=BORIS, value="dislike", likes=0, dislikes=1)
+    edited = ev("post.updated", ANNA, post=post, changes=["text"])
+    sub = ev("subscription.changed", ANNA, member=ANNA, op="created",
+             subscription={"id": 12, "kind": "post", "target": "9", "mode": "wake", "by": "", "auto": False})
+    committed = ev("files.committed", ANNA, kind="shell", commit="ab12", suspects=[ANNA],
+                   files=[{"path": "src/app.py", "change": "M"}, {"path": "b.txt", "change": "A"}])
+    q, n, v = ctx("quiet"), ctx(), ctx("verbose")
+    for c in (q, n, v):
+        assert plain(render.event(c, created)) == "📎 #9 План — Анна"
+    assert "Весь текст" not in plain(render.event(v, created))
+    assert plain(render.event(n, comment)) == "💬 Борис → #9: Первая строка…"
+    assert plain(render.event(n, reply)) == "💬 Анна → #9 ↳ c31: Да"
+    assert "вторая" in plain(render.event(v, comment))
+    assert plain(render.event(n, goal_vote)) == "↑ Борис ставит «нравится» #1"
+    assert plain(render.event(v, other_vote)) == "↓ Борис ставит «не нравится» c31"
+    assert plain(render.event(v, edited)) == "✎ #9 изменено — Анна"
+    assert plain(render.event(v, sub)) == "· Анна следит за #9 (wake)"
+    assert plain(render.event(v, committed)) == "✎ 2 файла: src/app.py, … — в коммите (shell) · Анна"
+    jobs = dict(committed, data=dict(committed["data"], kind="jobs j3, j5"))
+    assert plain(render.event(v, jobs)) == "✎ 2 файла: src/app.py, … — в коммите (процессы j3, j5) · Анна"
+    for e in (comment, goal_vote, other_vote, edited, sub, committed):
+        assert render.event(q, e) is None, e["type"]
+    for e in (other_vote, edited, sub, committed):
+        assert render.event(n, e) is None, e["type"]
+    assert plain(render.event(ctx(unicode=False), created)) == "# #9 План - Анна"
+
+
+def test_thread_mentions_and_the_users_forum_notices():
+    """docs/SPEC.md §22.8: the user's f_comment, f_reply and f_mention are not printed at normal and verbose (the
+    post or comment line says it, a mention highlighted); quiet, which has no comment lines, prints them;
+    u_thread_quiet is a warning line."""
+    q, n, v = ctx("quiet"), ctx(), ctx("verbose")
+    mention = ev("post.created", ANNA, post={"id": 9, "title": "Вопрос", "text": "@пользователь, что выбрать?",
+                                              "author": ANNA})
+    assert plain(render.event(n, mention)) == "📎 #9 Вопрос — Анна · упоминает вас"
+    assert plain(render.event(q, mention)) == "📎 #9 Вопрос — Анна · упоминает вас"
+    own = ev("post.created", "user", post={"id": 10, "title": "Мое", "text": "@user", "author": "user"})
+    assert plain(render.event(n, own)) == "📎 #10 Мое — вы"
+    word = ev("post.created", ANNA, post={"id": 11, "title": "Про user@host", "text": "почта: me@user", "author": ANNA})
+    assert "упоминает" not in plain(render.event(n, word))
+    comment = ev("post.comment", BORIS, post_id=9, comment={"id": 31, "post_id": 9, "author": BORIS,
+                                                             "text": "@User глянь", "reply_to": None})
+    assert plain(render.event(n, comment)) == "💬 Борис → #9 · упоминает вас: @User глянь"
+    assert plain(render.event(v, comment)).startswith("💬 Борис → #9 · упоминает вас: @User глянь")
+    assert render.event(q, comment) is None
+    for kind in ("f_comment", "f_reply", "f_mention"):
+        note = ev("notification", None, recipient="user", kind=kind, text=f"Анна: {kind}")
+        assert render.event(n, note) is None and render.event(v, note) is None, kind
+        assert plain(render.event(q, note)) == f"🔔 Анна: {kind}"
+    # post.updated is verbose only, also when the post named the user before the edit (a typo fix tells nobody)
+    edited = ev("post.updated", ANNA, post={"id": 9, "title": "Вопрос", "text": "@user ответь"}, changes=["text"])
+    n, v = ctx(), ctx("verbose")
+    assert render.event(n, edited) is None and render.event(q, edited) is None
+    assert plain(render.event(v, edited)) == "✎ #9 изменено — Анна"
+    assert render.event(n, dict(edited, data=dict(edited["data"], changes=["votes"]))) is None
+    # a mention the edit added: the forum's f_mention right after the post.updated is printed, highlighted
+    added = ev("notification", None, recipient="user", kind="f_mention", text="Анна упомянула вас в #9")
+    for c in (n, v):
+        render.event(c, edited)
+        assert plain(render.event(c, added)) == "🔔 Анна упомянула вас в #9"
+    render.event(n, comment)  # a comment's mention is said by its line again
+    assert render.event(n, added) is None
+    quiet = ev("notification", None, recipient="user", kind="u_thread_quiet", text="Уже 10 мин никто не работает")
+    assert "u_thread_quiet" in render._WARN_NOTES and "u_goal_decided" in render._QUIET_SKIP_NOTES
+    assert plain(render.event(n, quiet)) == "🔔 Уже 10 мин никто не работает"
+    decided = ev("notification", None, recipient="user", kind="u_goal_decided", text="Голосование завершило цель")
+    assert render.event(q, decided) is None and render.event(n, decided) is None
+
+
+def test_thread_tools_show_by_their_own_line_or_in_verbose():
+    """post_create, post_update and comment have their own line (ECHOED_TOOLS); subscribe, unsubscribe and vote show
+    in verbose only; a failed call always shows."""
+    assert {"post_create", "post_update", "comment"} <= render.ECHOED_TOOLS
+    for tool in ("post_create", "post_update", "comment", "subscribe", "unsubscribe", "vote"):
+        call = activity("tool_call", '{"post_id": 9}', tool=tool)
+        result = activity("tool_result", "Done.", tool=tool)
+        assert render.event(ctx(), call) is None and render.event(ctx(), result) is None, tool
+        assert plain(render.event(ctx("verbose"), call)).startswith(f"⏺ {ANNA} · {tool}(")
+        failed = activity("tool_result", "Error: No post #99", tool=tool, is_error=True)
+        assert "No post #99" in plain(render.event(ctx(), failed))
+    assert render.event(ctx(), activity("tool_call", "{}", tool="feed")) is not None
+
+
+def test_goal_panel_of_a_thread_session():
+    """/goal in a thread session adds #1's vote line (it names the rule), or the rule before #1 exists; a decided goal
+    says how; a board goal's panel is unchanged."""
+    goal = {"title": "Стих", "description": "", "status": "active"}
+    tally = {"rule": "democracy", "counted": 3, "for": [ANNA], "against": [BORIS], "needed": 2, "met": False}
+    text = plain(render.goal_panel(ctx(), goal, vote=tally, rule="democracy"))
+    assert "Голосование по цели (#1, демократия): за 1 из 3, против 1; нужно 2." in text
+    assert "Решение о цели" not in text
+    assert "Решение о цели: вето" in plain(render.goal_panel(ctx(), goal, rule="veto"))
+    veto = {**tally, "rule": "veto", "needed": 3}
+    assert "(#1, veto): 1 of 3 for, 1 against" in plain(render.goal_panel(ctx(lang="en"), goal, vote=veto))
+    by_vote = {"title": "Стих", "status": "done", "summary": "Готово",
+               "decision": {"rule": "democracy", "for": [ANNA, BORIS], "against": [], "counted": 3, "wrap_up": True}}
+    text = plain(render.goal_panel(ctx(), by_vote))
+    assert "✓ Цель достигнута" in text and "Готово" in text
+    assert "Цель достигнута голосованием (демократия): за 2 из 3 — Анна Смирнова, Борис Петров (в режиме " \
+           "завершения)" in " ".join(text.replace("│", " ").split())
+    # a summary generated from the vote opens with the decision line: the panel says it once
+    decided = {**by_vote, "summary": "Цель достигнута голосованием (демократия): за 2 из 3 — Анна Смирнова, Борис "
+                                     "Петров; против: —. Артефакты — общая рабочая папка.",
+               "decision": {**by_vote["decision"], "wrap_up": False}}
+    assert plain(render.goal_panel(ctx(), decided)).count("голосованием") == 1
+    by_user = {**by_vote, "decision": {"rule": "user", "for": [], "against": [], "counted": 3, "wrap_up": False}}
+    assert "Goal completed by the user's decision" in plain(render.goal_panel(ctx(lang="en"), by_user))
+    board = {"title": "Стих", "status": "done", "summary": "Готово"}
+    assert plain(render.goal_panel(ctx(), board)) == plain(render.goal_panel(ctx(), {**board, "decision": None}))
+    assert "голосованием" not in plain(render.goal_panel(ctx(), board))
+    # the vote line alone (on attach) and under a vote (`cont`); none without a tally
+    assert plain(render.goal_vote_line(ctx(), tally)) == "📌 Голосование по цели (#1, демократия): за 1 из 3, " \
+                                                         "против 1; нужно 2."
+    assert plain(render.goal_vote_line(ctx(), tally, cont=True)).startswith("  ⎿  Голосование по цели")
+    assert render.goal_vote_line(ctx(), None) is None and render.goal_vote_line(ctx(), {}) is None
+    assert render.goal_vote_text(ctx(), {"rule": 5, "for": None}).startswith("Голосование по цели (#1, демократия)")
+
+
+def test_feed_rows_and_post_view():
+    posts = [{"id": 1, "kind": "goal", "title": "Цель достигнута?", "author": None, "likes": 1, "dislikes": 0,
+              "comments": 0, "my_vote": None},
+             {"id": 2, "kind": "plan", "title": "Спланируем работу", "author": None, "likes": 0, "dislikes": 0,
+              "comments": 3, "my_vote": None},
+             {"id": 9, "kind": "post", "title": "Рифмы", "author": ANNA, "likes": 4, "dislikes": 1, "comments": 2,
+              "my_vote": "like"}]
+    rows = plain(render.feed_rows(ctx(), posts, 2))
+    assert rows.splitlines() == ["📌 #1 Цель достигнута? · нравится 1 · комментариев 0",
+                                 "📌 #2 Спланируем работу · нравится 0 · комментариев 3", "  … еще 1: /feed"]
+    assert "📎 #9 Рифмы — Анна · нравится 4 · не нравится 1 · комментариев 2 · ваш голос: нравится" in \
+        plain(render.feed_rows(ctx(), posts))
+    assert plain(render.feed_rows(ctx(), [])) == "  ⎿  Объявлений пока нет"
+    assert render.post_counts(ctx(), posts[2]) == "нравится 4 · комментариев 2"
+    assert plain(render.feed_text(ctx(lang="en"), "Feed: 2 posts.\n#1 \"Goal reached?\"\n#9 \"Rhymes\"")) == \
+        "📎 Feed: 2 posts.\n  #1 \"Goal reached?\"\n  #9 \"Rhymes\""
+
+    data = {"post": {"id": 9, "kind": "post", "title": "Рифмы", "text": "Какие **рифмы** брать?", "author": ANNA,
+                     "created_at": NOW, "edited_at": None, "likes": 1, "dislikes": 1, "comments": 3,
+                     "my_vote": "dislike"},
+            "comments": [{"id": 31, "author": BORIS, "text": "Перекрестные", "reply_to": None, "ts": NOW, "likes": 2,
+                          "dislikes": 0, "my_vote": "like"},
+                         {"id": 32, "author": "user", "text": "Согласен", "reply_to": 31, "ts": NOW, "likes": 0,
+                          "dislikes": 0, "my_vote": None},
+                         {"id": 33, "author": ANNA, "text": "Тогда так", "reply_to": 32, "ts": NOW, "likes": 0,
+                          "dislikes": 0, "my_vote": None}],
+            "votes": [{"voter": BORIS, "value": "like", "counted": False},
+                      {"voter": "user", "value": "dislike", "counted": False}]}
+    out = plain(render.post_view(ctx(), data))
+    lines = out.splitlines()
+    assert lines[0] == "📎 #9 Рифмы"
+    assert "Анна Смирнова · " in lines[1] and "нравится 1 · не нравится 1 · ваш голос: не нравится" in lines[1]
+    assert "Какие рифмы брать?" in out and "Нравится: Борис Петров" in out and "Не нравится: вы" in out
+    assert "Комментарии (3)" in out
+    c31 = next(line for line in lines if "c31" in line)
+    c32 = next(line for line in lines if "c32" in line)
+    c33 = next(line for line in lines if "c33" in line)
+    assert c31.startswith("  💬 c31 Борис Петров · ") and "↑2 ↓0 · ваш голос: нравится" in c31
+    assert c32.startswith("    💬 c32 вы · ") and c33.startswith("      💬 c33 Анна Смирнова · ")
+    assert lines[-1] == "Ответить: /comment 9 текст · /comment 9 cM текст · /like 9 · /like cM"
+    # later comments only (since_id): a reply to one not shown is at the top with its target
+    later = plain(render.post_view(ctx(), {**data, "comments": data["comments"][2:]}))
+    assert next(line for line in later.splitlines() if "c33" in line).startswith("  💬 c33 ") and "↳ c32" in later
+
+    goal = {"post": {"id": 1, "kind": "goal", "title": "Цель достигнута?", "text": "", "author": None,
+                     "created_at": NOW, "likes": 2, "dislikes": 0, "comments": 0, "my_vote": "like"},
+            "comments": [], "votes": [{"voter": ANNA, "value": "like", "counted": True},
+                                      {"voter": "user", "value": "like", "counted": False}],
+            "goal_vote": {"rule": "veto", "counted": 2, "for": [ANNA], "against": [], "needed": 2, "met": False}}
+    out = plain(render.post_view(ctx(), goal))
+    assert "система · " in out.splitlines()[1]
+    assert "Голосование по цели (#1, вето): за 1 из 2, против 0" in out and "За: Анна Смирнова; против: —" in out
+    assert "Показаны, но не учитываются: вы (нравится)" in out and "Комментариев пока нет" in out
+    assert "Нравится:" not in out
+    assert "No post #99" in plain(render.post_view(ctx(), {"error": "No post #99"}))
+    for odd in (None, {}, {"post": "x"}, {"post": {"id": 3}, "comments": [None, {"id": 4, "reply_to": 4}],
+                                          "votes": "x", "goal_vote": 7}):
+        assert isinstance(plain(render.post_view(ctx(), odd)), str)
 
 
 # ---- events: robustness ---------------------------------------------------------------------------
