@@ -81,6 +81,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     by_member TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, created_at REAL,
     UNIQUE (member, kind, target, by_member));
 CREATE INDEX IF NOT EXISTS subscriptions_match ON subscriptions(kind, target);
+CREATE TABLE IF NOT EXISTS read_marks (
+    member TEXT NOT NULL, target TEXT NOT NULL, version TEXT, ts REAL, PRIMARY KEY (member, target));
 INSERT INTO sqlite_sequence(name, seq) SELECT 'posts', 2
     WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'posts');
 """

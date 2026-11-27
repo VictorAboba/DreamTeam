@@ -11,7 +11,8 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable
 
-from ..models import USER, ToolError
+from .. import prompts
+from ..models import USER, ReadRefusal, ToolError
 
 if TYPE_CHECKING:
     from ..agent import AgentRuntime
@@ -420,6 +421,26 @@ def _other_mode(spec: ToolSpec, ctx: ToolContext) -> str:
     return texts["thread"].format(name=spec.name, hint=_NEAREST_BOARD.get(spec.name, "board"))
 
 
+def _fit_note(ctx: ToolContext, text: str, note: str, ignored: list[str]) -> str:
+    """The ignored-arguments note of a result that went through. An LLM agent's runtime cuts every result to
+    agents.tool_output_chars in its middle; a note that pushed the result past that would cut out of it what the
+    tool already counted as shown (the lines of `read_file`, the comments of `post_read`, the posts of `feed`:
+    their read marks, docs/SPEC.md §7.3, §22.11). So for a result within that limit the note gets shorter, without
+    `Usage:` and then without the names, and is left out when even that does not fit. A result over the limit is
+    cut anyway and keeps the note at its end; other callers receive the result whole."""
+    if not note or ctx.runtime is None:
+        return note
+    limit = int(ctx.swarm.config.agents.tool_output_chars)
+    if len(text) > limit:
+        return note
+    room = limit - len(text)
+    for candidate in (note, f"\n[Ignored unknown argument(s): {', '.join(ignored)}]",
+                      "\n[Ignored unknown argument(s)]"):
+        if len(candidate) <= room:
+            return candidate
+    return ""
+
+
 async def call_tool(ctx: ToolContext, name: str, args: dict[str, Any] | None) -> tuple[str, bool]:
     """Run a tool for `ctx.actor`. Returns (text, is_error); never raises for tool-level problems."""
     _load()
@@ -455,7 +476,12 @@ async def call_tool(ctx: ToolContext, name: str, args: dict[str, Any] | None) ->
     try:
         prepared = prepare_args(spec, args, usage=params, mode=mode)
         result = await spec.handler(ctx, prepared)
-        return (result if isinstance(result, str) else str(result)) + note, False
+        text = result if isinstance(result, str) else str(result)
+        return text + _fit_note(ctx, text, note, ignored), False
+    except ReadRefusal as exc:  # flag it for the rest of an LLM agent's response (docs/SPEC.md §7.3)
+        if ctx.runtime is not None and hasattr(ctx.runtime, "read_refused"):
+            ctx.runtime.read_refused = name
+        return f"Error: {exc}{note}", True
     except ToolError as exc:
         return f"Error: {exc}{note}", True
     except UnicodeEncodeError as exc:  # e.g. "\ud800" in a text stored by sqlite3 (UTF-8 only)
@@ -464,6 +490,16 @@ async def call_tool(ctx: ToolContext, name: str, args: dict[str, Any] | None) ->
     except Exception as exc:  # tool bugs must not kill the agent loop
         log.exception("tool %s failed", name)
         return f"Internal error in {name}: {type(exc).__name__}: {exc}", True
+
+
+def hold_after_refusal(ctx: ToolContext, key: str) -> None:
+    """Hold a call that a read-before-write refusal earlier in the same LLM response makes unsafe (docs/SPEC.md §7.3
+    "A `wait` after a refusal"): raises the ToolError of `prompts.TEXTS[key]` in the caller's language, with the
+    refused tool as `{tool}`, while `ctx.runtime.read_refused` is set (AgentRuntime._run_tools clears it at the start
+    of every response); does nothing otherwise, also for callers with no runtime (the hub, /api/act)."""
+    refused = getattr(ctx.runtime, "read_refused", None)
+    if refused:
+        raise ToolError(prompts.t(ctx.lang, key, tool=refused))
 
 
 _loaded = False

@@ -89,6 +89,9 @@ class AgentRuntime:
         self.stalled_at = 0.0
         self.llm_steps = 0  # LLM replies of this runtime's activations (swarm: the planning hint counts them)
         self.trace: Trace | None = None  # the trace of the running activation (docs/SPEC.md §16)
+        # the tool of a read-before-write refusal in the response being run (tools.call_tool sets it): the response's
+        # later wait, task_complete, goal_complete and like on #1 are held (docs/SPEC.md §7.3)
+        self.read_refused: str | None = None
         member = swarm.member(name) or {}
         self.language: str = member.get("language") or swarm.language
         self.system_prompt: str = member.get("system_prompt") or ""
@@ -128,7 +131,9 @@ class AgentRuntime:
 
     def _ended_mid_activation(self) -> bool:
         """True when the stored history stops inside an activation (the process died or the agent was
-        stopped while working): a finished one ends with an assistant reply or the result of `wait`."""
+        stopped while working): a finished one ends with an assistant reply or the result of a `wait` that ended
+        the turn. A `wait` result with is_error did not (held after a read-before-write refusal, arguments that did
+        not parse, a repaired `interrupted` result): the member decides again (docs/SPEC.md §7.3)."""
         row = self.swarm.db.one("SELECT msg FROM history WHERE agent = ? ORDER BY seq DESC LIMIT 1", (self.name,))
         if row is None:
             return False
@@ -136,7 +141,7 @@ class AgentRuntime:
         if last.get("role") == "assistant":
             return bool(last.get("tool_calls"))
         if last.get("role") == "tool":
-            return last.get("name") != "wait"
+            return last.get("name") != "wait" or bool(last.get("is_error"))
         return True
 
     # ---- control ------------------------------------------------------------------------------
@@ -595,6 +600,7 @@ class AgentRuntime:
     async def _run_tools(self, response: LLMResponse) -> None:
         limit = self.swarm.config.agents.tool_output_chars
         trace = self._tr
+        self.read_refused = None  # a read-before-write refusal holds calls of its own response only (§7.3)
         for call in response.tool_calls:
             span = trace.tool_start(call.id, call.name, call.arguments)
             if call.parse_error:

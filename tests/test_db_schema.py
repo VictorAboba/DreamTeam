@@ -67,6 +67,8 @@ def test_known_columns_are_what_a_fresh_database_and_tracer_create(tmp_path):
     assert {"kv.key", "events.data", "mcp_servers.approved_digest", "spans.usage", "history_archive.epoch",
             "jobs.tail"} <= known
     assert {f"{t}.{c}" for t, c, _ in ADDED_COLUMNS} <= known
+    # the read marks of posts and comments (docs/SPEC.md §22.11) are forum columns: thread databases only
+    assert {"read_marks.member", "read_marks.target", "read_marks.version", "read_marks.ts"} <= _FORUM_COLUMNS
     assert not any(name.startswith("sqlite_") for name in known)  # sqlite_sequence (AUTOINCREMENT) is SQLite's
     assert unknown_columns(path) == []
 

@@ -923,7 +923,8 @@ def test_texts_steer_agents_to_the_right_tools(lang):
 SHARED_KEYS = {"wake_header", "incoming_header", "reasons", "goal", "goal_none", "money", "my_jobs", "my_job",
                "my_job_silent", "job_silent", "notes", "notes_empty", "notes_unchanged", "msg", "msg_reply", "you",
                "instructions", "continue", "cut_off", "tools_added", "n_resumed", "n_restart", "n_step_limit",
-               "n_wrap_up_end", "n_lock_free", "n_network_on", "n_workspace_moved", "n_workspace_changed"}
+               "n_wrap_up_end", "n_lock_free", "n_network_on", "n_workspace_moved", "n_workspace_changed",
+               "wait_refused"}
 SHARED_PREFIXES = ("n_job_", "job_", "n_trigger", "trigger_file_", "n_mcp_", "skills_", "n_skill_", "deps_reason_")
 # the call sites that pass their key through mode_key (docs/SPEC.md §22.6 "Keys by mode")
 MODE_KEYED = ("n_budget_low", "n_network_off", "n_member_retired", "n_lock_wanted", "n_user_answer",
@@ -1032,7 +1033,7 @@ THREAD_PLACEHOLDERS = {
     "n_goal_updated_thread": {"by", "title", "description"}, "n_goal_reopened_thread": {"title", "comment"},
     "n_goal_decided": {"rule", "for", "against"}, "n_wrap_up_votes_cleared": set(),
     "n_thread_quiet": {"vote", "jobs"}, "n_thread_quiet_wrap_up": {"vote", "jobs"}, "thread_quiet_jobs": {"jobs"},
-    "u_goal_decided": {"summary"}, "u_thread_quiet": {"elapsed", "vote"},
+    "u_goal_decided": {"summary"}, "u_thread_quiet": {"elapsed", "vote"}, "vote_refused": {"tool"},
 }
 
 
@@ -1046,7 +1047,8 @@ def test_thread_texts_have_their_placeholders_and_no_dotted_letter():
             assert "ё" not in text.lower(), (lang, key)
             # a thread text names no board-only tool (R0′ per mode, docs/SPEC.md §22.5)
             assert not code_idents(text) & BOARD_ONLY and "task_" not in text, (lang, key)
-            assert not re.search(r"`\{", text), (lang, key)   # no path or id in backticks
+            # no path or id in backticks (the held like's `{tool}` is the name of the refused tool, §7.3)
+            assert not re.search(r"`\{(?!tool\}`)", text), (lang, key)
     # the system posts address the members as «вы», the notices as «ты»
     ru = prompts.TEXTS["ru"]
     assert "Ставьте «нравится»" in ru["post_goal_text"] and "Обсудите здесь" in ru["post_plan_text"]
@@ -1182,6 +1184,107 @@ def test_system_prompt_takes_the_mode():
                                                                                             **SYSTEM_KW)
 
 
+# ------------------------------------------------------- read before write (docs/SPEC.md §7.3, §22.11)
+FILE_PINS = {
+    "en": ("`write_file` or `edit_file` of an existing file is refused if it changed since you last read or wrote it, "
+           "or you never read it", "`write_file` of a long file needs every line read"),
+    "ru": ("`write_file` или `edit_file` существующего файла не пройдет, если он изменился с тех пор, как ты его "
+           "читал(а) или писал(а), или ты его не читал(а)", "для `write_file` длинного файла нужно прочитать все его "
+           "строки"),
+}
+CLAIM_PINS = {
+    "en": ("start only once that comment went through", "top-level comment (no reply_to)",
+           "Send the claim alone in its response", "claim it as rule 3 says"),
+    "ru": ("начинай, только когда комментарий прошел", "комментарием верхнего уровня (без reply_to)",
+           "Отправь заявку отдельным ответом", "заяви о ней, как сказано в правиле 3"),
+}
+# the calls held after a read-before-write refusal in the same response: key -> (mode set, the tool it names)
+HELD_TEXTS = {"wait_refused": (None, "wait"), "complete_refused": ("board", "task_complete"),
+              "goal_complete_refused": ("board", "goal_complete"), "vote_refused": ("thread", "vote")}
+
+
+def test_held_call_texts():
+    """wait_refused (shared), complete_refused and goal_complete_refused (board), vote_refused (thread): one {tool}
+    placeholder, the same backticked tool in en and ru, no dotted letter, the SPEC's wording."""
+    for key, (mode, tool_name) in HELD_TEXTS.items():
+        assert key_mode(key) == mode, key
+        for lang in LANGS:
+            text = prompts.TEXTS[lang][key]
+            assert placeholders(text) == {"tool"}, (lang, key)
+            assert code_idents(text) == {tool_name}, (lang, key)
+            assert chr(0x451) not in text.lower(), (lang, key)
+            assert f"`{tool_name}`" in prompts.t(lang, key, tool="edit_file") and "`edit_file`" in prompts.t(
+                lang, key, tool="edit_file")
+    t = prompts.t
+    assert t("en", "wait_refused", tool="edit_file") == (
+        "Not waiting: your `edit_file` above was refused because of what you had not read. Decide on it first (send "
+        "it again or drop it), then call `wait`.")
+    assert t("ru", "wait_refused", tool="comment") == (
+        "Не жду: твой вызов `comment` выше отклонен из-за того, чего ты не читал(а). Сначала реши, как с ним быть "
+        "(отправь снова или откажись), затем вызови `wait`.")
+    assert t("en", "complete_refused", tool="write_file") == (
+        "Not completed: your `write_file` above was refused because of what you had not read, so the task may lack "
+        "that change. Decide on it first (send it again or drop it), then call `task_complete`.")
+    assert t("en", "goal_complete_refused", tool="write_file").endswith(
+        "so the goal may lack that change. Decide on it first (send it again or drop it), then call `goal_complete`.")
+    assert t("en", "vote_refused", tool="comment") == (
+        "Not voted: your `comment` above was refused because of what you had not read, so the goal may lack that "
+        "change. Decide on it first (send it again or drop it), then call `vote` on #1.")
+    assert t("ru", "vote_refused", tool="comment").endswith("затем вызови `vote` для #1.")
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_system_prompts_teach_read_before_write(lang):
+    """The file rule's pinned sentences are in all four system prompts (the board's rule 4, the thread's rule 3); the
+    thread prompts claim first and start after the claim went through, and no longer say to start at once."""
+    for system in (SYSTEMS[lang], THREAD_SYSTEMS[lang]):
+        for pin in FILE_PINS[lang]:
+            assert pin in system, pin
+    board_rule = next(line for line in SYSTEMS[lang].splitlines() if line.startswith("4. "))
+    assert FILE_PINS[lang][0] in board_rule
+    marks = {"en": ("reread the file). Before you overwrite or edit a file, read it:",
+                    "so decide again whether your change still fits it. If a contract"),
+             "ru": ("перечитай файл). Прежде чем перезаписать или править файл, прочитай его:",
+                    "так что реши заново, подходит ли ему еще твое изменение. Если контракт")}[lang]
+    for mark in marks:
+        assert mark in board_rule, mark
+    if lang == "ru":   # the new sentence uses е, although the rest of SYSTEM_RU keeps the dotted letter
+        sentence = board_rule[board_rule.index("Прежде чем перезаписать"):board_rule.index("Если контракт")]
+        assert chr(0x451) not in sentence
+    thread = THREAD_SYSTEMS[lang]
+    rule3 = next(line for line in thread.splitlines() if line.startswith("3. "))
+    rule2 = next(line for line in thread.splitlines() if line.startswith("2. "))
+    for pin in CLAIM_PINS[lang][:3]:
+        assert pin in rule3, pin
+    assert CLAIM_PINS[lang][3] in rule2
+    for pin in FILE_PINS[lang]:
+        assert pin in rule3, pin
+    old = {"en": "can start at once", "ru": "можно начинать сразу"}[lang]
+    assert old not in thread
+    kickoff = prompts.TEXTS[lang]["n_kickoff_thread"]
+    assert {"en": "start it once your comment went through", "ru": "начинай это, когда комментарий прошел"}[lang] \
+        in kickoff
+    assert {"en": "Start at once", "ru": "Сразу начинай"}[lang] not in kickoff
+
+
+def test_hub_instructions_teach_read_before_write():
+    from dreamteam.hub_mcp import INSTRUCTIONS, INSTRUCTIONS_THREAD
+
+    board, thread = " ".join(INSTRUCTIONS.split()), " ".join(INSTRUCTIONS_THREAD.split())
+    assert ("As a member, `write_file` and `edit_file` of an existing file are refused while it changed since you "
+            "last read or wrote it, or you never read it (`write_file` of a long file needs every line read: else use "
+            "`edit_file`); the refusal shows the current content and counts as reading it (a long file it cannot "
+            "show: read that with `read_file`), so a retry passes.") in board
+    for words in ("`comment`, `post_update` and `post_create` are refused while the post or the feed has news you "
+                  "have not read", "`write_file` / `edit_file` of an existing file while it changed since you last "
+                  "read or wrote it", "`write_file` of a long file needs every line read",
+                  "claim work in a top-level comment (no `reply_to`) on the post it belongs to",
+                  "start it only once that comment went through", "The user (no `as_agent`) is never refused."):
+        assert words in thread, words
+    for text in (INSTRUCTIONS, INSTRUCTIONS_THREAD):
+        assert all(len(line) <= 120 for line in text.splitlines())
+
+
 # ------------------------------------------------------------------- end to end, in Russian
 @pytest.fixture
 def fast_scheduler(monkeypatch):
@@ -1281,3 +1384,28 @@ async def test_russian_swarm_gets_russian_guidance_and_reaches_the_goal(tmp_path
     finally:
         await swarm.stop()
         swarm.close()
+
+
+def test_the_forum_refusal_texts():
+    """forum.UNREAD_TEXTS (docs/SPEC.md §22.11): the same keys, placeholders and backticked identifiers in en and ru,
+    only real tools of the thread revision 6, no dotted letter in ru, and the SPEC's wording."""
+    from dreamteam.forum import UNREAD_TEXTS
+
+    assert set(UNREAD_TEXTS) == set(LANGS) and set(UNREAD_TEXTS["en"]) == set(UNREAD_TEXTS["ru"]) == {
+        "comment_unread", "update_unread", "create_unread", "news_post", "news_edited", "news_comments",
+        "news_thread"}
+    thread = revision_tools("thread")
+    for key, text in UNREAD_TEXTS["en"].items():
+        ru = UNREAD_TEXTS["ru"][key]
+        assert placeholders(text) == placeholders(ru), key
+        assert code_idents(text) == code_idents(ru), key
+        assert code_idents(text) <= thread, (key, code_idents(text) - thread)
+        assert chr(0x451) not in ru.lower(), key
+    assert placeholders(UNREAD_TEXTS["en"]["comment_unread"]) == {"post", "title", "news"}
+    assert placeholders(UNREAD_TEXTS["en"]["create_unread"]) == {"n"}
+    assert code_idents(UNREAD_TEXTS["en"]["create_unread"]) == {"post_read"}
+    assert UNREAD_TEXTS["en"]["comment_unread"].endswith("if it claims work, start that work only once it went "
+                                                         "through.")
+    assert UNREAD_TEXTS["ru"]["comment_unread"].endswith("если он заявляет работу, начинай ее, только когда он "
+                                                         "прошел.")
+    assert UNREAD_TEXTS["en"]["news_thread"].format(id=31, n=2) == "unread comments in the thread of c31: 2"

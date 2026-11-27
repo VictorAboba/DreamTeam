@@ -545,8 +545,10 @@ async def test_post_read_tree_votes_and_since_id(thread):
     assert lines[6].startswith(f"c2 {member}, ")
     text = await ok(thread, bob, "post_read", {"post_id": 3, "since_id": "c3"})
     lines = text.splitlines()
-    assert lines[2] == "Comments after c3 (2 of 5):"
-    assert lines[3].startswith(f"c4 {anna}, ") and ", reply to c1: an answer" in lines[3]
+    # Bob has read the text as it is: a page after since_id shows only its head (docs/SPEC.md §22.11)
+    assert lines[1] == "The numbers." and lines[2] == "[text unchanged since you read it: 12 characters]"
+    assert lines[3] == "Comments after c3 (2 of 5):"
+    assert lines[4].startswith(f"c4 {anna}, ") and ", reply to c1: an answer" in lines[4]
     assert await err(thread, bob, "post_read", {"post_id": 3, "since_id": "c99"}) == "Error: No comment c99 on #3"
     assert await err(thread, bob, "post_read", {"post_id": 3, "since_id": "#2"}) == \
         "Error: since_id must be a comment id such as c31"
@@ -752,8 +754,10 @@ async def test_the_forum_tools_on_the_real_forum(tmp_path):
         anna, bob = agents_of(sw)
         assert await ok(sw, anna, "post_create", {"title": "Parser benchmark", "text": "First paragraph."}) == \
             'Posted #3 "Parser benchmark".'
+        await ok(sw, bob, "post_read", {"post_id": 3})   # read before write (docs/SPEC.md §22.11)
         assert await ok(sw, bob, "comment", {"post_id": "#3", "text": "Looks good"}) == \
             'Commented c1 on #3 "Parser benchmark".'
+        await ok(sw, anna, "post_read", {"post_id": 3})
         assert await ok(sw, anna, "comment", {"post_id": 3, "text": "Thanks", "reply_to": "c1"}) == \
             f'Replied c2 to c1 ({bob}) on #3 "Parser benchmark".'
         assert await ok(sw, bob, "vote", {"target": "#3", "value": "like"}) == "Liked #3 (likes 1, dislikes 0)."

@@ -7,7 +7,7 @@ from typing import Any
 from .. import prompts
 from ..board import MAX_POST, UNSET
 from ..models import PRIORITIES, USER, Status, Task, ToolError
-from . import ToolContext, tool
+from . import ToolContext, hold_after_refusal, tool
 from .fmt import crew_line, goal_line, post_line, subtask_line, task_detail, task_line, trim
 
 _STATUS_DOC = "todo | in_progress | waiting | review | done | failed | cancelled"
@@ -395,6 +395,7 @@ def _diff(old: Task, new: Task) -> list[str]:
     modes=BOARD_ONLY,
 )
 async def task_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
+    hold_after_refusal(ctx, "complete_refused")   # docs/SPEC.md §7.3 "A `wait` after a refusal"
     notes: list[str] = []
     before = ctx.swarm.board.get(args["task_id"])
     task = ctx.swarm.board.complete(ctx.actor, args["task_id"], args["result"], notes=notes)

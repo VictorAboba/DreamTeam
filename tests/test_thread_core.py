@@ -220,6 +220,7 @@ async def test_likes_on_1_complete_the_goal_under_democracy(tmp_path, open_swarm
         sw.set_goal(USER, GOAL, DESCRIPTION)
         assert "Created #3" in await ok(sw, a, "post_create", {"title": "Parser ready", "text": "In parser.py."}) \
             or sw.forum.get(3)["author"] == a
+        await ok(sw, b, "post_read", {"post_id": 3})   # read before write (docs/SPEC.md §22.11)
         await ok(sw, b, "comment", {"post_id": "#3", "text": "Checked: the tests pass."})
         await ok(sw, c, "vote", {"target": "#3", "value": "like"})
         assert sw.forum.get(3)["likes"] == 1 and len(sw.forum.comments(3)) == 1

@@ -20,7 +20,7 @@ from dreamteam.db import (FORUM_SCHEMA, MODE_KEY, SCHEMA, Database, columns_of, 
 from dreamteam.forum import Forum
 from dreamteam.swarm import Swarm
 
-FORUM_TABLES = {"posts", "post_comments", "votes", "subscriptions"}
+FORUM_TABLES = {"posts", "post_comments", "votes", "subscriptions", "read_marks"}
 WARNING = "the session's mode is {}, chosen when it was created; [swarm] mode is ignored"
 
 
@@ -172,7 +172,8 @@ def test_known_columns_and_objects_include_the_forum(tmp_path):
         forum_columns = columns_of(conn)
     finally:
         conn.close()
-    assert {"posts.active_at", "post_comments.reply_to", "votes.value", "subscriptions.by_member"} <= forum_columns
+    assert {"posts.active_at", "post_comments.reply_to", "votes.value", "subscriptions.by_member",
+            "read_marks.version"} <= forum_columns
     assert forum_columns <= known_columns()
     assert {("index", "posts_active"), ("index", "post_comments_post"),
             ("index", "subscriptions_match")} <= known_objects()

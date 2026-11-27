@@ -22,9 +22,10 @@ from dreamteam.forum import GOAL_POST, PLAN_POST
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.mailbox import seen_as, sent_as_seen_by
 from dreamteam.models import USER, AgentKind
-from dreamteam.swarm import DIGEST_KEY, QUIET_KEY, Swarm
+from dreamteam.swarm import DIGEST_KEY, QUIET_KEY, READ_KEY, Swarm
 from dreamteam.tools import ToolContext, call_tool
 from dreamteam.tools.fmt import STAMP_SPAN, item_time, stamp_range
+from helpers.forum_reads import read_all
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -154,6 +155,7 @@ def test_a_feed_in_wake_wakes_with_the_long_cut_and_a_by_row_wakes_only_for_its_
     bob, carl = f_rows(sw, BOB)[0], f_rows(sw, CARL)[0]
     assert waking(bob) and waking(carl) and sw.has_pending(BOB)
     assert bob["text"].endswith("y" * 1499 + "…")
+    read_all(sw, BOB)
     sw.forum.create(BOB, "Lexer", "z")
     carl_rows = f_rows(sw, CARL)
     assert len(carl_rows) == 2 and digest(carl_rows[1])  # Bob's post: only Carl's feed row in digest matches
@@ -169,6 +171,7 @@ def test_a_mention_is_one_waking_item_whatever_the_subscriptions(sw):
     (user,) = f_rows(sw, USER)
     assert user["kind"] == "f_mention"
     assert [r["kind"] for r in f_rows(sw, CARL)] == ["f_post"]
+    read_all(sw, CARL)
     sw.forum.comment(CARL, 3, "@Anna Smith done")
     (anna,) = f_rows(sw, ANNA)  # her reactions row matches too: still one item, the mention
     assert anna["kind"] == "f_mention" and "(c1)" in anna["text"]
@@ -180,12 +183,14 @@ def test_comments_follow_post_and_reactions_rows_with_one_item_per_recipient(sw)
     sw.forum.subscribe(CARL, "post", "#3", mode="wake")
     sw.forum.subscribe(ANNA, "post", "3", mode="wake")
     sw.db.execute("DELETE FROM notifications")
+    read_all(sw, BOB)
     first = sw.forum.comment(BOB, 3, "a question")
     anna, carl = f_rows(sw, ANNA), f_rows(sw, CARL)
     assert [r["kind"] for r in anna] == ["f_comment"] and waking(anna[0])  # post row (wake) + reactions (digest)
     assert anna[0]["text"] == f'{BOB} commented on #3 "Parser plan" (c{first["id"]}): a question'
     assert [r["kind"] for r in carl] == ["f_comment"] and waking(carl[0])
     assert f_rows(sw, EVE) == []  # a comment belongs to its post, not to the feed
+    read_all(sw, CARL)
     sw.forum.comment(CARL, 3, "an answer", reply_to=first["id"])
     bob = f_rows(sw, BOB)
     assert [r["kind"] for r in bob] == ["f_reply"] and digest(bob[0])
@@ -196,6 +201,7 @@ def test_comments_follow_post_and_reactions_rows_with_one_item_per_recipient(sw)
 def test_comments_on_the_system_posts_reach_their_post_rows(sw):
     team(sw, ANNA, BOB)
     set_goal(sw)
+    read_all(sw, ANNA)
     sw.forum.comment(ANNA, PLAN_POST, "I take the lexer")
     (bob,) = f_rows(sw, BOB)
     assert bob["kind"] == "f_comment" and digest(bob) and "#2" in bob["text"]
@@ -209,6 +215,7 @@ def test_the_users_posts_and_comments_wake_every_member(sw):
     for name in (ANNA, BOB, EVE):
         (row,) = f_rows(sw, name)
         assert row["kind"] == "f_post" and waking(row) and row["text"].startswith("user posted #3")
+    read_all(sw, ANNA)
     post = sw.forum.create(ANNA, "Mine", "")
     sw.forum.comment(USER, post["id"], "nice")
     assert [r["kind"] for r in f_rows(sw, BOB)] == ["f_post", "f_post", "f_comment"]
@@ -219,15 +226,19 @@ def test_users_items_comments_on_its_posts_and_replies_to_its_comments(sw):
     team(sw, ANNA, BOB)
     set_goal(sw)
     mine = sw.forum.create(USER, "User's post", "")
+    read_all(sw, ANNA)
     sw.forum.comment(ANNA, mine["id"], "on it")
+    read_all(sw, ANNA)
     sw.forum.create(ANNA, "Anna's post", "")
     theirs = sw.forum.comment(USER, GOAL_POST, "check the tests")
+    read_all(sw, BOB)
     sw.forum.comment(BOB, GOAL_POST, "they pass", reply_to=theirs["id"])
+    read_all(sw, BOB)
     sw.forum.comment(BOB, GOAL_POST, "unrelated")
     sw.forum.vote(ANNA, f"#{mine['id']}", "like")
     assert [r["kind"] for r in f_rows(sw, USER)] == ["f_comment", "f_reply"]
-    assert all(r["data"] == {k: v for k, v in r["data"].items() if not k.startswith("_")}
-               for r in f_rows(sw, USER))  # never quiet
+    assert all(r["data"] == {k: v for k, v in r["data"].items() if not k.startswith("_") or k == READ_KEY}
+               for r in f_rows(sw, USER))  # never quiet (their read marks are data, docs/SPEC.md §22.11)
 
 
 def test_votes_never_wake_and_a_withdrawn_vote_tells_nobody(sw):
@@ -243,6 +254,7 @@ def test_votes_never_wake_and_a_withdrawn_vote_tells_nobody(sw):
     assert len(f_rows(sw, ANNA)) == 1
     sw.forum.vote(BOB, f"#{post['id']}", "dislike")
     assert [r["text"].rsplit(": ", 1)[1] for r in f_rows(sw, ANNA)] == ["like.", "dislike."]
+    read_all(sw, ANNA)
     comment = sw.forum.comment(ANNA, PLAN_POST, "my part")
     sw.forum.vote(BOB, f"c{comment['id']}", "like")
     assert f_rows(sw, ANNA)[-1]["text"] == f'{BOB} rated your c{comment["id"]} (#2) "Let\'s plan the work": like.'
@@ -315,14 +327,18 @@ def test_a_new_post_waits_for_the_members_own_job(sw, monkeypatch):
     assert waking(row) and sw.has_pending(BOB) and BOB in sw._deferred and woken == []
     sw.forum.create(USER, "From the user", "")  # the user's posts are never deferred
     assert woken == [1]
+    read_all(sw, BOB)
     post = sw.forum.create(BOB, "Mine", "")
+    read_all(sw, ANNA)
     sw.forum.comment(ANNA, post["id"], "mentioning nobody")  # a comment is no new post: it wakes (digest here)
     assert digest(f_rows(sw, BOB)[-1])
     sw.forum.subscribe(BOB, "post", str(post["id"]), mode="wake")
     sw._deferred.clear()
     n = len(woken)
+    read_all(sw, ANNA)
     sw.forum.comment(ANNA, post["id"], "another one")  # a waking comment is signalled, not deferred
     assert waking(f_rows(sw, BOB)[-1]) and len(woken) == n + 1 and BOB not in sw._deferred
+    read_all(sw, ANNA)
     sw.forum.comment(ANNA, post["id"], "@Bob Stone look")  # a mention too
     last = f_rows(sw, BOB)[-1]
     assert last["kind"] == "f_mention" and waking(last) and len(woken) == n + 2 and BOB not in sw._deferred
@@ -335,6 +351,7 @@ def test_the_wake_up_shows_the_digest_group_votes_last_and_marks_every_row_deliv
     post = sw.forum.create(ANNA, "Plan", "")
     sw.forum.vote(BOB, f"#{post['id']}", "like")
     for i in range(32):
+        read_all(sw, BOB)
         sw.forum.create(BOB, f"Note {i}", "")
     sw.notify(ANNA, "n_network_on", wake=False)
     sw.db.execute("UPDATE notifications SET ts = ts - 1000 WHERE kind = 'f_vote'")  # oldest, still shown last
@@ -387,6 +404,7 @@ def test_digest_deadline_counts_from_the_oldest_non_vote_row_and_the_floor(sw):
     set_goal(sw)
     sw.forum.vote(BOB, f"#{post['id']}", "like")
     assert sw.digest_deadline(ANNA) is None  # votes alone never fall due
+    read_all(sw, BOB)
     sw.forum.create(BOB, "Lexer", "")
     first = rows(sw, ANNA, kind="f_post")[0]["ts"]
     assert sw.digest_deadline(ANNA) == pytest.approx(first + 60)
@@ -404,6 +422,7 @@ def test_due_digests_wake_an_idle_agent_once_never_for_votes_alone_or_without_an
     woken = {name: fake_runtime(sw, name) for name in (ANNA, BOB, CARL)}
     post = sw.forum.create(ANNA, "Plan", "")
     sw.forum.vote(CARL, f"#{post['id']}", "like")
+    read_all(sw, CARL)
     sw.forum.create(CARL, "Lexer", "")
     sw._deliver_digests()
     assert not any(woken.values())  # not due yet
@@ -420,6 +439,7 @@ def test_due_digests_wake_an_idle_agent_once_never_for_votes_alone_or_without_an
     age(sw, 1000)
     sw._deliver_digests()
     assert woken[ANNA] == [1]  # a vote alone
+    read_all(sw, BOB)
     sw.forum.create(BOB, "Again", "")
     age(sw, 1000)
     sw._timers.add(object())
@@ -655,6 +675,7 @@ async def test_wait_for_events_returns_the_digest_at_its_deadline_not_at_the_tim
         sw.forum.vote(ANNA, f"#{post['id']}", "like")  # a vote alone never ends the wait early
         await asyncio.sleep(0.5)  # past the 0.3 s a digest row would give
         assert not task.done()
+        read_all(sw, ANNA)
         sw.forum.comment(ANNA, post["id"], "@Eve Black see")
         text, _ = await asyncio.wait_for(task, 5)
         assert "rated your" in text and "mentioned you" in text

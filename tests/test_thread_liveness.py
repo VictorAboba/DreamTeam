@@ -27,6 +27,7 @@ from dreamteam.models import USER, AgentKind, AgentStatus, ToolError
 from dreamteam.swarm import DIGEST_KEY, QUIET_KEY, Swarm
 from dreamteam.tools import ToolContext, call_tool
 from dreamteam.tools.swarm_tools import WAIT_UNWATCHED
+from helpers.forum_reads import read_all
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -226,6 +227,7 @@ def test_a_comment_or_a_vote_of_the_nudged_member_makes_a_new_key_and_the_delay_
     quiet_after(sw, WAIT)
     assert nudged(sw) == [ANNA] and told(sw) == 0
     back_to_sleep(sw, ANNA)
+    read_all(sw, ANNA)
     sw.forum.comment(ANNA, GOAL_POST, "Nothing to do for me.")  # a new key
     quiet_after(sw, 2 * WAIT - 1)
     assert len(nudged(sw)) == 1
@@ -506,6 +508,7 @@ async def test_a_reopen_wakes_each_member_once_with_its_notice_and_its_old_diges
         set_goal(sw)
         sw.complete_goal_by_user("Done.")
         for name in (ANNA, BOB, CARL):
+            read_all(sw, name)
             sw.forum.create(name, f"Notes of {name}", "")  # digest rows for the others, while the goal is done
         texts: dict[str, list[str]] = {name: [] for name in (ANNA, BOB, CARL)}
         order: list[str] = []

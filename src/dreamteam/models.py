@@ -23,6 +23,13 @@ class ToolError(Exception):
     """An error reported back to the caller (agent, user or MCP client) as a tool result."""
 
 
+class ReadRefusal(ToolError):
+    """A read-before-write refusal (docs/SPEC.md §7.3, §22.11): a write of a file, a post or the feed refused because
+    the member had not read its current state. Every surface treats it as a ToolError; tools.call_tool also flags it
+    on an LLM agent's runtime, so that a later `wait`, `task_complete`, `goal_complete` or like on #1 of the same
+    response is held (§7.3 "A `wait` after a refusal")."""
+
+
 class Status:
     TODO = "todo"
     IN_PROGRESS = "in_progress"

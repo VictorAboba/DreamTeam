@@ -21,7 +21,9 @@ _PATH = {"type": "string", "description": "Path relative to the workspace root, 
     required=["path"],
 )
 async def read_file(ctx: ToolContext, args: dict[str, Any]) -> str:
-    return ctx.swarm.workspace.read(args["path"], offset=args.get("offset") or 1, limit=args.get("limit") or 400)
+    # a member's read moves its file read mark (docs/SPEC.md §7.3)
+    return ctx.swarm.workspace.read(args["path"], offset=args.get("offset") or 1, limit=args.get("limit") or 400,
+                                    actor=ctx.actor)
 
 
 @tool(

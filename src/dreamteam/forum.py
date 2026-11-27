@@ -6,6 +6,7 @@ Every write runs in one db transaction and emits its event after it; who is told
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import sqlite3
@@ -18,8 +19,8 @@ from .board import (MAX_POST, MAX_TITLE, NOTIFY_TEXT_LIMIT, SIMILAR_MAX, _as_int
                     similar_items)
 from .db import Database, dumps, loads, utf8_safe
 from .mailbox import seen_as
-from .models import USER, AgentKind, AgentStatus, ToolError
-from .workspace import _covers, in_scratch, path_key, shown_list
+from .models import USER, AgentKind, AgentStatus, ReadRefusal, ToolError
+from .workspace import REFUSAL_RESERVE, _covers, in_scratch, path_key, shown_list
 
 log = logging.getLogger(__name__)
 
@@ -68,8 +69,67 @@ _FEED_STAYS = {
 }
 
 
+# the read-before-write refusals' first lines (docs/SPEC.md §22.11), in the member's language; what follows them is
+# English data in post_read's format
+UNREAD_TEXTS = {
+    "en": {
+        "comment_unread": "Not sent: #{post} \"{title}\" has what you have not read ({news}). You may write to a post "
+                          "only after reading what is new in it: it is below and now counts as read. If your comment "
+                          "is still needed, send it again (another member may already have said it or taken it on); "
+                          "if it claims work, start that work only once it went through.",
+        "update_unread": "Not changed: #{post} \"{title}\" has what you have not read ({news}). You may change your "
+                         "post only after reading what is new in it, objections included: it is below and now counts "
+                         "as read. If your edit is still right, send it again.",
+        "create_unread": "Not posted: the feed has posts by others that you have not seen ({n}). You may post only "
+                         "after seeing what is new in the feed: they are listed below and now count as seen. If one "
+                         "of them is about your topic, comment there instead (`post_read` shows it); otherwise send "
+                         "your post again.",
+        "news_post": "you have not read the post itself",
+        "news_edited": "the post was edited",
+        "news_comments": "unread comments by others: {n}",
+        "news_thread": "unread comments in the thread of c{id}: {n}",
+    },
+    "ru": {
+        "comment_unread": "Не отправлено: в #{post} «{title}» есть то, чего ты не читал(а) ({news}). Писать в "
+                          "объявление можно, только прочитав новое в нем: оно ниже и теперь считается прочитанным. "
+                          "Если твой комментарий еще нужен, отправь его снова (возможно, другой участник уже сказал "
+                          "это или взялся за это); если он заявляет работу, начинай ее, только когда он прошел.",
+        "update_unread": "Не изменено: в #{post} «{title}» есть то, чего ты не читал(а) ({news}). Менять свое "
+                         "объявление можно, только прочитав новое в нем, возражения тоже: оно ниже и теперь "
+                         "считается прочитанным. Если правка еще верна, отправь ее снова.",
+        "create_unread": "Не опубликовано: в ленте есть объявления других, которых ты не видел(а) ({n}). Публиковать "
+                         "можно, только увидев новое в ленте: они перечислены ниже и теперь считаются "
+                         "просмотренными. Если одно из них о твоей теме, напиши комментарий там (его покажет "
+                         "`post_read`); иначе отправь объявление снова.",
+        "news_post": "ты не читал(а) само объявление",
+        "news_edited": "объявление изменено",
+        "news_comments": "непрочитанные комментарии других: {n}",
+        "news_thread": "непрочитанные комментарии в ветке c{id}: {n}",
+    },
+}
+REFUSAL_ITEMS_MIN = 200   # what a refusal's items always get, whatever is left of its budget (§22.11 "Size")
+
+
 def _lang(language: str | None) -> str:
     return language if language in _FEED_STAYS else "en"
+
+
+def post_version(post: dict) -> str:
+    """A post's content version (docs/SPEC.md §22.11): the first 16 hex digits of sha256 over the UTF-8 of its title,
+    "\\0" and its text. Votes, edited_at and #2's data do not change it."""
+    raw = f"{post['title'] or ''}\0{post['text'] or ''}".encode("utf-8", "surrogatepass")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _read_key() -> str:
+    from .swarm import READ_KEY  # the swarm imports this module
+
+    return READ_KEY
+
+
+def read_budget(swarm: Any) -> int:
+    """What a forum read (`feed`, `post_read`) fits into: max(200, [agents] tool_output_chars), read at each use."""
+    return max(200, int(swarm.config.agents.tool_output_chars))
 
 
 def t(language: str | None, key: str, **kw: Any) -> str:
@@ -347,9 +407,16 @@ class Forum:
         self._check_actor(actor)
         title, body = _check_title(title), _check_text(text)
         now = time.time()
+        refusal = None
         with self.db.transaction() as db:
-            pid = db.insert("INSERT INTO posts(author, kind, title, text, created_at, active_at) "
-                            "VALUES (?, 'post', ?, ?, ?, ?)", (actor, title, body, now, now))
+            # read before write (docs/SPEC.md §22.11): checked right before the insert, in its transaction
+            refusal = self._create_refusal(actor) if actor != USER else None
+            if refusal is None:
+                pid = db.insert("INSERT INTO posts(author, kind, title, text, created_at, active_at) "
+                                "VALUES (?, 'post', ?, ?, ?, ?)", (actor, title, body, now, now))
+                self._put_marks(self._movers(actor), {f"p{pid}": post_version({"title": title, "text": body})})
+        if refusal is not None:  # raised after the block: the refusal's marks are committed
+            raise ReadRefusal(refusal)
         post = self.get(pid)
         event = self.swarm.bus.emit("post.created", actor, post=post)
         self._deliver(event, self._mentioned(actor, f"{title}\n{body}"))
@@ -378,9 +445,15 @@ class Forum:
             return {**post, "changes": []}
         now = time.time()
         sets = ", ".join(f"{key} = ?" for key in changes)
+        refusal = None
         with self.db.transaction() as db:
-            db.execute(f"UPDATE posts SET {sets}, edited_at = ?, active_at = ? WHERE id = ?",
-                       (*(values[key] for key in changes), now, now, post["id"]))
+            refusal = self._post_refusal(actor, post["id"], "update_unread") if actor != USER else None
+            if refusal is None:
+                db.execute(f"UPDATE posts SET {sets}, edited_at = ?, active_at = ? WHERE id = ?",
+                           (*(values[key] for key in changes), now, now, post["id"]))
+                self._put_marks(self._movers(actor), {f"p{post['id']}": self._version_of(post["id"])})
+        if refusal is not None:
+            raise ReadRefusal(refusal)
         new = self.get(post["id"])
         event = self.swarm.bus.emit("post.updated", actor, post=new, changes=changes)
         before = f"{post['title']}\n{post['text']}"
@@ -397,16 +470,27 @@ class Forum:
         if reply_to is not None and str(reply_to).strip():
             reply = _as_int(reply_to, "reply_to")
             self._comment_of(post["id"], reply)
-        event, comment = self._insert_comment(actor, post["id"], body, reply)
+        event, comment = self._insert_comment(actor, post["id"], body, reply, check=actor != USER)
         self._deliver(event, self._mentioned(actor, body))
         return comment
 
-    def _insert_comment(self, actor: str, post_id: int, body: str, reply: int | None) -> tuple[dict, dict]:
+    def _insert_comment(self, actor: str, post_id: int, body: str, reply: int | None,
+                        check: bool = False) -> tuple[dict, dict]:
+        """`check`: the read-before-write check of a member's comment (docs/SPEC.md §22.11), in the insert's
+        transaction; a refusal writes nothing but its marks and raises ReadRefusal once they are committed."""
         now = time.time()
+        refusal = None
         with self.db.transaction() as db:
-            cid = db.insert("INSERT INTO post_comments(post_id, author, text, reply_to, ts) VALUES (?, ?, ?, ?, ?)",
-                            (post_id, actor, body, reply, now))
-            db.execute("UPDATE posts SET active_at = ? WHERE id = ?", (now, post_id))
+            if check:
+                refusal = (self._reply_refusal(actor, post_id, reply) if reply is not None
+                           else self._post_refusal(actor, post_id, "comment_unread"))
+            if refusal is None:
+                cid = db.insert("INSERT INTO post_comments(post_id, author, text, reply_to, ts) "
+                                "VALUES (?, ?, ?, ?, ?)", (post_id, actor, body, reply, now))
+                db.execute("UPDATE posts SET active_at = ? WHERE id = ?", (now, post_id))
+                self._put_marks(self._movers(actor), {f"c{cid}": None})
+        if refusal is not None:
+            raise ReadRefusal(refusal)
         comment = self.comment_get(cid)
         return self.swarm.bus.emit("post.comment", actor, post_id=post_id, comment=comment), comment
 
@@ -652,16 +736,18 @@ class Forum:
         if deleted or reason == "reopened":
             self.swarm.bus.emit("post.updated", actor, post=self.get(GOAL_POST), changes=["votes"])
 
-    def reopen(self, actor: str, comment: str) -> None:
+    def reopen(self, actor: str, comment: str) -> int | None:
         """The thread part of reopen_goal: the votes on #1 reset, and the comment (stripped, unless "" or "-")
-        posted on #1 by USER, cut to MAX_POST, never refused."""
+        posted on #1 by USER, cut to MAX_POST, never refused. Returns the comment's id, None when it posted none
+        (n_goal_reopened_thread carries it as read, docs/SPEC.md §22.11)."""
         self.reset_goal_votes(actor, "reopened")
         body = (comment or "").strip()
         if not body or body == "-" or not self.has_post(GOAL_POST):
-            return
-        event, _ = self._insert_comment(USER, GOAL_POST, _clip(body, MAX_POST), None)
+            return None
+        event, made = self._insert_comment(USER, GOAL_POST, _clip(body, MAX_POST), None)
         # the LLM members get the reopen's own waking notice in place of an f_* item (docs/SPEC.md §22.4)
         self._deliver(event, self._mentioned(USER, body), llm_quiet=True)
+        return made["id"]
 
     def _goal_text(self, goal: dict) -> str:
         lang = self.swarm.language
@@ -839,12 +925,244 @@ class Forum:
                 kw["reply_to"] = f"c{comment['reply_to']}"
         elif key == "f_post":
             kw["text"] = _clip(post["text"], limit)
+        kw[_read_key()] = self._item_reads(key, post, comment, limit)
         if name == USER:
             self.swarm.notify(USER, key, **kw)
         elif wake:
             self.swarm.notify(name, key, defer=defer, **kw)
         else:
             self.swarm.notify(name, key, wake=False, batch=True, **kw)
+
+    @staticmethod
+    def _item_reads(key: str, post: dict, comment: dict | None, limit: int) -> dict[str, str | None]:
+        """An f_* item's `_read` (docs/SPEC.md §22.11): what its text carries whole. A post's text not cut: `p<id>`
+        at its version, else by title; a comment's text not cut: `c<id>`, with its post by title."""
+        target = f"p{post['id']}"
+        if key == "f_post" or (key == "f_mention" and not comment):
+            return {target: post_version(post) if len(post["text"] or "") <= limit else None}
+        reads: dict[str, str | None] = {}
+        if key in ("f_comment", "f_reply", "f_mention") and comment and len(comment["text"] or "") <= limit:
+            reads[f"c{comment['id']}"] = None
+        reads[target] = None
+        return reads
+
+    # --- read marks (docs/SPEC.md §22.11) ----------------------------------------------------------------------
+
+    def _movers(self, actor: str | None) -> list[str]:
+        """Whose marks a call of `actor` moves: the actor when it is a member, and the members of seen_as(actor),
+        the MCP client acting as them saw it too; never USER."""
+        if actor is None:
+            return []
+        names = [actor] if actor != USER and self.swarm.is_member(actor) else []
+        names += sorted(n for n in seen_as(actor) if n != USER and n not in names and self.swarm.is_member(n))
+        return names
+
+    def _put_marks(self, names: Iterable[str], marks: dict[str, str | None]) -> None:
+        """Upserts: a version replaces the row's; a post by title (None) and a comment never erase a version."""
+        now = time.time()
+        for name in names:
+            for target, version in marks.items():
+                if version is None:
+                    self.db.execute("INSERT INTO read_marks(member, target, version, ts) VALUES (?, ?, NULL, ?) "
+                                    "ON CONFLICT (member, target) DO NOTHING", (name, target, now))
+                else:
+                    self.db.execute("INSERT INTO read_marks(member, target, version, ts) VALUES (?, ?, ?, ?) "
+                                    "ON CONFLICT (member, target) DO UPDATE SET version = excluded.version, "
+                                    "ts = excluded.ts", (name, target, version, now))
+
+    def mark_read(self, member: str, marks: dict[str, str | None]) -> None:
+        """Read marks `p<id>` (a version, or None: by title) and `c<id>` (None) of `member` and of the members of
+        seen_as(member), in one transaction; nothing for USER itself or a non-member."""
+        names = self._movers(member)
+        if not names or not marks:
+            return
+        with self.db.transaction():
+            self._put_marks(names, marks)
+
+    def note_shown(self, member: str, rows: Iterable[Any]) -> None:
+        """render_wake: the `_read` of the notification rows it printed. A version is applied only while it is
+        still the post's version, else that post by title. Every version shown is kept per target, so the order of
+        the rows does not matter: a post shown whole at its current version by any row is marked at it."""
+        key = _read_key()
+        wanted: dict[str, set[str]] = {}
+        for row in rows:
+            raw = row["data"]
+            data = loads(raw) if isinstance(raw, str) else raw
+            reads = data.get(key) if isinstance(data, dict) else None
+            if not isinstance(reads, dict):
+                continue
+            for target, version in reads.items():
+                shown = wanted.setdefault(str(target), set())
+                if version:
+                    shown.add(str(version))
+        names = self._movers(member)
+        if not names or not wanted:
+            return
+        with self.db.transaction():
+            marks: dict[str, str | None] = {}
+            for target, versions in wanted.items():
+                version = None  # a comment; or a post by title, edited later, or shown at an older version only
+                if target.startswith("p") and versions:
+                    current = self._version_of(int(target[1:]))
+                    version = current if current in versions else None
+                marks[target] = version
+            self._put_marks(names, marks)
+
+    def drop_reads(self, member: str) -> int:
+        """At retire: every read mark of the member."""
+        with self.db.transaction() as db:
+            return db.execute("DELETE FROM read_marks WHERE member = ?", (member,)).rowcount
+
+    def mark_of(self, member: str, target: str) -> str | None:
+        """The version of `member`'s mark of `target` (None: no row, or by title only)."""
+        return self.db.scalar("SELECT version FROM read_marks WHERE member = ? AND target = ?", (member, target))
+
+    def system_reads(self) -> dict[str, str]:
+        """`p1` and `p2` at their current versions: the kickoff notices carry them (§22.11)."""
+        return {f"p{r['id']}": post_version(r) for r in self.db.all(
+            "SELECT id, title, text FROM posts WHERE id IN (?, ?)", (GOAL_POST, PLAN_POST))}
+
+    def _version_of(self, post_id: int) -> str | None:
+        row = self.db.one("SELECT title, text FROM posts WHERE id = ?", (post_id,))
+        return None if row is None else post_version(row)
+
+    # --- the checks (§22.11 "The checks"); each runs inside its write's transaction ------------------------------
+
+    def _post_state(self, member: str, post_id: int) -> str | None:
+        """"unread" (no p row, or by title only), "edited" (another version) or None (read as it is)."""
+        row = self.db.one("SELECT version FROM read_marks WHERE member = ? AND target = ?", (member, f"p{post_id}"))
+        if row is None or row["version"] is None:
+            return "unread"
+        return "edited" if row["version"] != self._version_of(post_id) else None
+
+    def _unread_comments(self, member: str, post_id: int, thread_of: int | None = None) -> list[dict]:
+        """The post's comments by others that `member` has not read, ascending ids; `thread_of` cN: only cN and the
+        replies under it at any depth."""
+        unread = ("c.author != ? AND NOT EXISTS (SELECT 1 FROM read_marks r WHERE r.member = ? AND "
+                  "r.target = 'c' || c.id)")
+        if thread_of is None:
+            rows = self.db.all(f"{_COMMENT_SQL} WHERE c.post_id = ? AND {unread} ORDER BY c.id",
+                               (post_id, member, member))
+        else:
+            rows = self.db.all(
+                "WITH RECURSIVE thread(id) AS (SELECT ? UNION SELECT k.id FROM post_comments k JOIN thread t "
+                f"ON k.reply_to = t.id WHERE k.post_id = ?) {_COMMENT_SQL} WHERE c.id IN (SELECT id FROM thread) "
+                f"AND c.post_id = ? AND {unread} ORDER BY c.id", (thread_of, post_id, post_id, member, member))
+        return [_comment_dict(r) for r in rows]
+
+    def _post_refusal(self, member: str, post_id: int, key: str) -> str | None:
+        """A top-level comment's and post_update's check: the post's own news and its unread comments."""
+        state = self._post_state(member, post_id)
+        comments = self._unread_comments(member, post_id)
+        if state is None and not comments:
+            return None
+        return self._refuse(member, key, post_id, state, comments)
+
+    def _reply_refusal(self, member: str, post_id: int, reply_to: int) -> str | None:
+        """A reply's check: the unread comments of the thread of cN, and an edit of a post read in an earlier
+        version (a post never read does not block it)."""
+        state = self._post_state(member, post_id)
+        state = state if state == "edited" else None
+        comments = self._unread_comments(member, post_id, thread_of=reply_to)
+        if state is None and not comments:
+            return None
+        return self._refuse(member, "comment_unread", post_id, state, comments, thread_of=reply_to)
+
+    def _refusal_room(self, first: str) -> int:
+        """What a refusal's items get after its first lines: max(200, tool_output_chars) less REFUSAL_RESERVE and
+        the first lines, at least REFUSAL_ITEMS_MIN."""
+        budget = max(200, int(self.swarm.config.agents.tool_output_chars)) - REFUSAL_RESERVE
+        return max(REFUSAL_ITEMS_MIN, budget - len(first) - 1)
+
+    def _refuse(self, member: str, key: str, post_id: int, state: str | None, comments: list[dict],
+                thread_of: int | None = None) -> str:
+        """The refusal text of a comment or an edit; the member's marks (and its seen_as members') move to what it
+        shows: the post block's version, the comments listed."""
+        from .tools import forum_tools as ft  # the tools import this module
+
+        lang = self.swarm.language_of(member)
+        texts = UNREAD_TEXTS.get(lang, UNREAD_TEXTS["en"])
+        post = self.get(post_id)
+        news = []
+        if state == "unread":
+            news.append(texts["news_post"])
+        elif state == "edited":
+            news.append(texts["news_edited"])
+        if comments:
+            news.append(texts["news_thread"].format(id=thread_of, n=len(comments)) if thread_of is not None
+                        else texts["news_comments"].format(n=len(comments)))
+        first = texts[key].format(post=post_id, title=post["title"], news="; ".join(news))
+        room = self._refusal_room(first)
+        lines = [first]
+        marks: dict[str, str | None] = {}
+        header = f"Unread comments ({len(comments)}):"
+        # the continuation line: never needed for one comment, which is always shown (cut when it must be)
+        more = len(f"… and {len(comments)} more unread comments: `post_read` post_id={post_id} "
+                   f"since_id=c{comments[-1]['id']}, or send again to see them.") + 1 if len(comments) > 1 else 0
+        # the lines of every comment, each with its newline: what showing them all takes
+        whole = sum(len(line) + 1 for line in ft.comment_prefix(self.swarm, member, comments, 1 << 62)[1])
+        if state is not None:
+            now = time.time()
+            block = [ft.post_head(self.swarm, post, member, now)]
+            vote_part = ft.goal_vote_part(self.swarm, lang) if post_id == GOAL_POST else []
+            fixed = sum(len(line) + 1 for line in (*block, *vote_part))
+            text = post["text"] or ""
+            if text.strip():
+                # with comments to show too, the comment block keeps its header and the lines of all of them, or
+                # a third of the room (at least REFUSAL_ITEMS_MIN) and the continuation line (as in post_read)
+                share = max(REFUSAL_ITEMS_MIN, room // 3)
+                kept = (len(header) + 1 + (whole if whole <= share else share + more)) if comments else 0
+                left = room - fixed - kept
+                block.append(text if len(text) + 1 <= left else ft.cut_to(text, left - 1, "text"))
+            block += vote_part
+            lines += block
+            room -= sum(len(line) + 1 for line in block)
+            marks[f"p{post_id}"] = post_version(post)
+        if comments:
+            room -= len(header) + 1
+            # the continuation line is reserved only when not every comment fits
+            shown, comment_lines = ft.comment_prefix(self.swarm, member, comments,
+                                                     room if whole <= room else room - more)
+            lines += [header, *comment_lines]
+            if len(shown) < len(comments):
+                lines.append(f"… and {len(comments) - len(shown)} more unread comments: `post_read` "
+                             f"post_id={post_id} since_id=c{shown[-1]['id']}, or send again to see them.")
+            marks.update({f"c{c['id']}": None for c in shown})
+        self._put_marks(self._movers(member), marks)
+        return "\n".join(lines)
+
+    def _create_refusal(self, member: str) -> str | None:
+        """post_create's check: the posts of kind post by others (the user's too) of which `member` has no mark. A
+        refusal lists the newest that fit and marks them all by title."""
+        from .tools.fmt import item_time
+
+        rows = self.db.all("SELECT id, title, author, created_at FROM posts p WHERE kind = 'post' AND author IS NOT "
+                           "NULL AND author != ? AND NOT EXISTS (SELECT 1 FROM read_marks r WHERE r.member = ? AND "
+                           "r.target = 'p' || p.id) ORDER BY created_at DESC, id DESC", (member, member))
+        if not rows:
+            return None
+        lang = self.swarm.language_of(member)
+        first = UNREAD_TEXTS.get(lang, UNREAD_TEXTS["en"])["create_unread"].format(n=len(rows))
+        header = f"Posts you have not seen ({len(rows)}), newest first:"
+        more = len(f"… and {len(rows)} older posts you have not seen: `feed` lists them.") + 1
+        room = self._refusal_room(first) - len(header) - 1 - more
+        now = time.time()
+        listed: list[str] = []
+        used = 0
+        for row in rows:
+            line = f"#{row['id']} \"{row['title']}\" — {row['author']}, {item_time(row['created_at'] or now, now)}"
+            if listed and used + len(line) + 1 > room:
+                break
+            if not listed and len(line) + 1 > room:
+                line = line[:max(1, room - 1) - 1] + "…"
+            listed.append(line)
+            used += len(line) + 1
+        lines = [first, header, *listed]
+        if len(listed) < len(rows):
+            lines.append(f"… and {len(rows) - len(listed)} older posts you have not seen: `feed` lists them.")
+        # the whole feed counts as seen: a member hired late must not page a long feed through refusals
+        self._put_marks(self._movers(member), {f"p{row['id']}": None for row in rows})
+        return "\n".join(lines)
 
     # --- file subscriptions (docs/SPEC.md §22.3 "File subscriptions") -------------------------------------------
 

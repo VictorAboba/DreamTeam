@@ -13,7 +13,7 @@ from ..jobs import fmt_duration, short_command
 from ..models import USER, AgentKind, Status, ToolError
 from ..swarm import USER_PAUSE
 from ..workspace import shown_list
-from . import ToolContext, tool
+from . import ToolContext, hold_after_refusal, tool
 from .fmt import STAMP_SPAN, ago, budget_line, goal_line, item_time, stamp_range
 
 MAX_NOTES = 20000
@@ -311,6 +311,8 @@ async def update_notes(ctx: ToolContext, args: dict[str, Any]) -> str:
     },
 )
 async def wait(ctx: ToolContext, args: dict[str, Any]) -> str:
+    # after a read-before-write refusal in the same response the member decides again first (docs/SPEC.md §7.3)
+    hold_after_refusal(ctx, "wait_refused")
     if ctx.runtime is not None:
         ctx.runtime.end_turn()
     # the caller's running jobs whose end will wake it (never one whose end is quiet, e.g. once the goal is done), and
@@ -362,6 +364,7 @@ def _unwatched(ctx: ToolContext) -> bool:
     modes=("board",),   # a thread goal is decided by the votes on #1 or by the user (docs/SPEC.md §22.4)
 )
 async def goal_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
+    hold_after_refusal(ctx, "goal_complete_refused")   # docs/SPEC.md §7.3 "A `wait` after a refusal"
     swarm = ctx.swarm
     goal = swarm.goal()
     if goal and goal.get("status") == "done":

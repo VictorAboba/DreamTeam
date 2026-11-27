@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from .. import prompts
-from ..forum import vote_line
+from ..forum import post_version, read_budget, vote_line
 from ..jobs import fmt_duration
 from ..models import USER, AgentKind, ToolError
-from . import ToolContext, tool
+from . import ToolContext, hold_after_refusal, tool
 from .fmt import item_time
 
 THREAD_ONLY = ("thread",)
@@ -19,6 +19,7 @@ FEED_DEFAULT = 30
 FEED_MAX = 100
 COMMENTS_MAX = 200
 VOTERS_SHOWN = 10
+UNCHANGED_HEAD = 200   # post_read after since_id of a post read in its current version: its text's first characters
 
 # --- ids -----------------------------------------------------------------------------------------------------------
 
@@ -123,6 +124,7 @@ def _post_of_comment(swarm, comment_id: int) -> int | None:
 )
 async def feed(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
+    budget = read_budget(swarm)
     minutes = args.get("since")
     if minutes is not None and not minutes > 0:
         raise ToolError("since must be a number of minutes > 0")
@@ -137,45 +139,87 @@ async def feed(ctx: ToolContext, args: dict[str, Any]) -> str:
     narrowed = f"; {', '.join(filters)}" if filters else ""
     if not posts:
         return f"Feed: no posts{narrowed}."
-    lines = [f"Feed: {total} post{'s' if total != 1 else ''}, newest activity first{narrowed}."]
+    head = f"Feed: {total} post{'s' if total != 1 else ''}, newest activity first{narrowed}."
     mine = _my_votes(swarm, ctx.actor, [f"p{p['id']}" for p in posts])
     now = time.time()
+    entries: list[str] = []   # one per post: its line, and under #1 the goal vote line
     for post in posts:
         edited = " (edited)" if post.get("edited_at") else ""
         active = item_time(post.get("active_at") or post.get("created_at") or now, now)
         line = (f"#{post['id']} \"{post['title']}\" — {_author(post.get('author'))}, {_counts(post)}, "
                 f"comments {post.get('comments', 0)}, active {active}{edited}")
         vote = mine.get(f"p{post['id']}")
-        lines.append(line + (f"; you: {_value_word(vote)}" if vote else ""))
+        line += f"; you: {_value_word(vote)}" if vote else ""
         if post["id"] == 1:
             tally = swarm.forum.goal_vote()
             if tally is not None:
-                lines.append("  " + vote_line(ctx.lang, tally))
-    if total > len(posts):
-        lines.append(f"… and {total - len(posts)} more: `feed` with limit, by, since or query.")
+                line += "\n  " + vote_line(ctx.lang, tally)
+        entries.append(line)
+
+    def more(n: int) -> str:
+        return f"… and {n} more: `feed` with limit, by, since or query."
+
+    shown = entries
+    if total > len(posts) or len(head) + sum(len(e) + 1 for e in entries) > budget:
+        # the lines that fit after the reserve for the continuation, at least one (cut when it alone is too long)
+        room = budget - len(head) - 1 - (len(more(total)) + 1)
+        shown, used = [], 0
+        for entry in entries:
+            if used + len(entry) + 1 > room:
+                break
+            shown.append(entry)
+            used += len(entry) + 1
+        if not shown:
+            first = entries[0]
+            shown = [first if len(first) <= max(1, room - 1) else first[:max(1, room - 1) - 1] + "…"]
+    lines = [head, *shown]
+    if total > len(shown):
+        lines.append(more(total - len(shown)))
+    # the posts listed count as seen by title (docs/SPEC.md §22.11); the ones left out move nothing
+    swarm.forum.mark_read(ctx.actor, {f"p{post['id']}": None for post in posts[:len(shown)]})
     return "\n".join(lines)
 
 
-def _goal_vote_part(ctx: ToolContext) -> list[str]:
+def goal_vote_part(swarm, language: str) -> list[str]:
     """#1's vote in post_read: the vote line with the counted voters' names, then the votes that do not count."""
-    swarm = ctx.swarm
     tally = swarm.forum.goal_vote()
     if tally is None:
         return []
     counted = set(tally.get("for") or []) | set(tally.get("against") or [])
     voters = (", ".join(tally.get("for") or []) or "—", ", ".join(tally.get("against") or []) or "—")
     names = f" For: {voters[0]}; against: {voters[1]}."
-    lines = [vote_line(ctx.lang, tally) + names]
+    lines = [vote_line(language, tally) + names]
     others = [f"{voter} ({_value_word(value)})" for voter, value in _voters(swarm, "p1") if voter not in counted]
     if others:
         lines.append("Not counted: " + ", ".join(others) + ".")
     return lines
 
 
-def _comment_lines(comments: list[dict], mine: dict[str, int]) -> list[str]:
-    """The comments as a tree: replies under the comment they answer, two spaces per level; a reply to a comment
-    not shown is at the top level with its `reply to`."""
-    now = time.time()
+def _goal_vote_part(ctx: ToolContext) -> list[str]:
+    return goal_vote_part(ctx.swarm, ctx.lang)
+
+
+def post_head(swarm, post: dict, viewer: str, now: float) -> str:
+    """post_read's head line: `#9 "title" by Anna Smith, 10:50 (edited 11:02); likes 2 (...), dislikes 0; you: like`
+    (also a read-before-write refusal's post block, docs/SPEC.md §22.11)."""
+    post_id = post["id"]
+    edited = f" (edited {item_time(post['edited_at'], now)})" if post.get("edited_at") else ""
+    voters = _voters(swarm, f"p{post_id}")
+    likes = [v for v, value in voters if value > 0]
+    dislikes = [v for v, value in voters if value < 0]
+    if post_id == 1:
+        counts = _counts(post)
+    else:
+        counts = (f"likes {post.get('likes', 0)}" + (f" ({_names(likes)})" if likes else "")
+                  + f", dislikes {post.get('dislikes', 0)}" + (f" ({_names(dislikes)})" if dislikes else ""))
+    vote = _my_votes(swarm, viewer, [f"p{post_id}"]).get(f"p{post_id}")
+    return (f"#{post_id} \"{post['title']}\" by {_author(post.get('author'))}, "
+            f"{item_time(post.get('created_at') or now, now)}{edited}; {counts}"
+            + (f"; you: {_value_word(vote)}" if vote else ""))
+
+
+def _tree(comments: list[dict]) -> list[tuple[dict, int]]:
+    """The comments in tree order with their depth: replies under the comment they answer."""
     shown = {c["id"] for c in comments}
     children: dict[int, list[dict]] = {}
     roots = []
@@ -184,22 +228,82 @@ def _comment_lines(comments: list[dict], mine: dict[str, int]) -> list[str]:
             children.setdefault(c["reply_to"], []).append(c)
         else:
             roots.append(c)
-    lines: list[str] = []
+    out: list[tuple[dict, int]] = []
 
     def add(c: dict, depth: int) -> None:
-        indent = "  " * depth
-        reply = f", reply to c{c['reply_to']}" if c.get("reply_to") and c["reply_to"] not in shown else ""
-        vote = mine.get(f"c{c['id']}")
-        you = f", you: {_value_word(vote)}" if vote else ""
-        body = str(c.get("text") or "").replace("\n", "\n" + indent + "  ")
-        lines.append(f"{indent}c{c['id']} {_author(c.get('author'))}, {item_time(c.get('ts') or now, now)}, "
-                     f"{_counts(c)}{you}{reply}: {body}")
+        out.append((c, depth))
         for child in children.get(c["id"], []):
             add(child, depth + 1)
 
     for c in roots:
         add(c, 0)
-    return lines
+    return out
+
+
+def _comment_line(c: dict, depth: int, shown: set[int], mine: dict[str, int], now: float) -> str:
+    indent = "  " * depth
+    reply = f", reply to c{c['reply_to']}" if c.get("reply_to") and c["reply_to"] not in shown else ""
+    vote = mine.get(f"c{c['id']}")
+    you = f", you: {_value_word(vote)}" if vote else ""
+    body = str(c.get("text") or "").replace("\n", "\n" + indent + "  ")
+    return (f"{indent}c{c['id']} {_author(c.get('author'))}, {item_time(c.get('ts') or now, now)}, "
+            f"{_counts(c)}{you}{reply}: {body}")
+
+
+def _comment_lines(comments: list[dict], mine: dict[str, int]) -> list[str]:
+    """The comments as a tree: replies under the comment they answer, two spaces per level; a reply to a comment
+    not shown is at the top level with its `reply to`."""
+    now = time.time()
+    shown = {c["id"] for c in comments}
+    return [_comment_line(c, depth, shown, mine, now) for c, depth in _tree(comments)]
+
+
+def cut_note(what: str, shown: int, total: int) -> str:
+    """`[text cut at N of M characters]` / `[comment cut at N of M characters]` (docs/SPEC.md §22.11)."""
+    return f"[{what} cut at {shown} of {total} characters]"
+
+
+def cut_to(text: str, room: int, what: str) -> str:
+    """`text` cut so that it and its note on the next line take at most `room` characters (at least the note)."""
+    note_len = len(cut_note(what, len(text), len(text))) + 1
+    keep = max(0, min(len(text), room - note_len))
+    return text[:keep] + "\n" + cut_note(what, keep, len(text))
+
+
+def comment_prefix(swarm, viewer: str, comments: list[dict], room: int) -> tuple[list[dict], list[str]]:
+    """The id-ordered prefix of `comments` whose tree lines fit `room` characters (each line with its newline), at
+    least one: a first comment that alone exceeds the room is shown cut with `[comment cut at N of M characters]`.
+    Returns the comments shown (the cut one as it is stored) and their lines in tree order."""
+    if not comments:
+        return [], []
+    now = time.time()
+    mine = _my_votes(swarm, viewer, [f"c{c['id']}" for c in comments])
+    every = {c["id"] for c in comments}
+    # a comment's parent has a lower id, so whether it is shown is the same in every prefix: each line is fixed
+    depths: dict[int, int] = {}
+    for c in comments:
+        depths[c["id"]] = depths[c["reply_to"]] + 1 if c.get("reply_to") in every else 0
+    used = 0
+    count = 0
+    for c in comments:
+        size = len(_comment_line(c, depths[c["id"]], every, mine, now)) + 1
+        if used + size > room:
+            break
+        used += size
+        count += 1
+    if count:
+        shown = comments[:count]
+        ids = {c["id"] for c in shown}
+        return shown, [_comment_line(c, depth, ids, mine, now) for c, depth in _tree(shown)]
+    first = comments[0]
+    bare = len(_comment_line({**first, "text": ""}, 0, set(), mine, now)) + 1
+    text = str(first.get("text") or "")
+    left = room - bare
+    line = _comment_line({**first, "text": cut_to(text, left, "comment")}, 0, set(), mine, now)
+    while len(line) + 1 > room and left > 0:  # each newline of the cut body (the note's too) gets a 2-space indent
+        left -= len(line) + 1 - room
+        line = _comment_line({**first, "text": cut_to(text, left, "comment")}, 0, set(), mine, now)
+    return [first], [line]
 
 
 @tool(
@@ -219,47 +323,65 @@ def _comment_lines(comments: list[dict], mine: dict[str, int]) -> list[str]:
 )
 async def post_read(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
+    forum = swarm.forum
     post_id = args["post_id"]
-    post = swarm.forum.get(post_id)
+    post = forum.get(post_id)
     since_id = _comment_id(args["since_id"], "since_id") if args.get("since_id") not in (None, "") else 0
     if since_id and _post_of_comment(swarm, since_id) != post_id:
         raise ToolError(f"No comment c{since_id} on #{post_id}")
     now = time.time()
-    edited = f" (edited {item_time(post['edited_at'], now)})" if post.get("edited_at") else ""
-    voters = _voters(swarm, f"p{post_id}")
-    likes = [v for v, value in voters if value > 0]
-    dislikes = [v for v, value in voters if value < 0]
-    if post_id == 1:
-        counts = _counts(post)
-    else:
-        counts = (f"likes {post.get('likes', 0)}" + (f" ({_names(likes)})" if likes else "")
-                  + f", dislikes {post.get('dislikes', 0)}" + (f" ({_names(dislikes)})" if dislikes else ""))
-    vote = _my_votes(swarm, ctx.actor, [f"p{post_id}"]).get(f"p{post_id}")
-    head = (f"#{post_id} \"{post['title']}\" by {_author(post.get('author'))}, "
-            f"{item_time(post.get('created_at') or now, now)}{edited}; {counts}"
-            + (f"; you: {_value_word(vote)}" if vote else ""))
-    lines = [head]
-    if (post.get("text") or "").strip():
-        lines.append(post["text"])
-    if post_id == 1:
-        lines.extend(_goal_vote_part(ctx))
+    budget = read_budget(swarm)
+    version = post_version(post)
+    head = post_head(swarm, post, ctx.actor, now)
+    text = post.get("text") or ""
+    has_text = bool(text.strip())
+    vote_part = _goal_vote_part(ctx) if post_id == 1 else []
     total = int(post.get("comments") or 0)
     after = total if not since_id else int(swarm.db.scalar(
         "SELECT COUNT(*) FROM post_comments WHERE post_id = ? AND id > ?", (post_id, since_id)) or 0)
-    comments = swarm.forum.comments(post_id, since_id=since_id, limit=COMMENTS_MAX) if after else []
+    comments = forum.comments(post_id, since_id=since_id, limit=COMMENTS_MAX) if after else []
     if since_id:
-        lines.append(f"Comments after c{since_id} ({after} of {total})" + (":" if comments else "."))
+        comments_line = f"Comments after c{since_id} ({after} of {total})" + (":" if comments else ".")
     elif total:
-        lines.append(f"Comments ({total}):")
+        comments_line = f"Comments ({total}):"
     else:
-        lines.append("No comments yet.")
-    if comments:
-        mine = _my_votes(swarm, ctx.actor, [f"c{c['id']}" for c in comments])
-        lines.extend(_comment_lines(comments, mine))
-        if after > len(comments):
-            lines.append(f"… and {after - len(comments)} more: `post_read` post_id={post_id} "
-                         f"since_id=c{comments[-1]['id']}.")
-    return "\n".join(lines)
+        comments_line = "No comments yet."
+    # a page after since_id of a post the caller has read in its current version shows only the text's head
+    unchanged = bool(since_id) and forum.mark_of(ctx.actor, f"p{post_id}") == version
+    if unchanged and has_text:
+        text = text[:UNCHANGED_HEAD] + f"\n[text unchanged since you read it: {len(post['text'])} characters]"
+
+    def continuation(shown: list[dict]) -> str:
+        return f"… and {after - len(shown)} more: `post_read` post_id={post_id} since_id=c{shown[-1]['id']}."
+
+    def page(body: str, shown: list[dict], lines: list[str]) -> str:
+        out = [head, *([body] if has_text else []), *vote_part, comments_line, *lines]
+        if shown and after > len(shown):
+            out.append(continuation(shown))
+        return "\n".join(out)
+
+    mine = _my_votes(swarm, ctx.actor, [f"c{c['id']}" for c in comments])
+    full = page(text, comments, _comment_lines(comments, mine))
+    if len(full) <= budget:
+        result, shown = full, comments
+    else:
+        fixed = sum(len(line) + 1 for line in (head, *vote_part, comments_line))
+        reserve = len(f"… and {after} more: `post_read` post_id={post_id} since_id=c{comments[-1]['id']}.") + 1 \
+            if comments else 0
+        body = text
+        if has_text and not unchanged:
+            # while there are comments to show they get at least a third of the budget (and 200 characters)
+            room = budget - fixed - 1 - reserve - (max(200, budget // 3) if comments else 0)
+            if len(text) > room:
+                body = cut_to(text, room, "text")
+        used = fixed + (len(body) + 1 if has_text else 0)
+        shown, lines = comment_prefix(swarm, ctx.actor, comments, budget - used - reserve)
+        result = page(body, shown, lines)
+    # what the result shows counts as read (docs/SPEC.md §22.11): the text, also cut, and every comment shown
+    marks: dict[str, str | None] = {} if unchanged else {f"p{post_id}": version}
+    marks.update({f"c{c['id']}": None for c in shown})
+    forum.mark_read(ctx.actor, marks)
+    return result
 
 
 def _similar_entry(post: dict, language: str) -> str:
@@ -374,6 +496,8 @@ async def comment(ctx: ToolContext, args: dict[str, Any]) -> str:
 async def vote(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
     target, value = _vote_target(args["target"]), args["value"]
+    if target == "p1" and value == "like":   # the like that may complete the goal (docs/SPEC.md §7.3)
+        hold_after_refusal(ctx, "vote_refused")
     before = swarm.db.scalar("SELECT value FROM votes WHERE target = ? AND voter = ?", (target, ctx.actor))
     result = swarm.forum.vote(ctx.actor, target, value)
     shown = f"#{target[1:]}" if target.startswith("p") else f"{target} on #{_post_of_comment(swarm, int(target[1:]))}"

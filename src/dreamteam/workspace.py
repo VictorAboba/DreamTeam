@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import logging
 import os
 import re
@@ -18,8 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any, Callable, Iterable
 
-from . import hubgit, netoff, prompts
-from .models import USER, Status, ToolError
+from . import hubgit, mailbox, netoff, prompts
+from .models import USER, ReadRefusal, Status, ToolError
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,10 @@ SKILLS_MIRROR = f"{SCRATCH_DIR}/_skills"
 GIT_LOCATION_VARS = frozenset({"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX"})
 BINARY_PROBE_BYTES = 8192
+# what a read-before-write refusal (models.ReadRefusal) leaves of max(200, [agents] tool_output_chars) for the
+# `Error: ` prefix and any note call_tool adds; the file refusals and the forum's use it alike (docs/SPEC.md §7.3,
+# §22.11)
+REFUSAL_RESERVE = 300
 LIST_MAX_ENTRIES = 500
 TREE_MAX_ENTRIES = 5000
 MAX_LOCK_MINUTES = 24 * 60
@@ -61,6 +66,47 @@ HELD_OTHERS = " ({names} also had a command running then; git cannot tell who wr
 COMMITTED_FILES_MAX = 200  # the files a files.committed event lists; the rest is its `more` (docs/SPEC.md §22.2)
 HARD_LINK_REFUSED = ("'{rel}' has another hard link, which may be a file outside the workspace or inside .git: "
                      "write_file and edit_file do not change it. Write the content to a new path instead.")
+# File read marks (docs/SPEC.md §7.3): kv rows `file_read:<member>:<path key>`, value "<sha256>" (whole: every line
+# seen at that hash) or "<sha256>:<ranges>" (partial: the 1-based line ranges seen, "1-400,801-1200", maybe empty)
+FILE_READ_PREFIX = "file_read:"
+MISSING_SHOWN = 10  # line ranges a write_file refusal names as not read; the rest as ", …"
+# The read-before-write refusals of write_file and edit_file (docs/SPEC.md §7.3 "The refusal"), in the member's
+# language (en for an unknown one): `head` with one `why_*`, then one of `fits` (and the file), `long_*`, `binary`
+UNREAD_FILE_TEXTS: dict[str, dict[str, str]] = {
+    "en": {
+        "why_unread": "exists, and you have not read it",
+        "why_changed": "changed since you last read or wrote it",
+        "why_partial": "has lines you have not read since it last changed ({missing})",
+        "head": "Not written: '{rel}' {why} ({size}). You may overwrite or edit a file only after reading its current "
+                "content (another member, a command or git may have changed it).",
+        "fits": "Its current content is below and now counts as read: if your change still fits it, send it again "
+                "(for `edit_file`, copy old_text from this text).",
+        "long_edit": "It is too long to show here (lines: {lines}): read it with `read_file` (offset and limit; for "
+                     "`edit_file` the part you change is enough), then send your change again.",
+        "long_write": "It is too long to show here (lines: {lines}): `write_file` replaces the whole file, so read "
+                      "with `read_file` (offset and limit) every line you have not read since it changed, or change "
+                      "it with `edit_file`; then send your change again.",
+        "binary": "It is a binary file, which `read_file` cannot show; this refusal counts as reading it: send your "
+                  "change again if it is still right.",
+    },
+    "ru": {
+        "why_unread": "уже существует, а ты его не читал(а)",
+        "why_changed": "изменился с тех пор, как ты его читал(а) или писал(а)",
+        "why_partial": "содержит строки, которые ты не читал(а) с тех пор, как он изменился ({missing})",
+        "head": "Не записано: '{rel}' {why} ({size}). Перезаписывать или править файл можно, только прочитав его "
+                "текущее содержимое (его мог изменить другой участник, команда или git).",
+        "fits": "Его текущее содержимое ниже и теперь считается прочитанным: если твое изменение ему еще подходит, "
+                "отправь его снова (для `edit_file` копируй old_text из этого текста).",
+        "long_edit": "Он слишком длинный, чтобы показать его здесь (строк: {lines}): прочитай его через `read_file` "
+                     "(offset и limit; для `edit_file` достаточно той части, которую ты меняешь), затем отправь "
+                     "изменение снова.",
+        "long_write": "Он слишком длинный, чтобы показать его здесь (строк: {lines}): `write_file` заменяет весь "
+                      "файл, поэтому прочитай через `read_file` (offset и limit) все строки, которые ты не читал(а) "
+                      "с тех пор, как он изменился, или измени его через `edit_file`; затем отправь изменение снова.",
+        "binary": "Это двоичный файл, `read_file` его не покажет; этот отказ считается его прочтением: отправь "
+                  "изменение снова, если оно еще верно.",
+    },
+}
 # Directories shown but never expanded in listings (dependency caches, virtualenvs).
 NO_EXPAND = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
                        ".pytest_cache", ".ruff_cache", ".tox"})
@@ -162,6 +208,61 @@ def shown_list(items: list[str], limit: int = WAITERS_SHOWN) -> str:
 def in_scratch(rel: str) -> bool:
     """`rel` (workspace-relative, "/"-separated) is `.scratch` or inside it."""
     return _covers(SCRATCH_DIR, rel.rstrip("/"))
+
+
+def file_digest(data: bytes) -> str:
+    """The hash a file read mark keeps of a file's bytes (docs/SPEC.md §7.3)."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def merge_ranges(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sorted, with overlapping and adjacent ranges joined: [(1, 3), (4, 6), (9, 9)] -> [(1, 6), (9, 9)]."""
+    out: list[tuple[int, int]] = []
+    for first, last in sorted(ranges):
+        if out and first <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], last))
+        else:
+            out.append((first, last))
+    return out
+
+
+def format_ranges(ranges: Iterable[tuple[int, int]], sep: str = ",") -> str:
+    """"1-400,801-1200" (a single line as "7"); a refusal names them with sep ", "."""
+    return sep.join(f"{a}-{b}" if a != b else str(a) for a, b in ranges)
+
+
+def parse_ranges(text: str) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for part in (text or "").split(","):
+        first, _, last = part.strip().partition("-")
+        if first.isdigit() and (not last or last.isdigit()):
+            out.append((int(first), int(last or first)))
+    return merge_ranges(out)
+
+
+def parse_file_mark(value: Any) -> tuple[str, list[tuple[int, int]] | None] | None:
+    """(sha256, None) for a whole mark, (sha256, ranges) for a partial one, None for no mark or a malformed one."""
+    if not isinstance(value, str) or not value:
+        return None
+    digest, sep, ranges = value.partition(":")
+    if not digest:
+        return None
+    return (digest, parse_ranges(ranges)) if sep else (digest, None)
+
+
+def unread_ranges(ranges: list[tuple[int, int]], total: int) -> list[tuple[int, int]]:
+    """The line ranges of 1..total that `ranges` (merged) leave out."""
+    out: list[tuple[int, int]] = []
+    line = 1
+    for first, last in ranges:
+        if first > line:
+            out.append((line, min(first - 1, total)))
+        line = max(line, last + 1)
+        if line > total:
+            break
+    if line <= total:
+        out.append((line, total))
+    return [(a, b) for a, b in out if a <= b]
 
 
 def scratch_is_local(root: Path) -> bool:
@@ -1021,7 +1122,9 @@ class Workspace:
         except OSError as exc:
             raise ToolError(f"Cannot read '{rel}': {exc.strerror or exc}.") from exc
 
-    def read(self, path: str, offset: int = 1, limit: int = 400) -> str:
+    def read(self, path: str, offset: int = 1, limit: int = 400, actor: str | None = None) -> str:
+        """Lines offset..offset+limit-1 of a text file. For a member `actor` (and the members it is seen as) it also
+        records what the result showed as the file read mark (docs/SPEC.md \u00a77.3), from the bytes read here."""
         p, rel = self._existing_file(path)
         data = self._read_bytes(p, rel)
         if b"\x00" in data[:BINARY_PROBE_BYTES]:
@@ -1029,6 +1132,7 @@ class Workspace:
         lines = _split_lines(data.decode("utf-8", errors="replace").removeprefix("\ufeff"))
         total = len(lines)
         if total == 0:
+            self._mark_seen(actor, rel, file_digest(data), None, total)
             return f"[{rel}: empty file, 0 lines]"
         offset = max(1, int(offset or 1))
         limit = max(1, int(limit or 400))
@@ -1040,6 +1144,8 @@ class Workspace:
         # reserve room for the longest possible header and note so the result stays within max_chars
         reserve = len(self._header(rel, total, total, total)) + len(self._note(max_chars, total, total - 1, "line")) + 2
         body, end, cut = self._fit(lines, offset, end, max(80, max_chars - reserve))
+        # a single line _fit cut to its head counts as seen: no tool shows more of a line
+        self._mark_seen(actor, rel, file_digest(data), [(offset, end)], total)
         parts = [self._header(rel, offset, end, total), body]
         if cut or end < total:
             parts.append(self._note(max_chars, total, end, cut))
@@ -1089,6 +1195,123 @@ class Workspace:
             return f"[binary file, {format_size(size)}]", False
         return data.decode("utf-8", errors="replace"), size > len(data)
 
+    # --- file read marks (docs/SPEC.md §7.3) ----------------------------------------------------
+    # A member overwrites or edits an existing file only while it has read the file's current content. The marks are
+    # kv rows in both modes (a board database stays importable into 0.4.x, which ignores kv rows of a new key).
+    @staticmethod
+    def _mark_key(name: str, rel: str) -> str:
+        return f"{FILE_READ_PREFIX}{name}:{path_key(rel)}"
+
+    def _is_member(self, name: str) -> bool:
+        check = getattr(self.swarm, "is_member", None)
+        return bool(name and name != USER and check is not None and check(name))
+
+    @staticmethod
+    def _own_scratch(name: str, rel: str) -> bool:
+        """`rel` is in the member's own scratch folder, whose reads and writes record no marks and need none."""
+        return _covers(scratch_rel(name).rstrip("/"), rel)
+
+    def _mark_names(self, actor: str | None, rel: str) -> list[str]:
+        """Whose marks a call of `actor` on `rel` moves: the actor when it is a member and the members it is seen as
+        during the call (mailbox.seen_as: an MCP client acting as several members, or reading as USER), each only
+        while it is a member (a retired name keeps no row) and never in its own scratch folder."""
+        if not actor or self._own_scratch(actor, rel):
+            return []
+        names: list[str] = []
+        for name in (actor, *sorted(mailbox.seen_as(actor))):
+            if name not in names and not self._own_scratch(name, rel) and self._is_member(name):
+                names.append(name)
+        return names
+
+    def file_mark(self, name: str, rel: str) -> tuple[str, list[tuple[int, int]] | None] | None:
+        """The member's mark of `rel` (workspace-relative): (sha256, None) whole, (sha256, ranges) partial, or None."""
+        return parse_file_mark(self.swarm.db.get(self._mark_key(name, rel)))
+
+    def _mark_seen(self, actor: str | None, rel: str, digest: str, ranges: list[tuple[int, int]] | None,
+                   total: int = 0) -> None:
+        """Record that `actor` (and whom it is seen as) saw lines `ranges` of the file's bytes of hash `digest`, or
+        all of them (ranges None: a whole mark). At the mark's hash the ranges merge, a whole mark stays whole, and a
+        mark that covers lines 1..total becomes whole; at another hash this replaces the mark."""
+        for name in self._mark_names(actor, rel):
+            value = digest
+            if ranges is not None:
+                prior = self.file_mark(name, rel)
+                if prior is not None and prior[0] == digest and prior[1] is None:
+                    continue  # whole already
+                seen = merge_ranges([*ranges, *(prior[1] if prior is not None and prior[0] == digest else [])])
+                if unread_ranges(seen, total):
+                    value = f"{digest}:{format_ranges(seen)}"
+            self.swarm.db.set(self._mark_key(name, rel), value)
+
+    def _mark_edited(self, actor: str, rel: str, before: str, after: str) -> None:
+        """An edit_file write moved the file from hash `before` to `after`: a whole mark at `before` becomes whole
+        at `after`, any other one partial with no ranges (the edit moved lines; the rest is still unread)."""
+        for name in self._mark_names(actor, rel):
+            prior = self.file_mark(name, rel)
+            whole = prior is not None and prior[0] == before and prior[1] is None
+            self.swarm.db.set(self._mark_key(name, rel), after if whole else f"{after}:")
+
+    def drop_file_reads(self, name: str) -> int:
+        """Delete the member's file read marks (it leaves the team, Swarm.retire). Returns the rows deleted."""
+        prefix = f"{FILE_READ_PREFIX}{name}:"
+        cursor = self.swarm.db.execute("DELETE FROM kv WHERE substr(key, 1, ?) = ?", (len(prefix), prefix))
+        return max(0, cursor.rowcount)
+
+    def _language(self, actor: str) -> str:
+        language_of = getattr(self.swarm, "language_of", None)
+        try:
+            lang = language_of(actor) if language_of is not None else "en"
+        except Exception:  # noqa: BLE001 - only the wording depends on it
+            lang = "en"
+        return lang if lang in UNREAD_FILE_TEXTS else "en"
+
+    def _check_read(self, actor: str, rel: str, raw: bytes, tool: str) -> None:
+        """Refuse (ReadRefusal) a write_file or edit_file (`tool`) of the existing file `rel`, whose bytes now are
+        `raw`, unless `actor` read or wrote them: a member's mark at their hash, whole for write_file. Passes for an
+        actor that is no member, a file of 0 bytes and the actor's own scratch folder. Run under _io_lock, after
+        check_writable. The refusal shows the file when it fits and then counts as reading it."""
+        if not raw or not self._is_member(actor) or self._own_scratch(actor, rel):
+            return
+        digest = file_digest(raw)
+        mark = self.file_mark(actor, rel)
+        if mark is not None and mark[0] == digest and (mark[1] is None or tool == "edit_file"):
+            return
+        texts = UNREAD_FILE_TEXTS[self._language(actor)]
+        lines = _split_lines(raw.decode("utf-8", errors="replace").removeprefix("﻿"))
+        total = len(lines)
+        if mark is None:
+            why = texts["why_unread"]
+        elif mark[0] != digest:
+            why = texts["why_changed"]
+        else:  # a partial mark at the current hash, for write_file
+            gaps = unread_ranges(mark[1] or [], total)
+            missing = ("all" if not mark[1] else format_ranges(gaps[:MISSING_SHOWN], ", ")
+                       + (", …" if len(gaps) > MISSING_SHOWN else ""))
+            why = texts["why_partial"].format(missing=missing)
+        head = texts["head"].format(rel=rel, why=why, size=format_size(len(raw)))
+        if b"\x00" in raw[:BINARY_PROBE_BYTES]:  # write_file only: edit() leaves a binary file to _apply_edit
+            self._mark_seen(actor, rel, digest, None)
+            raise ReadRefusal(f"{head} {texts['binary']}")
+        intro = f"{head} {texts['fits']}"
+        shown = self._whole_rendering(rel, lines, self._max_chars() - REFUSAL_RESERVE - len(intro) - 1)
+        if shown is not None:
+            self._mark_seen(actor, rel, digest, None)
+            raise ReadRefusal(f"{intro}\n{shown}")
+        raise ReadRefusal(f"{head} " + texts["long_edit" if tool == "edit_file" else "long_write"].format(lines=total))
+
+    def _whole_rendering(self, rel: str, lines: list[str], budget: int) -> str | None:
+        """read()'s rendering of every line of the file (its header and lines) when _fit shows them all uncut within
+        `budget` characters, else None: a refusal never shows a part of a file and calls it read."""
+        if not lines:
+            empty = f"[{rel}: empty file, 0 lines]"
+            return empty if len(empty) <= budget else None
+        header = self._header(rel, 1, len(lines), len(lines))
+        room = budget - len(header) - 1
+        if room <= 0:
+            return None
+        body, end, cut = self._fit(lines, 1, len(lines), room)
+        return f"{header}\n{body}" if not cut and end == len(lines) else None
+
     # --- writing ------------------------------------------------------------------------------
     def _refuse_skills_mirror(self, rel: str) -> None:
         """write_file / edit_file never change the swarm's skills: the mirror is rebuilt from the session's copies
@@ -1120,12 +1343,18 @@ class Workspace:
         if p.is_dir():
             raise ToolError(f"'{rel}' is a directory; give a file path.")
         data = _encode(content or "", "content")
+        digest = file_digest(data)
         async with self._io_lock:
             self.check_writable(actor, rel)
             existed = p.exists()
-            if existed and self._read_bytes(p, rel) == data:
+            current = self._read_bytes(p, rel) if existed else b""
+            if existed and current == data:
+                self._mark_seen(actor, rel, digest, None)  # the member's content is the file's
                 return f"{rel} unchanged (same content)."
-            commit = await self._store_and_commit(actor, p, rel, data, "write" if existed else "create")
+            if existed:
+                self._check_read(actor, rel, current, "write_file")
+            commit = await self._store_and_commit(actor, p, rel, data, "write" if existed else "create",
+                                                  stored=lambda: self._mark_seen(actor, rel, digest, None))
         verb = "Updated" if existed else "Created"
         n = len(_split_lines(content or ""))
         return (f"{verb} {rel} ({n} line{'s' if n != 1 else ''}, {format_size(len(data))})"
@@ -1141,10 +1370,16 @@ class Workspace:
             self._refuse_skills_mirror(rel)
             self._refuse_hardlink(rel, p)
             self.check_writable(actor, rel)
-            updated, replaced = self._apply_edit(rel, self._read_bytes(p, rel), old, new, replace_all)
+            raw = self._read_bytes(p, rel)
+            if b"\x00" not in raw[:BINARY_PROBE_BYTES]:  # a binary file: _apply_edit's own refusal, never a read one
+                self._check_read(actor, rel, raw, "edit_file")
+            updated, replaced = self._apply_edit(rel, raw, old, new, replace_all)
             if updated is None:
                 return f"{rel} unchanged (old_text equals new_text)."
-            commit = await self._store_and_commit(actor, p, rel, updated.encode("utf-8"), "edit")
+            data = updated.encode("utf-8")
+            before, after = file_digest(raw), file_digest(data)
+            commit = await self._store_and_commit(actor, p, rel, data, "edit",
+                                                  stored=lambda: self._mark_edited(actor, rel, before, after))
         return (f"Edited {rel}: replaced {replaced} occurrence{'s' if replaced != 1 else ''}"
                 + self._commit_note(commit, rel))
 
@@ -1223,8 +1458,10 @@ class Workspace:
         except OSError as exc:
             raise ToolError(f"Cannot write '{rel}': {exc.strerror or exc}.") from exc
 
-    async def _store_and_commit(self, actor: str, p: Path, rel: str, data: bytes, op: str) -> str | None:
-        """Write the file, emit file.changed and commit only this path as `actor`.
+    async def _store_and_commit(self, actor: str, p: Path, rel: str, data: bytes, op: str,
+                                stored: Callable[[], None] | None = None) -> str | None:
+        """Write the file, emit file.changed and commit only this path as `actor`. `stored` runs once the write
+        succeeded (the file read marks move then, docs/SPEC.md §7.3), never for a write whose call was cancelled.
 
         The git lock is held from the write to the commit so that no other commit (e.g. a shell
         autocommit doing `add -A`) picks the change up under another member's name."""
@@ -1238,6 +1475,8 @@ class Workspace:
             try:
                 await asyncio.shield(store)
                 self.swarm.bus.emit("file.changed", actor, path=rel, op=op)
+                if stored is not None:
+                    stored()
             except asyncio.CancelledError:
                 # cancelled (e.g. the member stopped) while the thread goes on writing: the path stays in flight until
                 # the thread ends, and a write that lands is still this member's change

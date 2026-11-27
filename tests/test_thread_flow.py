@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 import pytest
 
+from dreamteam import prompts
 from dreamteam import swarm as swarm_module
 from dreamteam.config import Config
 from dreamteam.forum import SETTLE_KEY
@@ -47,7 +48,9 @@ def make_config(tmp_path: Path, mode: str = "thread") -> Config:
 
 class Team:
     """The agents' scripts: each activation records its wake-up text and answers with the next batch of tool calls
-    queued for the agent (none: just `wait`), always ending the turn with `wait`."""
+    queued for the agent (none: just `wait`), always ending the turn with `wait`. A forum write refused for news the
+    agent had not read (docs/SPEC.md §22.11) is sent again in the next step: the refusal showed the news, and the
+    scripted agent still wants its write."""
 
     def __init__(self) -> None:
         self.todo: dict[str, list[list[dict]]] = {}
@@ -58,6 +61,9 @@ class Team:
             last = messages[-1] if messages else {}
             if last.get("role") == "user":
                 self.wakes.setdefault(agent, []).append(str(last.get("content") or ""))
+            retry = _refused_writes(messages)
+            if retry:
+                return {"tool_calls": [*retry, WAIT_CALL]}
             queue = self.todo.get(agent) or []
             batch = queue.pop(0) if queue else []
             return {"tool_calls": [*batch, WAIT_CALL]}
@@ -73,6 +79,23 @@ class Team:
 
 def call(name: str, **arguments: Any) -> dict:
     return {"name": name, "arguments": arguments}
+
+
+REFUSALS = ("Error: Not sent:", "Error: Not posted:", "Error: Not changed:")   # the forum's (§22.11)
+
+
+def _refused_writes(messages: list[dict]) -> list[dict]:
+    """The calls of the last response whose results are read-before-write refusals of the forum."""
+    results = []
+    for message in reversed(messages):
+        if message.get("role") != "tool":
+            break
+        results.append(message)
+    refused = {m.get("tool_call_id") for m in results if str(m.get("content") or "").startswith(REFUSALS)}
+    if not refused:
+        return []
+    sent = messages[-len(results) - 1] if len(messages) > len(results) else {}
+    return [call(c["name"], **c["arguments"]) for c in sent.get("tool_calls") or () if c.get("id") in refused]
 
 
 @pytest.fixture(autouse=True)
@@ -185,6 +208,16 @@ async def act(sw: Swarm, actor: str, name: str, args: dict) -> str:
 def tool_errors(sw: Swarm) -> list[str]:
     return [e["data"].get("text", "") for e in sw.bus.recent(types=("agent.activity",), limit=10000)
             if e["data"].get("kind") == "tool_result" and e["data"].get("is_error")]
+
+
+def tool_results(sw: Swarm) -> list[tuple[str, str, bool]]:
+    """Every tool result of the run in order: (agent, text, is_error)."""
+    return [(e["data"].get("agent", ""), e["data"].get("text", ""), bool(e["data"].get("is_error")))
+            for e in sw.bus.recent(types=("agent.activity",), limit=10000) if e["data"].get("kind") == "tool_result"]
+
+
+def agent_tool_errors(sw: Swarm) -> list[tuple[str, str]]:
+    return [(agent, text) for agent, text, is_error in tool_results(sw) if is_error]
 
 
 async def kicked_off(tmp_path: Path, open_swarms: list, todo: Callable[[list[str]], dict] | None = None,
@@ -339,7 +372,18 @@ async def test_a_thread_session_delivers_batches_and_watches_its_quiet(tmp_path,
         await passes_go_by(sw, passes, 5)
         assert len(rows(sw, kind="n_thread_quiet")) == swarm_module.TEAM_ASLEEP_MAX
         assert len(rows(sw, USER, "u_thread_quiet")) == 1
-        assert not tool_errors(sw)
+        # the only errors: the second of the two comments on #4 refused for the first one, which its author had not
+        # read (both answered the user's post at once, docs/SPEC.md §22.11), and the `wait` of that same response
+        # held after it; the comment sent again went through (`told` above has both)
+        held = "Error: " + prompts.t("en", "wait_refused", tool="comment")
+        errors = agent_tool_errors(sw)
+        assert len(errors) == 2, errors
+        (late, refusal), (waiter, wait_error) = errors
+        assert late in (a, b) and waiter == late
+        assert refusal.startswith('Error: Not sent: #4 "Style" has what you have not read') and wait_error == held
+        results = [r for r in tool_results(sw) if r[0] == late]
+        at = results.index((late, refusal, True))
+        assert results[at + 1] == (late, held, True)  # consecutive: the held `wait` of the refused response
         assert sw.goal()["status"] == "active"
     finally:
         await sw.stop()

@@ -744,6 +744,8 @@ async def test_file_tools(swarm):
     assert "not by you" in await err(swarm, b, "lock_file", {"path": "src/app.py", "unlock": True})
     assert await ok(swarm, a, "lock_file", {"path": "src/app.py", "unlock": "true"}) == "Unlocked src/app.py."
     assert notifications(swarm, b)[-1] == "n_lock_free"
+    # b read one line and edited: write_file replaces the whole file, so it reads it all first (docs/SPEC.md §7.3)
+    await ok(swarm, b, "read_file", {"path": "src/app.py"})
     await ok(swarm, b, "write_file", {"path": "src/app.py", "content": "mine"})
     # the user reads files but does not write them
     assert "mine" in await ok(swarm, USER, "read_file", {"path": "src/app.py"})

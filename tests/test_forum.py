@@ -18,6 +18,7 @@ from dreamteam.config import Config
 from dreamteam.forum import GOAL_POST, PLAN_POST, Forum, goal_tally
 from dreamteam.models import USER, AgentKind, ToolError
 from dreamteam.swarm import Swarm
+from helpers.forum_reads import read_all
 
 ANNA, BOB, CARL, DORA, EVE = "Anna Smith", "Bob Stone", "Carl Brown", "Dora White", "Eve Black"
 
@@ -152,6 +153,7 @@ def test_the_system_posts_in_russian(make_swarm):
 def test_a_rewrite_resets_the_votes_on_1_only(sw, delivered):
     add(sw, ANNA), add(sw, BOB)
     set_goal(sw)
+    read_all(sw, ANNA)
     c = sw.forum.comment(ANNA, 2, "I take the lexer.")
     sw.forum.vote(BOB, "p1", "dislike")
     sw.forum.vote(BOB, "p2", "like")
@@ -292,6 +294,7 @@ def test_comments(sw):
         sw.forum.comment(BOB, post["id"], "x" * 20001)
     assert str(err.value) == ("Comment is too long (20001 chars, max 20000). Put long content into a workspace file "
                               "and comment its path.")
+    read_all(sw, BOB)
     first = sw.forum.comment(BOB, post["id"], " first ")
     assert set(first) == {"id", "post_id", "author", "text", "reply_to", "ts", "likes", "dislikes"}
     assert (first["post_id"], first["author"], first["text"], first["reply_to"]) == (post["id"], BOB, "first", None)
@@ -300,6 +303,7 @@ def test_comments(sw):
     with pytest.raises(ToolError) as err:
         sw.forum.comment(ANNA, post["id"], "reply", reply_to=elsewhere["id"])
     assert str(err.value) == f"No comment c{elsewhere['id']} on #{post['id']}"
+    read_all(sw, ANNA)
     reply = sw.forum.comment(ANNA, post["id"], "reply", reply_to=first["id"])
     assert reply["reply_to"] == first["id"]
     [_, _, event] = events(sw, "post.comment")
@@ -319,6 +323,7 @@ def test_comments(sw):
 def test_votes_on_posts_and_comments(sw, delivered):
     add(sw, ANNA), add(sw, BOB), add(sw, CARL)
     post = sw.forum.create(ANNA, "Topic", "")
+    read_all(sw, BOB)
     comment = sw.forum.comment(BOB, post["id"], "hm")
     with pytest.raises(ToolError, match=r"^You cannot vote on your own post\.$"):
         sw.forum.vote(ANNA, f"#{post['id']}", "like")
@@ -525,6 +530,7 @@ def test_the_feed_order_and_filters(sw):
     add(sw, ANNA), add(sw, BOB)
     set_goal(sw)
     a = sw.forum.create(ANNA, "Parser notes", "Про ПАРСЕР")
+    read_all(sw, BOB)
     b = sw.forum.create(BOB, "Lexer", "tokens")
     c = sw.forum.create(USER, "From the user", "")
     sw.forum.comment(BOB, a["id"], "bump")
@@ -666,11 +672,15 @@ def test_similar_open(sw):
     add(sw, ANNA), add(sw, BOB)
     set_goal(sw, "Parser benchmark results", "")
     other = sw.forum.create(BOB, "Parser benchmark results", "Numbers for the parser.\n\nDetails later.")
+    read_all(sw, ANNA)
     own = sw.forum.create(ANNA, "Benchmark parser results", "")
+    read_all(sw, BOB)
     sw.forum.create(BOB, "Weather report", "")
+    read_all(sw, ANNA)
     new = sw.forum.create(ANNA, "Results of the parser benchmark", "We ran it.")
     assert [p["id"] for p in sw.forum.similar_open(new)] == [other["id"]]  # not its own, not #1 / #2
     assert own["id"] not in [p["id"] for p in sw.forum.similar_open(new)]
+    read_all(sw, BOB)
     many = [sw.forum.create(BOB, f"Parser benchmark results {word}", "") for word in ("one", "two", "three", "four")]
     assert len(sw.forum.similar_open(new)) == 3 and many
     assert forummod.post_goal("First paragraph\n  \nsecond") == "First paragraph"
@@ -713,6 +723,7 @@ def test_asks_user_holds_for_the_asker_until_it_comments_on_2(make_swarm):
     assert sw.asks_user(ANNA) and sw._awaits_user_answer(ANNA) and not sw._in_clarify_phase(ANNA)
     assert not sw.asks_user(BOB)                                   # only the asker of #2
     assert sw.snapshot()["swarm"]["clarify_wait"] == {"name": ANNA, "post_id": PLAN_POST}
+    read_all(sw, ANNA)
     sw.forum.comment(ANNA, PLAN_POST, "Decisions: JSON.")
     assert not sw.asks_user(ANNA) and not sw._awaits_user_answer(ANNA)
     assert sw.snapshot()["swarm"]["clarify_wait"] is None
@@ -726,6 +737,7 @@ def test_asks_user_holds_for_the_asker_until_it_comments_on_2(make_swarm):
 def test_an_old_message_or_comment_does_not_end_a_new_clarify_phase(make_swarm):
     sw = _clarify_swarm(make_swarm)
     sw.mail.send(ANNA, ["user"], "Questions about the first goal")
+    read_all(sw, ANNA)
     sw.forum.comment(ANNA, PLAN_POST, "Decisions for the first goal.")
     assert not sw._in_clarify_phase(ANNA)
     _age(sw)
@@ -792,6 +804,7 @@ def test_no_clarify_hint_once_the_asker_asked_or_commented(make_swarm):
     assert "p2" not in sw._planning_watch and not _kinds_to(sw, ANNA, "n_clarify_hint_thread")
     other = _clarify_swarm(make_swarm)
     other.runtimes[ANNA] = runtime
+    read_all(other, ANNA)
     other.forum.comment(ANNA, PLAN_POST, "No questions.")
     other.hint_planner(ANNA)
     assert not _kinds_to(other, ANNA, "n_clarify_hint_thread")
@@ -821,6 +834,7 @@ def test_clarify_switched_off_tells_the_asker_once(make_swarm):
     asked._clarify_switched_off(once=True)
     assert _kinds_to(asked, ANNA, "n_clarify_off_thread") == 1
     done = _clarify_swarm(make_swarm)
+    read_all(done, ANNA)
     done.forum.comment(ANNA, PLAN_POST, "No questions.")
     done._clarify_switched_off()
     assert not _kinds_to(done, ANNA, "n_clarify_off_thread")

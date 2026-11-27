@@ -18,6 +18,7 @@ from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentKind, Status
 from dreamteam.swarm import Swarm
 from dreamteam.tools import ToolContext, call_tool
+from helpers.forum_reads import read_all
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -94,7 +95,9 @@ async def test_the_snapshot_of_a_thread_session(thread):
     a, b, c_ = llm_names(thread)
     thread.set_goal(USER, "Build the parser", "With tests.")
     first = thread.forum.create(a, "Lexer first", "The plan.")
+    read_all(thread, b)
     second = thread.forum.create(b, "Parser", "")
+    read_all(thread, c_)
     thread.forum.comment(c_, first["id"], "Agreed")
     thread.forum.vote(USER, f"#{first['id']}", "like")
     thread.forum.vote(USER, f"#{second['id']}", "dislike")
@@ -148,7 +151,9 @@ async def test_a_snapshot_poll_costs_a_fixed_number_of_queries(thread):
 
     few = queries()
     for n in range(12):
+        read_all(thread, a, b)
         post = thread.forum.create(a if n % 2 else b, f"Post {n}", "text")
+        read_all(thread, a, b)
         thread.forum.comment(b if n % 2 else a, post["id"], "comment")
         thread.forum.vote(USER, f"#{post['id']}", "like")
     await as_member(thread, a, "subscribe", {"what": "file", "target": "src"})
@@ -159,7 +164,9 @@ async def test_a_post_and_its_comments(thread):
     a, b, c_ = llm_names(thread)
     thread.set_goal(USER, "Build the parser")
     post = thread.forum.create(a, "Lexer first", "The **plan**.")
+    read_all(thread, b)
     one = thread.forum.comment(b, post["id"], "Agreed")
+    read_all(thread, c_)
     reply = thread.forum.comment(c_, post["id"], "Me too", reply_to=one["id"])
     thread.forum.vote(USER, f"c{one['id']}", "like")
     thread.forum.vote(b, f"#{post['id']}", "dislike")

@@ -31,6 +31,7 @@ from test_web_thread import BASE, llm_names, make_swarm
 
 from dreamteam import web
 from dreamteam.models import USER
+from helpers.forum_reads import read_all
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -802,7 +803,9 @@ async def test_the_thread_tab_renders_a_real_thread_snapshot(tmp_path):
         a, b, c = llm_names(sw)
         sw.set_goal(USER, "Build the parser", "With tests.")
         post = sw.forum.create(a, "Lexer first", f"The **plan**, @{b}.")
+        read_all(sw, b)
         one = sw.forum.comment(b, post["id"], "Agreed")
+        read_all(sw, c)
         reply = sw.forum.comment(c, post["id"], "Me too", reply_to=one["id"])
         sw.forum.vote(a, "#1", "like")
         sw.forum.vote(USER, f"#{post['id']}", "like")

@@ -45,6 +45,8 @@ QUIET_KEY = "_quiet"  # notifications.data flag of a member notification sent wi
 # ... and of a digest item of the forum's delivery (notify(..., batch=True), thread sessions; docs/SPEC.md §22.3)
 DIGEST_KEY = "_digest"
 DIGEST_SHOWN = 30  # the wake-up's digest group shows at most this many rows (§22.6)
+# notifications.data of a thread notice: the read marks its text carries whole, applied once it is shown (§22.11)
+READ_KEY = "_read"
 SCHEDULER_SECONDS = 3.0
 TRACE_PRUNE_SECONDS = 6 * 3600
 # An agent nudged about ready tasks is "considering" them until it claims a task, goes idle again or
@@ -876,6 +878,8 @@ class Swarm:
             lines.extend(f"• {at(n['ts'])}{n['text']}" for n in digest[:DIGEST_SHOWN])
             if len(digest) > DIGEST_SHOWN:
                 lines.append(prompts.t(lang, "digest_more", n=len(digest) - DIGEST_SHOWN))
+        if thread and (notes or digest):  # what it prints moves read marks; a digest row left out does not
+            self.forum.note_shown(name, [*notes, *digest[:DIGEST_SHOWN]])
         if not incoming:
             goal = self.goal()
             if goal:
@@ -1055,13 +1059,14 @@ class Swarm:
                 self.forum.set_plan_asker(asker)
         key = "n_kickoff_thread" if first else "n_goal_updated_thread"
         extra = {"team": team} if first else {}
+        extra[READ_KEY] = self.forum.system_reads()  # #1 and #2 as written for this goal (docs/SPEC.md §22.11)
         for i, name in enumerate(self._llm_order(goal["updated_at"])):
             if asker is None:
                 self.notify_later(i * stagger, name, key, by=actor, title=goal["title"], description=description,
                                   **extra)
             elif name == asker:
                 self.notify(name, "n_kickoff_thread_clarify", by=actor, title=goal["title"], description=description,
-                            team=team)
+                            team=team, **{READ_KEY: extra[READ_KEY]})
             else:  # they wake on the asker's comment on #2 (their automatic #2 subscription, docs/SPEC.md §22.3)
                 self.notify(name, key, wake=False, by=actor, title=goal["title"], description=description, **extra)
 
@@ -1134,11 +1139,12 @@ class Swarm:
         if self.forum is not None:
             # the votes on #1 cleared, the comment posted there; every LLM member is woken, staggered in the
             # kickoff's shuffled order (nobody re-plans for the others)
-            self.forum.reopen(actor, comment)
+            posted = self.forum.reopen(actor, comment)
+            reads = {READ_KEY: {f"c{posted}": None}} if posted else {}  # the notice carries it whole (§22.11)
             stagger = max(0.0, self.config.agents.stagger_seconds)
             for i, name in enumerate(self._llm_order(goal["updated_at"])):
                 self.notify_later(i * stagger, name, "n_goal_reopened_thread", title=goal["title"],
-                                  comment=comment or "-")
+                                  comment=comment or "-", **reads)
             return goal
         # One member re-plans: the one who declared the goal achieved, else the most recently active. Waking
         # everyone at once made them all create tasks for the same missing parts; the others are offered the
@@ -1255,9 +1261,11 @@ class Swarm:
         self.jobs.forbid(name)
         released = self.board.release_all(name, by)
         self.workspace.release_all(name)
+        self.workspace.drop_file_reads(name)  # its file read marks (docs/SPEC.md §7.3)
         self.db.execute("UPDATE triggers SET active = 0 WHERE owner = ?", (name,))
         if self.forum is not None:
             self.forum.drop_subscriptions(name)  # every row, the feed one too (docs/SPEC.md §22.3)
+            self.forum.drop_reads(name)  # its read marks of posts and comments (docs/SPEC.md §22.11)
         self.db.execute("UPDATE agents SET status = ? WHERE name = ?", (AgentStatus.RETIRED, name))
         self.bus.emit("agent.retired", by, name=name, reason=reason, released=released, jobs=jobs)
         q = self.pending_question()

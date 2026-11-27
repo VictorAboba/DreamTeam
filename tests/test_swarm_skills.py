@@ -391,6 +391,9 @@ async def test_a_copy_of_the_mirror_can_be_edited_and_proposed(swarm, tmp_path):
     copy = Path(swarm.workspace.root, "drafts", "fold-copy")
     shutil.copytree(mirror(swarm, "fold"), copy)   # (what an agent's shell copy does)
     assert not writable(copy / "SKILL.md") and not writable(copy / "scripts" / "run.py")
+    for path in ("drafts/fold-copy/SKILL.md", "drafts/fold-copy/scripts/run.py"):   # existing files: read first
+        text, is_error = await call_tool(ctx, "read_file", {"path": path})           # (docs/SPEC.md §7.3)
+        assert not is_error, text
     text, is_error = await call_tool(ctx, "edit_file", {"path": "drafts/fold-copy/SKILL.md", "old_text": "name: fold",
                                                         "new_text": "name: fold-better"})
     assert not is_error, text

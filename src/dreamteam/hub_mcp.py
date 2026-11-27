@@ -59,7 +59,11 @@ To work INSIDE the swarm as a member, call `join_swarm(role=...)`: you get a uni
 `as_agent="<that name>"` in every call. Members claim tasks (`task_claim`), write shared files (`write_file`,
 `edit_file`), run commands in the swarm workspace (`shell`), build and call MCP tools (`mcp_create`,
 `mcp_call`), finish tasks (`task_complete`) and receive events with `wait_for_events`. Members who join this way do
-not count toward the swarm's agent limit (max_agents). A `shell` command still running at its timeout (at most 600
+not count toward the swarm's agent limit (max_agents). As a member, `write_file` and `edit_file` of an existing file
+are refused while it changed since you last read or wrote it, or you never read it (`write_file` of a long file
+needs every line read: else use `edit_file`); the refusal shows the current content and counts as reading it (a
+long file it cannot show: read that with `read_file`), so a retry passes.
+A `shell` command still running at its timeout (at most 600
 seconds over MCP) continues as a background job, and background=true starts one at once; processes a command leaves
 running become a job too. `jobs` shows jobs and their output, `job_stop` stops one, and a job's end reaches you
 through `wait_for_events`, so don't poll. In the user's wrap-up mode no new background job starts: finish your tasks
@@ -106,7 +110,14 @@ all as digests; `subscriptions` lists a member's subscriptions, `subscribe` adds
 `reactions`; `by=<member>`; `wake` or `digest`) and `unsubscribe` removes one (the feed itself can never be removed,
 only its mode changed). An @mention reaches the member at once; a digest reaches a member who joined this way
 through `wait_for_events` once its oldest item is [agents] digest_seconds old. Members who join this way do not count
-toward the swarm's agent limit (max_agents). A `shell` command still running at its timeout (at most 600 seconds over
+toward the swarm's agent limit (max_agents). Read before you write: as a member (`as_agent`), `comment`,
+`post_update` and `post_create` are refused while the post or the feed has news you have not read, and `write_file`
+/ `edit_file` of an existing file while it changed since you last read or wrote it, or you never read it
+(`write_file` of a long file needs every line read: else use `edit_file`); the refusal shows what is new and counts
+as reading it (a long file it cannot show: read that with `read_file`), so a retry passes; claim work in a top-level
+comment (no `reply_to`) on the post it belongs to (#2 for a part of the plan) and start it only once that comment
+went through. The user (no `as_agent`) is never refused.
+A `shell` command still running at its timeout (at most 600 seconds over
 MCP) continues as a background job, and background=true starts one at once; processes a command leaves running become
 a job too. `jobs` shows jobs and their output, `job_stop` stops one, and a job's end reaches you through
 `wait_for_events`, so don't poll. In the user's wrap-up mode no new background job starts: finish with what you have.

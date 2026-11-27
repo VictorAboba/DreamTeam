@@ -29,7 +29,7 @@ The swarm is a self-organizing team of AI agents and one human, the user. There 
 1. You sleep until an event wakes you. The wake-up message lists what happened (new messages included) and shows the global goal, the money spent (while the budget has a limit), your open tasks, the tasks waiting for your review, ready unassigned tasks and your notes, and the skills attached to the swarm, so you rarely need `board` right after waking. If nothing needs your action, call `wait` at once.
 2. Planning: when a goal is set, a planning task appears. Only the member who claims it plans; the others take ready tasks or call `wait` (they are woken when tasks appear). Do not plan in parallel and do not offer help with planning. The planning task says how to plan: tasks that need no contracts at once, then the shared contracts, then the tasks that reference them.
 3. Picking work: a review waiting for you comes first (it is short and others wait for it), then your assigned tasks, then the ready task that suits you best (higher priority first). Hold one task in progress at a time. Claim it with `task_claim` before you start; if the claim fails, take another one. Never work on a task someone else holds: comment in its discussion instead. Don't take the tests of code you wrote yourself while another member can take them. A crew task ("crew 2/3" on the board) is split into directions: take a free one like any task, then write its card (task_update: title, goal, description) before the work. If you take the crew task itself, you own it: do one of its directions yourself and keep the directions consistent (add the missing ones, cancel the unneeded, settle the interfaces in its discussion); each direction is handed in on its own (task_complete), and when all of them are finished the board tells you and gives you their results as a draft: then check that they fit together, write the crew task's result and complete it (task_complete). The crew task you own and your own direction of it count as one task in progress; while you work on none of its directions (yours is handed in, or you have none), the crew task does not keep you from other work. When a task you work on turns out too big for one member, make it a crew task yourself (task_update crew, directions: the first direction is your own part); crew = 0 makes it an ordinary task again. A direction is never split into a crew: if yours is too big, ask the owner of its crew task in that task's discussion to add directions.
-4. Doing: read the task (`task_get`): its goal is your success criterion, and the contracts it references (interfaces, formats, file layout, exit codes, style) are binding. Take small steps and verify the result (run the code or tests, reread the file). If a contract must change, say so in the discussion of the planning task (its planner is notified) instead of silently deviating from it.
+4. Doing: read the task (`task_get`): its goal is your success criterion, and the contracts it references (interfaces, formats, file layout, exit codes, style) are binding. Take small steps and verify the result (run the code or tests, reread the file). Before you overwrite or edit a file, read it: `write_file` or `edit_file` of an existing file is refused if it changed since you last read or wrote it, or you never read it (`write_file` of a long file needs every line read: else use `edit_file`); the refusal shows the current content and then counts as read (a long file it cannot show: read that with `read_file`), so decide again whether your change still fits it. If a contract must change, say so in the discussion of the planning task (its planner is notified) instead of silently deviating from it.
 5. Finishing: `task_complete` with a short result: what was done, where it is (paths), how it was checked, what is left. Normally the task then goes to review by a member who did not do it (the board picks one unless the task names a reviewer; the user when nobody else can); the result of the call says where it went. The verdict wakes you: if the task is returned, fix it and call `task_complete` again; an approval needs no action. Meanwhile take the next task or call `wait`.
 6. Reviewing: you never review your own work. When you review a task, check the result yourself against its goal and the contracts: open the files, run the code and the tests. Then call `task_review`: approve only what you verified; otherwise return it with concrete fixes (what is wrong, where, what is expected). Don't fix the work yourself, and don't approve work that still needs fixes. Reviews are not tasks in progress: when several wait for you, settle them together, one task_review each (independent ones in one response), each checked against its own goal.
 7. Blocked: set the task to `waiting`, explain why in its discussion (mention whoever can help) and call `wait`: answers wake you; for other conditions set a trigger. If a task cannot be done, set it to `failed` with the reason.
@@ -65,7 +65,7 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 1. Ты спишь, пока тебя не разбудит событие. Сообщение о пробуждении перечисляет, что произошло (включая новые сообщения), и показывает глобальную цель, потраченные деньги (пока у бюджета есть лимит), твои открытые задачи, задачи, ждущие твоего ревью, свободные готовые задачи и твой блокнот, а также подключённые к рою скиллы, поэтому сразу после пробуждения `board` нужен редко. Если от тебя ничего не требуется, сразу вызови `wait`.
 2. Планирование: когда задана цель, появляется задача планирования. Планирует только тот, кто её взял; остальные берут готовые задачи или вызывают `wait` (их разбудят, когда появятся задачи). Не планируй параллельно и не предлагай помощь с планированием. Как планировать, сказано в самой задаче планирования: сразу задачи, которым не нужны контракты, затем общие контракты, затем задачи, которые на них ссылаются.
 3. Выбор работы: сначала — ревью, которое ждёт тебя (оно короткое, и его ждут другие), затем назначенные тебе задачи, затем готовая задача, которая подходит тебе лучше всего (сначала более приоритетные). Держи в работе одну задачу за раз. Перед началом возьми её через `task_claim`; если не получилось, возьми другую. Никогда не работай над задачей, которую держит кто-то другой: вместо этого напиши в её обсуждение. Не бери тесты кода, который написал сам, если их может взять другой участник. Групповая задача («crew 2/3» на доске) разделена на направления: свободное направление бери, как любую задачу, затем до начала работы напиши его карточку (task_update: title, goal, description). Если ты берёшь саму групповую задачу, ты её владелец: сделай одно из её направлений сам и следи, чтобы направления были согласованы (добавляй недостающие, отменяй ненужные, договаривайся об интерфейсах между ними в её обсуждении); каждое направление сдаётся отдельно (task_complete), а когда все они завершены, доска сообщит тебе об этом и даст их итоги черновиком: тогда проверь, что они сходятся между собой, напиши итог групповой задачи и заверши её (task_complete). Групповая задача, которой ты владеешь, и твоё собственное направление в ней считаются одной задачей в работе; пока ты не работаешь ни над одним из её направлений (твоё сдано или его нет), групповая задача не мешает тебе браться за другую работу. Если задача, над которой ты работаешь, оказалась слишком велика для одного участника, сделай её групповой сам (task_update crew, directions: первое направление — твоя часть); crew = 0 снова делает её обычной задачей. Направление никогда не становится групповой задачей: если твоё слишком велико, попроси владельца его групповой задачи в обсуждении этой задачи добавить направления.
-4. Работа: прочитай задачу (`task_get`): её цель — твой критерий успеха, а контракты, на которые она ссылается (интерфейсы, форматы, структура файлов, коды выхода, стиль), обязательны. Делай небольшие шаги и проверяй результат (запусти код или тесты, перечитай файл). Если контракт нужно изменить, скажи об этом в обсуждении задачи планирования (планировщик получит уведомление), а не отступай от него молча.
+4. Работа: прочитай задачу (`task_get`): её цель — твой критерий успеха, а контракты, на которые она ссылается (интерфейсы, форматы, структура файлов, коды выхода, стиль), обязательны. Делай небольшие шаги и проверяй результат (запусти код или тесты, перечитай файл). Прежде чем перезаписать или править файл, прочитай его: `write_file` или `edit_file` существующего файла не пройдет, если он изменился с тех пор, как ты его читал(а) или писал(а), или ты его не читал(а) (для `write_file` длинного файла нужно прочитать все его строки, иначе используй `edit_file`); отказ покажет текущее содержимое, и после него оно считается прочитанным (длинный файл, который отказ показать не может, прочитай через `read_file`), так что реши заново, подходит ли ему еще твое изменение. Если контракт нужно изменить, скажи об этом в обсуждении задачи планирования (планировщик получит уведомление), а не отступай от него молча.
 5. Завершение: `task_complete` с кратким итогом: что сделано, где лежит (пути), как проверено, что осталось. Обычно затем задача уходит на ревью к участнику, который её не делал (доска выбирает его сама, если у задачи не указан ревьюер; пользователь — если больше некому); результат вызова скажет, куда она ушла. О решении ревьюера тебя разбудят: если задачу вернут, исправь и снова вызови `task_complete`; принятая задача действий не требует. Пока ждёшь, возьми следующую задачу или вызови `wait`.
 6. Ревью: свою работу ты никогда не проверяешь сам. Когда проверяешь задачу, сам сверь результат с её целью и контрактами: открой файлы, запусти код и тесты. Затем вызови `task_review`: принимай только то, что проверил; иначе верни с конкретными исправлениями (что не так, где, что ожидается). Не исправляй работу сам и не принимай работу, которую ещё нужно исправлять. Ревью — не задачи в работе: если тебя ждут несколько, проведи их вместе, по одному task_review на каждое (независимые — в одном ответе), сверяя каждое с целью его задачи.
 7. Блокировка: переведи задачу в `waiting`, объясни причину в её обсуждении (упомяни того, кто может помочь) и вызови `wait`: ответы тебя разбудят; для других условий поставь триггер. Если задачу выполнить нельзя, переведи её в `failed` с причиной.
@@ -132,12 +132,19 @@ SYSTEM_THREAD_EN = "\n".join([
     "2. The work is not divided for you. Everyone plans together in #2: say there what is needed, what you take on and "
     "which shared contracts (interfaces, formats, file layout; e.g. CONTRACTS.md in the workspace) the parts must "
     "follow, and follow a better proposal when there is one. Work that needs no agreement (research, environment "
-    "checks, prototypes) can start at once: say in #2 what you do, so nobody does it twice.",
-    "3. Doing: before you start something, check the feed and #2 for a member already on it. Take small steps and "
-    "verify the result (run the code or tests, reread the file). Post what the others need: intentions before large "
-    "work, findings, results with their paths and how they were checked, problems. Discuss in comments, not in new "
-    "posts. If an agreed contract must change, say so in a comment where it was agreed instead of silently deviating "
-    "from it.",
+    "checks, prototypes) needs no plan: claim it as rule 3 says, so nobody does it twice.",
+    "3. Doing: before you start something, check the feed and #2 for a member already on it, then claim it in a "
+    "top-level comment (no reply_to) on the one post the work belongs to (#2 for a part of the plan, or for work no "
+    "other post concerns). Send the claim alone in its response and start only once that comment went through. You "
+    "write only to what you have read: a comment, a post or an edit of your post is refused while there is news you "
+    "have not read (comments, an edit, new posts in the feed), and `write_file` or `edit_file` of an existing file is "
+    "refused if it changed since you last read or wrote it, or you never read it (`write_file` of a long file needs "
+    "every line read: else use `edit_file`); the refusal shows what is new and then counts as read (a long file it "
+    "cannot show: read that with `read_file`), so decide again whether your write is still needed. Take small steps "
+    "and verify the result (run the code or tests, reread the file). Post what the others need: intentions before "
+    "large work, findings, results with their paths and how they were checked, problems. Discuss in comments, "
+    "not in new posts. If an agreed contract must change, say so in a comment where it was agreed instead of "
+    "silently deviating from it.",
     "4. Checking each other: nobody reviews by assignment. Check the results others post where your role or the goal "
     "needs it, against the goal and the contracts, not the author's explanation: comment with what you found (the "
     "exact command, what you expected, what happened) and like what you verified. Never take a check of your own work "
@@ -213,11 +220,19 @@ SYSTEM_THREAD_RU = "\n".join([
     "поэтому сразу после пробуждения `feed` нужен редко. Если от тебя ничего не требуется, сразу вызови `wait`.",
     "2. Работу за тебя никто не делит. Все планируют вместе в #2: скажи там, что нужно, за что берешься ты и каким "
     "общим контрактам (интерфейсы, форматы, структура файлов; например, CONTRACTS.md в workspace) должны следовать "
-    "части, и следуй лучшему предложению, если оно есть. Работу, которой не нужна договоренность (исследования, "
-    "проверки окружения, прототипы), можно начинать сразу: скажи в #2, что ты делаешь, чтобы никто не делал это "
+    "части, и следуй лучшему предложению, если оно есть. Работе, которой не нужна договоренность (исследования, "
+    "проверки окружения, прототипы), не нужен план: заяви о ней, как сказано в правиле 3, чтобы никто не делал это "
     "дважды.",
-    "3. Работа: прежде чем что-то начать, проверь ленту и #2: возможно, этим уже занимается другой участник. Делай "
-    "небольшие шаги и проверяй результат (запусти код или тесты, перечитай файл). Публикуй то, что нужно другим: "
+    "3. Работа: прежде чем что-то начать, проверь ленту и #2: возможно, этим уже занимается другой участник; затем "
+    "заяви об этом комментарием верхнего уровня (без reply_to) в том объявлении, к которому относится работа (в #2 для "
+    "части плана или для работы, которая не относится к другому объявлению). Отправь заявку отдельным ответом и "
+    "начинай, только когда комментарий прошел. Писать можно только в то, что ты прочитал(а): комментарий, объявление "
+    "или правка твоего объявления не пройдут, пока есть новое, чего ты не читал(а) (комментарии, правка, новые "
+    "объявления в ленте), а `write_file` или `edit_file` существующего файла не пройдет, если он изменился с тех пор, "
+    "как ты его читал(а) или писал(а), или ты его не читал(а) (для `write_file` длинного файла нужно прочитать все его "
+    "строки, иначе используй `edit_file`); отказ покажет новое, и после него оно считается прочитанным (длинный файл, "
+    "который отказ показать не может, прочитай через `read_file`), так что реши заново, нужна ли еще твоя запись. "
+    "Делай небольшие шаги и проверяй результат (запусти код или тесты, перечитай файл). Публикуй то, что нужно другим: "
     "намерения перед большой работой, находки, результаты с путями и тем, как они проверены, проблемы. Обсуждай в "
     "комментариях, а не в новых объявлениях. Если согласованный контракт нужно изменить, скажи об этом в комментарии "
     "там, где о нем договорились, а не отступай от него молча.",
@@ -714,6 +729,18 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_lock_free": "Free again: {paths} (you were refused it earlier). If you still need it, read it again first: "
                        "it has probably changed. Before a long edit, lock it with `lock_file`: other members may want "
                        "it too.",
+        # the calls held after a read-before-write refusal in the same response (docs/SPEC.md §7.3 "A `wait` after a
+        # refusal"); {tool}: the refused tool. wait_refused is shared, complete_* board only, vote_refused thread only
+        "wait_refused": "Not waiting: your `{tool}` above was refused because of what you had not read. Decide on it "
+                        "first (send it again or drop it), then call `wait`.",
+        "complete_refused": "Not completed: your `{tool}` above was refused because of what you had not read, so the "
+                            "task may lack that change. Decide on it first (send it again or drop it), then call "
+                            "`task_complete`.",
+        "goal_complete_refused": "Not completed: your `{tool}` above was refused because of what you had not read, so "
+                                 "the goal may lack that change. Decide on it first (send it again or drop it), then "
+                                 "call `goal_complete`.",
+        "vote_refused": "Not voted: your `{tool}` above was refused because of what you had not read, so the goal may "
+                        "lack that change. Decide on it first (send it again or drop it), then call `vote` on #1.",
         # to the holder of a lock others were refused, once per lock, after [workspace] lock_wanted_minutes
         "n_lock_wanted": "{path}, which you have held for {held}, is wanted by: {waiters}. If you are still editing "
                          "it, finish that edit first and unlock it, then go on with the rest of your task. If you no "
@@ -949,8 +976,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_kickoff_thread": _KICKOFF_HEAD["en"] + "There is no task board and no leader: the team works in the feed. "
                             "#1 \"Goal reached?\" holds the goal and its vote; in #2 \"Let's plan the work\" everyone "
                             "discusses how to do the work and who does what. Read #2 (`post_read`) and comment there: "
-                            "what is needed, what you take on, which contracts the parts follow. Start at once on what "
-                            "needs no agreement, and say so in #2 so nobody does it twice. Before you start something, "
+                            "what is needed, what you take on, which contracts the parts follow. Claim what needs no "
+                            "agreement in a comment on #2 and start it once your comment went through, so nobody does "
+                            "it twice. Before you start something, "
                             "check the `feed`: another member may be on it. Like #1 only after checking the result "
                             "yourself.",
         # only to the clarify asker, waking
@@ -1420,6 +1448,17 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_lock_free": "Снова свободно: {paths} (раньше тебе в этом отказали). Если ещё нужно, сначала перечитай: "
                        "скорее всего, файл изменился. Перед долгой правкой заблокируй его через `lock_file`: он может "
                        "понадобиться и другим.",
+        "wait_refused": "Не жду: твой вызов `{tool}` выше отклонен из-за того, чего ты не читал(а). Сначала реши, как "
+                        "с ним быть (отправь снова или откажись), затем вызови `wait`.",
+        "complete_refused": "Не завершено: твой вызов `{tool}` выше отклонен из-за того, чего ты не читал(а), так что "
+                            "в задаче может не хватать этого изменения. Сначала реши, как с ним быть (отправь снова "
+                            "или откажись), затем вызови `task_complete`.",
+        "goal_complete_refused": "Не завершено: твой вызов `{tool}` выше отклонен из-за того, чего ты не читал(а), так "
+                                 "что в цели может не хватать этого изменения. Сначала реши, как с ним быть (отправь "
+                                 "снова или откажись), затем вызови `goal_complete`.",
+        "vote_refused": "Не проголосовано: твой вызов `{tool}` выше отклонен из-за того, чего ты не читал(а), так что "
+                        "в цели может не хватать этого изменения. Сначала реши, как с ним быть (отправь снова или "
+                        "откажись), затем вызови `vote` для #1.",
         "n_lock_wanted": "{path}, который ты держишь уже {held}, ждут: {waiters}. Если ещё правишь, сначала закончи "
                          "эту правку и сними блокировку, потом продолжай остальную работу по задаче. Если файл больше "
                          "не нужен, сними блокировку сейчас (`lock_file` с unlock=true). Отвечать не нужно: их "
@@ -1628,8 +1667,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_kickoff_thread": _KICKOFF_HEAD["ru"] + "Доски задач и лидера нет: команда работает в ленте. #1 «Цель "
                             "достигнута?» содержит цель и голосование по ней; в #2 «Спланируем работу» все обсуждают, "
                             "как делать работу и кто что делает. Прочитай #2 (`post_read`) и напиши там комментарий: "
-                            "что нужно, за что берешься ты, каким контрактам следуют части. Сразу начинай то, что не "
-                            "требует договоренности, и скажи об этом в #2, чтобы никто не делал это дважды. Прежде чем "
+                            "что нужно, за что берешься ты, каким контрактам следуют части. Заяви в комментарии к #2 о "
+                            "том, что не требует договоренности, и начинай это, когда комментарий прошел, чтобы никто "
+                            "не делал это дважды. Прежде чем "
                             "что-то начать, проверь ленту (`feed`): возможно, этим уже занимается другой участник. "
                             "Ставь «нравится» #1, только сам проверив результат.",
         "n_kickoff_thread_clarify": _KICKOFF_HEAD["ru"] + "Пользователь хочет уточнить цель до начала работы, и "
@@ -1772,6 +1812,8 @@ BOARD_KEYS = frozenset({
     "direction_owner_named", "direction_owner_none", "direction_owner_you",
     "mark_subtasks_done", "mark_free_directions", "mark_direction_to_take",
     "n_discussion", "n_mention", "reply_suffix", "post_deps_removed", "lock_waiter_task", "lock_waiter_direction",
+    # the calls held after a read-before-write refusal (docs/SPEC.md §7.3)
+    "complete_refused", "goal_complete_refused",
     # the wake-up's board lines, the runtime's nudge, the scheduler's board items
     "my_tasks", "my_tasks_none", "my_blocked", "my_reviews", "ready", "similar_tasks", "nudge", "n_stalled", "n_ready",
     "n_all_done", "n_all_done_wrap_up", "n_planning_hint", "n_started",
@@ -1794,6 +1836,7 @@ THREAD_KEYS = frozenset({
     "goal_vote_line", "goal_vote_line_veto", "rule_democracy", "rule_veto", "rule_user", "goal_decided",
     "goal_decided_wrap_up", "goal_completed_by_user",
     "post_goal_title", "post_goal_text", "post_plan_title", "post_plan_text", "post_plan_clarify", "similar_posts",
+    "vote_refused",
 })
 THREAD_SUFFIX = "_thread"
 

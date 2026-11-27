@@ -22,7 +22,7 @@ from dreamteam.transfer import MANIFEST, export_home, plan_import, render_export
 from test_transfer import (_db, _event, _fill_db, _home_named, _import, _item, _manager, _manifest, _raw, _raw_b,
                            _session, _set_db_sha, _statuses)
 
-FORUM_TABLES = ("posts", "post_comments", "votes", "subscriptions")
+FORUM_TABLES = ("posts", "post_comments", "votes", "subscriptions", "read_marks")
 DECISION = {"rule": "veto", "for": ["alice", "bob"], "against": [], "counted": 2, "wrap_up": False}
 MIXED = "its settings named another mode than its database; the database's ({mode}) is kept"
 
@@ -65,6 +65,8 @@ def _fill_forum(home: Path, sid: str) -> None:
         db.execute("INSERT INTO subscriptions(member, kind, target, by_member, mode, auto, created_at) VALUES "
                    "('alice', 'feed', '', '', 'digest', 1, 1.0), ('alice', 'post', '3', '', 'wake', 0, 2.0), "
                    "('bob', 'file', 'src/*.py', '', 'wake', 0, 2.1), ('bob', 'feed', '', 'alice', 'wake', 0, 2.2)")
+        db.execute("INSERT INTO read_marks(member, target, version, ts) VALUES ('alice', 'p3', '0123456789abcdef', "
+                   "2.5), ('bob', 'p3', NULL, 2.6), ('bob', 'c2', NULL, 4.1)")
         db.set("goal", {"title": "Ship the parser", "description": "", "status": "done", "summary": "Decided by vote",
                         "completed_by": None, "decision": DECISION, "created_at": 1.0, "updated_at": 6.0})
     finally:
@@ -151,6 +153,7 @@ async def test_a_thread_session_is_exported_and_imported_with_its_forum_and_stay
     home_a, thread, board = await _two_sessions(tmp_path)
     source = _forum_state(_db_path(home_a, thread))
     assert len(source["posts"]) == 3 and len(source["votes"]) == 4 and len(source["subscriptions"]) == 4
+    assert len(source["read_marks"]) == 3   # the read marks travel inside swarm.db (docs/SPEC.md §22.11)
     dest = tmp_path / "usb"
     report = export_home(home_a, dest, include=["sessions"])
     assert report.ok
