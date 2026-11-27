@@ -11,7 +11,8 @@ User-visible texts for agents live in `prompts.py` (ru/en). Python >= 3.11, asyn
 * Actors: a member name (`"John Smith"`), or the reserved `USER = "user"` (the human).
   `"all"` is a pseudo-recipient for messages. Names are unique, case-insensitive, stored canonically.
 * Errors meant for the caller (agent, user, MCP client) are raised as `models.ToolError(msg)`.
-  Messages are short, in English, and tell the caller how to fix the call.
+  Messages are short, in English (the read-before-write refusals and their held calls: in the member's
+  language, §7.3), and tell the caller how to fix the call.
 * JSON in DB: `db.dumps` / `db.loads` (ensure_ascii=False; a value holding a lone surrogate, e.g. from LLM
   tool arguments, is written with ASCII escapes instead, so it is storable and loads back identical).
   Plain TEXT columns cannot hold lone surrogates: `db.utf8_safe(text)` replaces them with U+FFFD; a tool
@@ -209,7 +210,9 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
   "mode"?: "board"|"thread"}` (the agent's frozen tool set, §6.1; no "mode" = board, §22.1, §22.5; kept for retired
   agents, traces read it), `wait_progress:<actor>` → the last events id whose board progress (in a thread session:
   the feed's progress, §22.5) `wait_for_events(progress=true)` returned to that actor (§12), `swarm_mode` →
-  `"board"` | `"thread"`: the session's mode, fixed when it is created (§22.1).
+  `"board"` | `"thread"`: the session's mode, fixed when it is created (§22.1), `file_read:<member>:<path key>` →
+  `"<sha256>"` or `"<sha256>:<line ranges>"`: the member's file read mark (§7.3; both modes, one row per member and
+  file).
 
 ## 3. Swarm (swarm.py) — what other modules may use
 
@@ -242,8 +245,9 @@ class Swarm:
         # roles.starting_team(swarm.starting_roles, swarm.start_agents), member i gets starting_roles[i], the rest
         # (and blank entries) are generalists (§17.3); LLM agents with open tasks, reviews waiting for them or
         # pending events (goal active), or whose last activation was cut short (the stored history ends
-        # mid-activation), get `n_restart`; hire() respects run_agents. After forge.start(): skills.start() (the
-        # session's skills read again, their script dependencies planned in a daemon thread and held in use, the
+        # mid-activation, a held `wait` too: §7.3 "A `wait` after a refusal"), get `n_restart`; hire() respects
+        # run_agents. After forge.start(): skills.start() (the session's skills read again, their script
+        # dependencies planned in a daemon thread and held in use, the
         # agents' mirror rebuilt from the session copies with its node_modules links, the owners of decisions made
         # while stopped told, §19), then skills.ensure_deps() as a `_background` task (builds never waited for);
         # after the starting team is created: skills.ensure_role_skills(announce=False)
@@ -416,10 +420,12 @@ class Swarm:
     async def retire(self, by: str, name: str, reason: str = "") -> list[int]   # returns released task ids
         # before the first await: the ids of its running jobs, and jobs.forbid(name) (none of its commands may
         # become a job while it leaves); then tasks and locks released (workspace.release_all: its own lock waits are
-        # dropped, the members waiting for its locks woken, §7 "Lock waiters"), triggers deactivated, status retired,
+        # dropped, the members waiting for its locks woken, §7 "Lock waiters"), its file read marks deleted
+        # (workspace.drop_file_reads, §7.3), triggers deactivated, status retired,
         # `agent.retired` {name, reason, released, jobs}, its pending question dropped (`_drop_question(by, "left")`,
         # §3.1), n_member_retired; in a thread session also forum.drop_subscriptions(name) with the triggers'
-        # deactivation (every row, the feed one too, §22.3) and forum.recheck_goal(None) after n_member_retired_thread
+        # deactivation (every row, the feed one too, §22.3), forum.drop_reads(name) (its forum marks, §22.11) and
+        # forum.recheck_goal(None) after n_member_retired_thread
         # (§22.4); then its runtime stops; last
         # jobs.stop_owner(name, "retired"): its jobs and its foreground commands (an external member's call in
         # flight) are killed and awaited, committed under its name, with no notice to it; then its held new files
@@ -2195,8 +2201,10 @@ class AgentRuntime:
   keeps the whole text, §16.1), call `swarm.hint_planner(name)` (§3 scheduler item 4; in a thread session only its
   clarify branch, §22.4; never raises); after tools, if
   `render_wake(name, incoming=True)` returns text, append it as a user message. Stops when: `wait` was
-  called, no tool calls (a `nudge` once per in_progress task the agent holds (never in a thread session, §22.7),
-  except a clarify planning task it
+  called (not a `wait` that follows a read-before-write refusal in the same response: it is not run, nor are
+  `task_complete`, `goal_complete` and a `vote` like on `#1`, §7.3 "A `wait` after a refusal"), no tool calls (a
+  `nudge` once per in_progress task the agent holds (never in a thread session, §22.7), except a clarify planning
+  task it
   waits for the user's answers about, `swarm.asks_user` looked up with getattr, §3.1, and a crew task with open
   directions, §3 item 3, unless one is free and its owner, working on none of them, could take it: then the nudge
   is the "free directions" sentence of §4.2 "Finishing" (Liveness; `Swarm.crew_nudge(name, tasks)`, looked up with
@@ -2277,8 +2285,10 @@ wrap-up: finish what is nearly done and start nothing large.` (it echoes `n_budg
 конца то, что почти готово, и не начинай ничего большого.»); rule 10 ends with ``A process you start with & or
 nohup that `jobs` does not list is not tracked: its end wakes nobody.`` (ru «Процесс, запущенный через & или
 nohup, которого нет в списке `jobs`, не отслеживается: его завершение никого не разбудит.»; `jobs` in both, so the
-backticked identifiers still match). A thread session's members get `SYSTEM_THREAD_EN` / `SYSTEM_THREAD_RU` instead
-(§22.6), which keep these sentences (the budget one in its thread wording).
+backticked identifiers still match); rule 4 ("Doing") gains the file sentence of §7.3 "Texts" after its "Take
+small steps" sentence (en and ru, pinned there). A thread session's members get `SYSTEM_THREAD_EN` /
+`SYSTEM_THREAD_RU` instead (§22.6), which keep these sentences (the budget one in its thread wording, the file one in
+rule 3).
 
 The **Skills index** (§19 "Delivery to agents"; never for external members, never in an incoming render): with skills
 attached, the full `skills_index` (or `skills_index_own` when the member's role lists one of them) once per agent
@@ -2323,6 +2333,9 @@ class Workspace:
     def resolve(self, path: str) -> Path         # inside root (no escape, no .git); ToolError otherwise
     def rel(self, p: Path) -> str                # posix relative path
     def read(self, path: str, offset: int = 1, limit: int = 400) -> str   # lines offset..offset+limit-1, header "[path: lines a-b of N]"; binary -> ToolError
+        # read(path, offset, limit, actor=None): for a member actor (and its seen_as members) also records the
+        # file read mark (the sha256 of the whole bytes read and the lines shown), in both modes (§7.3)
+    def drop_file_reads(self, name: str) -> int  # retire: deletes the member's file read marks (kv rows, §7.3)
     async def write(self, actor: str, path: str, content: str) -> str
     async def edit(self, actor: str, path: str, old: str, new: str, replace_all: bool = False) -> str
         # both refuse a path under SKILLS_MIRROR (`.scratch/_skills`, a lexical check on the resolved relative path,
@@ -2335,6 +2348,9 @@ class Workspace:
         # write and edit write in one checked step: refused when the file's folder now resolves outside the
         # workspace, the file became a link, or it has another hard link (st_nlink > 1, checked on the opened file
         # before it is truncated; resolve() cannot see a hard link); reading such a file is allowed
+        # for a member actor, both also refuse an existing file it has not read in its current content (write:
+        # every line of it; edit of a binary file: not checked), after the lock check and under _io_lock, and move
+        # the member's mark; in both modes (§7.3)
     def list(self, path: str = ".", depth: int = 2) -> str   # tree text, dirs end with "/", skips .git, sizes;
         # folders named `.scratch` are shown collapsed like the NO_EXPAND ones (".scratch/ (2 entries)"), so the
         # agents' temporary files do not inflate every listing; list(".scratch/<slug>") lists them; tree() (the
@@ -2383,14 +2399,17 @@ the event's top-level `actor`), then commit that path; a path under `.scratch/` 
 `file.changed` but is never committed, and the result says so (`Created .scratch/anna.smith/c.py (1 line, 9 B)
 (in .scratch/: not committed).`). In a thread session (`Workspace.commit_events`) a whole-tree autocommit and each
 per-owner commit of held new files also emit `files.committed` (§22.2), which `file` subscriptions follow (§22.3);
-`file.changed` itself is unchanged. Lock events: `file.locked` {path, owner, expires_at, refreshed},
+`file.changed` itself is unchanged. In both modes a member's write or edit of an existing file is also refused, after
+the lock check, while the member has not read the file's current content (by content hash, whoever changed it), and
+the refusal shows that content (§7.3). Lock events: `file.locked` {path, owner, expires_at, refreshed},
 `file.unlocked` {path, owner, forced} or {path, owner, expired: true}. Unless the folder is adopted (below),
 `init()` also writes repo-local settings (`_configure_repo`: core.autocrlf=false, commit.gpgsign=false, on
 Windows core.longpaths=true, and a default identity), so that git commands run from the shell behave like the
 autocommits (line endings, long paths, no signing); an agent's own commits carry its identity from the shell
 environment (`agent_git_env`, below).
 
-**Lock waiters.** A lock is advisory: only `write_file`, `edit_file` and `lock_file` check it (`shell` does not).
+**Lock waiters.** A lock is advisory: only `write_file`, `edit_file` and `lock_file` check it (`shell` does not). A
+write that passes the lock check still needs a fresh read (§7.3, both modes): a lock is no proof of it.
 A lock blocks another owner's lock on the same path, a folder above it or a path under it, and another owner's
 write or edit of a path it covers. These refusals, and a member's `lock_file` unlock=true of someone else's lock,
 are English ToolErrors that keep `'{rel}' is locked by X until HH:MM (N min left)[ (lock on '{path}')]` (the unlock:
@@ -3361,6 +3380,311 @@ hint says to restart `dreamteam sandbox` (it then adds the firewall, `docker.wan
   detected yet)}; the session summary has `network` ("on"/"off"); the launcher's `GET /api/settings` has
   `network_isolation`.
 
+### 7.3 Read before write (files)
+The owner's decisions of 2026-11-27. After a thread session in which an agent overwrote a file another had written a
+minute before without ever reading it (§22.11): **a member overwrites or edits an existing workspace file only while
+it has read the file's current content**; the same day the owner extended this file rule to board sessions. So it
+holds in **both modes**, with one implementation, one storage and the same texts. What a member has read is its
+**file read mark**; a `write_file` or `edit_file` of a file that changed since, or that the member never read, is
+refused, and the refusal shows the current content and counts as reading it, so a retry passes if the member still
+wants it. A thread session applies the same principle to posts and the feed (§22.11); that part stays thread only:
+the board has no forum, and its claims are atomic already (`task_claim`, §4).
+- **Who.** Every active member (`swarm.is_member`), an AI agent or one that joined through MCP (a call with
+  `as_agent`), is checked and has marks. An actor that is no member is never checked and records nothing: USER
+  (`write_file` and `edit_file` have no user audience, §12) and the swarm's own writes. A mark moves for the call's
+  actor when it is a member and, in the same step, for every member in `mailbox.seen_as(actor)` during that call (§5
+  `sent_as_seen_by`: an MCP client that acts as several members, or reads as USER and listens as its member, has
+  seen what it read or wrote), USER's `read_file` included. A mark moves only for names that are members
+  (`swarm.is_member`) at the moment of the move, the actor and each `seen_as` name alike: `HubClients.members_of`
+  keeps every member a client ever acted as, a retired one included, and a write of a leaving member can end after
+  its retire's `drop_file_reads` (a write's mark moves after the awaited `_store`), so neither leaves a row that
+  nothing deletes. A check compares only the member's own mark with the file's bytes: a change is found by content,
+  whoever made it.
+- **Not checked**: `read_file`, `list_files`, `lock_file`, `shell`, jobs and a new file. What `shell`, jobs, git or
+  the user's editor write is found by content at the member's next `write_file` or `edit_file` (below).
+
+**Marks** (kv, one row per member and file)
+- Key `file_read:<member>:<path key>` (`workspace.FILE_READ_PREFIX` = `file_read:`): `<member>` the canonical member
+  name (generated names hold no `:`, `names.generate_name`), `<path key>` the file's `workspace.path_key` (the
+  relative posix path, case-folded on Windows). Value (a JSON string, `Database.set`): `<sha256>` for a **whole**
+  mark, every line seen at that hash, or `<sha256>:<ranges>` for a **partial** one, `<ranges>` the merged 1-based
+  line ranges seen, as `1-400,801-1200`, possibly empty; `<sha256>` is the hex digest of the file's bytes the member
+  last read or wrote. A move is one `Database.set` (an upsert on kv's primary key), a check one `Database.get`.
+- `Workspace.drop_file_reads(name) -> int` deletes the member's rows (`DELETE FROM kv WHERE substr(key, 1, ?) = ?`,
+  the prefix `file_read:<name>:`); `Swarm.retire` calls it next to `release_all`, in both modes (§3 `retire`). Names
+  are never reused (§3), so this only keeps kv small. Nothing else resets a mark: not a compaction (the summary keeps
+  what the member decided, and every change after a mark still blocks), a restart, a reconnect or a welcome back
+  (`join_swarm(name=)` is the same member), a new goal, or a workspace switch or move (the hashes match or not).
+- **Why kv, in both modes.** A board database must stay importable into 0.4.x. Its import (0.4.1's
+  `transfer._check_export_db`) refuses a database with a `table.column` it does not know (`db.unknown_columns`:
+  anything outside its `SCHEMA`, the trace tables and `ADDED_COLUMNS`) or an index, trigger or view it does not
+  create (`db.foreign_objects`), and it reads kv only by exact keys and by the `tools:` prefix
+  (`max_tools_revision`, `made_by_earlier_version`). So 0.4.x ignores no table, and a kv row of a new key is what it
+  ignores: no table goes into `SCHEMA` (it would land in every board database and make every board export of this
+  version unimportable there, §22.1 "Why not in `SCHEMA`"), and no forum table goes into a board database. A thread
+  session keeps its file marks in the same rows, not in `read_marks` (the forum's marks of posts and comments,
+  §22.11), so `Workspace` needs neither the mode nor the forum: one code path and one storage for both modes, with
+  no `FORMAT_VERSION` bump, no `ADDED_COLUMNS` entry and no manifest change.
+- **Rejected.** One JSON per member (`file_reads:<member>`, like `wait_progress:<actor>`): each `read_file` page
+  would rewrite the member's whole dict (hundreds of files with their ranges), and two moves of one member would need
+  a transaction not to lose each other's update; a row per file is one upsert, a check one primary-key read. Memory
+  only: lost at every restart (a hub update included), so each member would be refused once per file it writes
+  again, safe but in every session after every restart. The price of kv: about members × files read rows, which
+  nothing lists (every kv reader takes one key; the unindexed `tools:` prefix scans, `made_by_earlier_version` in
+  `read_stats` among them, also step over these short rows), and a prefix delete at retire.
+- A session that 0.4.x runs meanwhile keeps the rows and moves none: a mark of a file its members changed no longer
+  matches, so the next write there is refused once, the safe direction.
+
+**What moves a mark.** Always to what was shown or written, never to "the current state at the time of the move".
+- A member's `read_file` records the lines its result showed: `Workspace.read(path, offset, limit, actor=None)` gains
+  `actor` (the handler passes `ctx.actor`) and hashes the bytes it already reads whole (§7), not a second read. The
+  lines are `offset` to the last line `_fit` showed; a single line that `_fit` cut to its head counts as seen (no tool
+  shows more of a line). At the mark's hash the ranges merge, and once they cover every line the mark becomes whole
+  (a whole mark stays whole); at another hash the read replaces the mark. An empty file records a whole mark of the
+  hash of no bytes; a binary file is never read (read()'s ToolError).
+- Why a part is not enough for every write: `edit_file`'s exact `old_text` match guards the region it edits, so any
+  mark at the current hash, a partial one included, lets it pass; `write_file` replaces the whole file, so over an
+  existing file it needs a whole mark, else it could drop lines the member never saw (the incident, on a long file).
+- A member's own `write_file` moves its mark to a whole mark of the data written once `_store` succeeded, its early
+  `… unchanged (same content).` too (the member's content is the file's). `edit_file` moves it to the edited bytes'
+  hash, whole when the mark was whole and partial with no ranges otherwise (the edit moved lines, and the member
+  still has not seen the rest), so a later `write_file` needs the whole file read.
+- A write whose call was cancelled moves nothing (`_late_write_ended`): the next write is refused once, safely.
+- `list_files`, `shell` (a `cat` too), jobs, `file_changed` triggers and, in a thread session, `f_file` items and
+  `files.committed` move nothing: they carry no content, or what they showed is unknown.
+
+**The check** runs inside `Workspace._io_lock`, the section that already holds `check_writable`, the read of the
+current bytes and `_store_and_commit`, so two `write_file` / `edit_file` calls never interleave. It comes after
+`check_writable`: a lock refusal comes first and records its lock waiter as now, and a passing lock check clears the
+member's waiter row of the path as now, whatever follows. A read refusal records no waiter (nothing is to be waited
+for: the refusal shows the content or `read_file` gets it), so `waits_for_lock` and the nudge of §6.2 are unchanged.
+- `write_file` of an existing file, after its same-content return: refused when the member has no mark for the path,
+  its hash differs from the sha256 of the current bytes (read under the lock, as write() reads them already), or the
+  mark is partial. `edit_file`: refused when there is no mark or its hash differs (a partial mark at the current
+  hash passes), on the bytes it reads before `_apply_edit`, so an edit of a changed file is refused even when its
+  `old_text` still matches (a change elsewhere can break it).
+- `edit_file` of a binary file (a NUL in its first `BINARY_PROBE_BYTES`) skips the check: `_apply_edit` refuses it as
+  now (`'x' is a binary file; it cannot be edited as text.`), so the member is never told by a read refusal to resend
+  an edit that cannot work. Only `write_file` meets the binary refusal below.
+- Passes with no read: a path that does not exist (a new file, also one deleted since the member read it), a file of
+  0 bytes (nothing can be lost), and the member's own scratch folder `scratch_rel(actor)` (private; its jobs' logs
+  live there), whose reads and writes record no marks. Other members' scratch folders follow the rule;
+  `.scratch/_skills` keeps its own refusal (§7).
+- **By content, not by who.** The hash compares the bytes the member last read or wrote with the bytes there now, so
+  a change by another member, by a `shell` command or a job (the member's own included: a formatter, `sed`, a
+  generator), by git (`checkout`, `stash`, `pull`) or by the user's editor counts alike, whether or not an event or a
+  commit showed it, with `[workspace] git` off too. A `shell` write between the check and `_store` cannot be stopped
+  (shell is not under `_io_lock`, as it is not under locks, §7): the rule narrows that window to one write.
+
+**The refusal** (`ReadRefusal`, below; the first lines in the member's language, `swarm.language_of`, from
+`workspace.UNREAD_FILE_TEXTS` {"en", "ru"}, en for an unknown language). `{why}`: `exists, and you have not read it`
+/ `уже существует, а ты его не читал(а)` (no mark), `changed since you last read or wrote it` / `изменился с тех пор,
+как ты его читал(а) или писал(а)` (another hash), and for `write_file` `has lines you have not read since it last
+changed ({missing})` / `содержит строки, которые ты не читал(а) с тех пор, как он изменился ({missing})` (a partial
+mark at the current hash; `{missing}` the line ranges not in it, at most 10, then `, …`, or `all` for a partial mark
+with no ranges); `{size}` `format_size` of the current bytes. en ``Not written: '{rel}' {why} ({size}). You may
+overwrite or edit a file only after reading its current content (another member, a command or git may have changed
+it).`` / ru ``Не записано: '{rel}' {why} ({size}). Перезаписывать или править файл можно, только прочитав его текущее
+содержимое (его мог изменить другой участник, команда или git).``, then one of:
+- it fits: en ``Its current content is below and now counts as read: if your change still fits it, send it again
+  (for `edit_file`, copy old_text from this text).`` / ru ``Его текущее содержимое ниже и теперь считается
+  прочитанным: если твое изменение ему еще подходит, отправь его снова (для `edit_file` копируй old_text из этого
+  текста).``, then read()'s rendering of the whole file (`[rel: lines 1-N of N]` and its lines); the mark moves to a
+  whole mark of the bytes shown;
+- too long, `edit_file`: en ``It is too long to show here (lines: {lines}): read it with `read_file` (offset and
+  limit; for `edit_file` the part you change is enough), then send your change again.`` / ru ``Он слишком длинный,
+  чтобы показать его здесь (строк: {lines}): прочитай его через `read_file` (offset и limit; для `edit_file`
+  достаточно той части, которую ты меняешь), затем отправь изменение снова.``; nothing moves, and any `read_file`
+  page of it moves the mark (above);
+- too long, `write_file`: en ``It is too long to show here (lines: {lines}): `write_file` replaces the whole file, so
+  read with `read_file` (offset and limit) every line you have not read since it changed, or change it with
+  `edit_file`; then send your change again.`` / ru ``Он слишком длинный, чтобы показать его здесь (строк: {lines}):
+  `write_file` заменяет весь файл, поэтому прочитай через `read_file` (offset и limit) все строки, которые ты не
+  читал(а) с тех пор, как он изменился, или измени его через `edit_file`; затем отправь изменение снова.``; nothing
+  moves (the `{why}` above names the missing ranges when the mark is partial);
+- binary (`write_file` only): en ``It is a binary file, which `read_file` cannot show; this refusal counts as reading
+  it: send your change again if it is still right.`` / ru ``Это двоичный файл, `read_file` его не покажет; этот отказ
+  считается его прочтением: отправь изменение снова, если оно еще верно.``; the mark moves to a whole mark of its
+  hash.
+- **The limit.** The content is shown when read()'s `_fit` of lines 1..N shows every line uncut within
+  `Workspace._max_chars()` less the refusal's own lines and `workspace.REFUSAL_RESERVE` = 300 characters (the `Error: `
+  prefix and any note `call_tool` adds; the forum's refusals, §22.11, import the same constant); with the default
+  12 000 that is a file of about 11 000 characters (the incident's files had 1.9k to 6.3k). Beyond it the member
+  calls `read_file`: a refusal never shows a part of a file and calls it read, and a `read_file` page is recorded as
+  that part only ("What moves a mark").
+- The marks of `write_file` and `edit_file`, and their refusals' marks, are single kv upserts under `_io_lock` (no
+  transaction spans the threaded store and the git await, §7), a refusal's before its ToolError. `read_file`'s mark
+  is a plain read-merge-upsert outside it: `Workspace.read` is synchronous and never takes the asyncio lock, and it
+  needs none, since the mark records the hash of the bytes that read returned, so a race with a write can at worst
+  cost one more refusal.
+
+**A `wait` after a refusal** (both modes: the file refusals here and the forum's of §22.11). An LLM agent's response
+runs all its calls in order (§6.2), and the prompts ask for `wait` at the end of every turn and for independent calls
+in one response, so `[edit_file, wait]` (in a thread session also `[comment, wait]`) is the usual shape: a refused
+write followed by `wait` would end the activation before the member could decide again, and nothing would wake it for
+that news (its marks moved). So every read-before-write refusal is a `ReadRefusal(ToolError)` (`models.py`, a
+subclass: every surface treats it as a ToolError). `call_tool`, which turns a ToolError into an error result, catches
+`ReadRefusal` before `ToolError` and, when `ctx.runtime` is not None, sets `ctx.runtime.read_refused = name` (the
+refused tool's name, for the `{tool}` of the texts below; a later refusal in the response replaces it), a setattr
+guarded as its `getattr(ctx.runtime, "tool_parameters", None)` is, since tool tests pass simpler runtimes. The other
+surfaces (the hub, `/api/act`) have runtime None and get no flag. `AgentRuntime._run_tools` sets
+`self.read_refused = None` before its loop, so the flag lasts one response; while it is set, these later calls of
+the same response are not run (each hold reads `getattr(ctx.runtime, "read_refused", None)` and formats `{tool}`
+from it):
+- `wait` (no `end_turn()`): its result is the error of `prompts.TEXTS` key `wait_refused` (a shared key, §22.6 "Keys
+  by mode") in the member's language, en ``Not waiting: your `{tool}` above was refused because of what you had not
+  read. Decide on it first (send it again or drop it), then call `wait`.`` / ru ``Не жду: твой вызов `{tool}` выше
+  отклонен из-за того, чего ты не читал(а). Сначала реши, как с ним быть (отправь снова или откажись), затем вызови
+  `wait`.``, and the activation goes on to its next step;
+- `task_complete` (board sessions; the task would go to review, or be done, without the refused change): its result
+  is the error of key `complete_refused` (`BOARD_KEYS`), en ``Not completed: your `{tool}` above was refused because
+  of what you had not read, so the task may lack that change. Decide on it first (send it again or drop it), then
+  call `task_complete`.`` / ru ``Не завершено: твой вызов `{tool}` выше отклонен из-за того, чего ты не читал(а),
+  так что в задаче может не хватать этого изменения. Сначала реши, как с ним быть (отправь снова или откажись),
+  затем вызови `task_complete`.``; the board is not touched;
+- `goal_complete` (board sessions; the whole goal would be declared reached without the refused change, and the
+  member would get no step to decide again): its result is the error of key `goal_complete_refused` (`BOARD_KEYS`),
+  en ``Not completed: your `{tool}` above was refused because of what you had not read, so the goal may lack that
+  change. Decide on it first (send it again or drop it), then call `goal_complete`.`` / ru ``Не завершено: твой
+  вызов `{tool}` выше отклонен из-за того, чего ты не читал(а), так что в цели может не хватать этого изменения.
+  Сначала реши, как с ним быть (отправь снова или откажись), затем вызови `goal_complete`.``; the goal is not
+  touched;
+- `vote` with value `like` on `#1` (thread sessions; that like may be the one that meets the rule and completes the
+  goal, §22.4, without the refused change): its result is the error of key `vote_refused` (`THREAD_KEYS`), en ``Not
+  voted: your `{tool}` above was refused because of what you had not read, so the goal may lack that change. Decide
+  on it first (send it again or drop it), then call `vote` on #1.`` / ru ``Не проголосовано: твой вызов `{tool}`
+  выше отклонен из-за того, чего ты не читал(а), так что в цели может не хватать этого изменения. Сначала реши, как
+  с ним быть (отправь снова или откажись), затем вызови `vote` для #1.``; no vote is recorded. A `dislike`, a `none`
+  and a vote on another post run as now: none of them can complete the goal.
+
+A held call's result is stored as any other (a tool row named after the call, `is_error` true), so
+`AgentRuntime._ended_mid_activation` also returns True when the last stored row is a `wait` result with `is_error`
+true: the held `wait`, or any `wait` that did not end the turn (arguments that did not parse, a repaired
+`interrupted` result). A session stopped, or a hub restarted, after `[edit_file (refused), wait (held)]` and before
+the next step's reply is stored therefore gives the member `n_restart` (§3 `start`), with or without open tasks or
+pending events, and it decides again; else the refused write would never be retried and nothing would wake the
+member, the gap the hold closes.
+
+Every other call of the response runs as now (a `read_file` sent after the refused write is the usual repair), and a
+held call in the next response runs as always. Behaviour only: the descriptions and schemas of `wait`,
+`task_complete`, `goal_complete` and `vote` stay frozen; a refusal of another kind (a lock, a hard link, the skills
+mirror) sets no flag. An external member's calls arrive as separate requests, possibly concurrent, and its client
+may send several calls of one turn before it sees any result, as an LLM agent does; the hub cannot see that turn,
+so no hold applies to it: the refusal comes back in its own result, a task sent to review meanwhile is caught
+there, a task done meanwhile is reopened by its creator (§4 `update`), and a goal completed meanwhile by the user
+(`reopen_goal`, §3); its likes on `#1` are never counted (§22.4). "Not in this version" states this limit.
+
+**Texts**
+- `SYSTEM_EN` / `SYSTEM_RU` (the board's, §6.3), "## How you work" rule 4 ("Doing"): after "Take small steps and
+  verify the result (run the code or tests, reread the file)." comes, the rest of the rule as it is:
+  ```text
+     ... Before you overwrite or edit a file, read it: `write_file` or `edit_file` of an existing file is refused if
+     it changed since you last read or wrote it, or you never read it (`write_file` of a long file needs every line
+     read: else use `edit_file`); the refusal shows the current content and then counts as read (a long file it
+     cannot show: read that with `read_file`), so decide again whether your change still fits it. If a contract ...
+  ```
+  ru: «Прежде чем перезаписать или править файл, прочитай его: `write_file` или `edit_file` существующего файла не
+  пройдет, если он изменился с тех пор, как ты его читал(а) или писал(а), или ты его не читал(а) (для `write_file`
+  длинного файла нужно прочитать все его строки, иначе используй `edit_file`); отказ покажет текущее содержимое, и
+  после него оно считается прочитанным (длинный файл, который отказ показать не может, прочитай через `read_file`),
+  так что реши заново, подходит ли ему еще твое изменение.» (е, not the dotted letter, although the rest of
+  `SYSTEM_RU` keeps it). The thread prompts say the same in rule 3 (§22.11 "Texts"). Pinned substrings
+  (tests/test_prompts.py), in all four templates: en "`write_file` or `edit_file` of an existing file is refused if
+  it changed since you last read or wrote it, or you never read it" / ru «`write_file` или `edit_file` существующего
+  файла не пройдет, если он изменился с тех пор, как ты его читал(а) или писал(а), или ты его не читал(а)»; en
+  "`write_file` of a long file needs every line read" / ru «для `write_file` длинного файла нужно прочитать все его
+  строки».
+- `hub_mcp.INSTRUCTIONS` (board; the launcher's `HUB_INSTRUCTIONS` repeat it, §13, §18.2) gains, in the members'
+  side after the max_agents sentence: "As a member, `write_file` and `edit_file` of an existing file are refused
+  while it changed since you last read or wrote it, or you never read it (`write_file` of a long file needs every
+  line read: else use `edit_file`); the refusal shows the current content and counts as reading it (a long file it
+  cannot show: read that with `read_file`), so a retry passes." `INSTRUCTIONS_THREAD` says it in its read-before-write
+  bullet (§22.11 "Texts").
+- Members created before this change keep their frozen prompt (§6.3, §22.6), so every refusal states the rule itself.
+- **The frozen tool sets stay as they are.** No description and no schema changes: `tools/snapshots/llm_r5.json` and
+  `llm_thread_r6.json` are untouched, `TOOLSET_REVISIONS` stays `{"board": 5, "thread": 6}`, and
+  tests/test_frozen_tools.py passes unchanged. Behaviour, refusal texts, results and prompts are not part of a
+  revision (§12 R0′), so this changes revision 5's behaviour in every board session, the existing ones included, as
+  the owner decided. `write_file`'s "Fails if another member locked the file." still holds; it simply is not the only
+  refusal, as the skills mirror's and the hard-link refusals are not either (§7).
+
+**Interactions** (mostly board; a thread session has no tasks)
+- **Locks** (§7 "Lock waiters") are kept next to the marks: a lock holder still needs a fresh read, since `shell`
+  passes locks and the holder's own commands may change the file. The order and the waiter rows: "The check".
+  `n_lock_free`'s "If you still need it, read it again first: it has probably changed" (a shared text, §22.6) is now
+  enforced in both modes and keeps its text; `n_lock_wanted`, `lock_waiter_task` and `held_locks_note` are
+  unchanged.
+- **Tasks.** `task_claim`, `task_update`, `task_comment`, `task_review` and `task_complete` write no file and are not
+  checked (`task_complete` after a refused write in the same response: "A `wait` after a refusal"). Owning a task is
+  no proof of having read the files it touches, which other tasks, the directions of a crew task (§4.2) and commands
+  share. In a crew, one direction's edit of a shared contract (CONTRACTS.md) refuses another direction's next write of
+  that file once, with the new content shown: what the rule is for.
+- **Review** (§4.1): the reviewer reads the files (its marks move) and does not fix the work (rule 6). The owner of a
+  returned task is refused only for the files that changed since its own last read or write (by a reviewer who edited
+  anyway, another member, a command), so a fix of files nobody else touched passes at once.
+- A refused write writes nothing: no `file.changed`, no commit, no `file_changed` trigger, no `f_file`, no lock
+  change; the held new files (§7 "Held new files") are not touched.
+- **Workspace switch or move** (`n_workspace_changed`, `n_workspace_moved`): nothing to do; the hashes match or not.
+
+**Export and import** (§20)
+- The marks are kv rows of `swarm.db` and travel with it in both modes, with no transfer code (transfer has no
+  per-row handling of kv; member names and paths are not remapped, and none need be). `db.known_columns()`,
+  `db.known_objects()` and the manifest's `schema.db_columns` are unchanged.
+- A board session exported by this version still imports into 0.4.x, which ignores kv rows of a new key ("Why kv");
+  a thread session's export is refused there already (§22.9). A mark keyed on Windows (case-folded) may miss on
+  another system after an import: one refusal, the safe direction.
+
+**Not in this version**: blocking the writes of `shell` commands, jobs and git (they are found by content and refuse
+the next tool write); a diff of what changed in a file since the member read it (the refusal shows the current
+content); a setting or switch that turns the rule off, per session or for tests; a hold for an external member's
+calls (a `task_complete`, a `goal_complete` or a like on `#1` sent with a refused write, before its result: "A
+`wait` after a refusal").
+
+**Tests** (tests/test_workspace.py in a board session, its default, and the same cases parametrized for a thread
+session with identical results; the other files named)
+- `write_file` over a file the member never read is refused with the content shown, and then passes; a file changed
+  by another member's `write_file`, by a `shell` command and by a plain write of the test (no event) since the
+  member's `read_file` is refused; one page of `read_file` of a long file lets `edit_file` pass, while `write_file` is
+  refused with the missing ranges named and passes once every page has been read (in any order); after an
+  `edit_file` on a partial mark a `write_file` is refused; a line `_fit` cut counts as seen; a new file, a 0-byte
+  file and the member's own scratch pass with no read; another member's scratch does not; a file larger than the
+  limit gives the "too long" text of its tool and no mark, then `edit_file` passes after one `read_file` page and
+  `write_file` after all of them; a binary file is refused once for `write_file` and then passes, and an `edit_file`
+  of an unread binary file gets `_apply_edit`'s binary error and no read refusal; an `edit_file` whose `old_text`
+  still matches a changed file is refused; a lock refusal comes before the read refusal, records the waiter, and a
+  read refusal after a passing lock check records none and clears the waiter row; two concurrent `write_file` calls
+  of members who read the same content give one write and one refusal; `Workspace.write` with an actor that is no
+  member is never checked and records nothing; a refused write emits no `file.changed` and makes no commit;
+- storage: a mark is the kv row `file_read:<member>:<path key>` with the value formats above; a board database gets
+  no table, column, index or forum table from the rule (tests/test_db_schema.py: `known_columns()` and
+  `known_objects()` unchanged), and a thread database keeps its file marks in kv, none in `read_marks`; a restart, a
+  compaction and a welcome back keep the marks; `drop_file_reads` at retire deletes exactly the member's rows (not
+  those of a member whose name extends it, as `Anna Smith` and `Anna Smith 2`); a client that acted as a member that
+  has since retired writes no row for it when it reads or writes as another member or as USER, and a write of a
+  member that ends after its retire records no row;
+- tests/test_transfer.py: a board session with file marks exported by this version imports into 0.4.1 (the existing
+  0.4.1 check, now with `file_read:` rows) and into this version with its marks; tests/test_transfer_thread.py: a
+  thread export keeps them too;
+- tests/test_runtime.py (ScriptedLLM): `[write_file (refused), wait]` in a board and in a thread session keeps the
+  activation running, the `wait` result is `wait_refused` in the member's language, and the next step's retry
+  passes; `[edit_file (refused), task_complete]` leaves the task in progress with `complete_refused`; `[edit_file
+  (refused), goal_complete]` leaves the goal active with `goal_complete_refused`; in a thread session `[write_file
+  (refused), vote like on #1]` records no vote and gives `vote_refused`, while a `dislike` there is recorded; a
+  `wait` after a lock refusal or another ToolError ends the turn as now, and `[write_file (lock refused),
+  task_complete]` completes the task as now; a `wait`, `task_complete` or `goal_complete` alone in the next response
+  runs; a swarm restarted with a history that ends `[write_file (refused), wait (held)]` gives the member
+  `n_restart` (no open task, no pending event) and its retry passes;
+- MCP (tests/test_hub_clients.py): an external member (`as_agent`) of a board session is refused and marks like an
+  AI agent; a client acting as two members marks for both; USER's `read_file` through such a client marks for its
+  member;
+- the suites that write an existing file as a member (tests/test_workspace.py, tests/test_lock_wake.py,
+  tests/test_held_files.py, tests/test_tools.py and the agent tests among them) read it first or write a new one;
+  none turns the rule off;
+- texts (tests/test_prompts.py): `UNREAD_FILE_TEXTS`, `wait_refused`, `complete_refused`, `goal_complete_refused`
+  and `vote_refused` have the same keys, placeholders and backticked identifiers in en and ru, name only real tools
+  of their revisions, and no ru text contains the dotted letter (U+0451); the pinned substrings above are in all
+  four system prompts; `INSTRUCTIONS` names the file rule; the frozen-tool tests pass with the snapshots unchanged.
+
 ## 8. Triggers (triggers.py)
 
 Condition DSL: a Python *expression* parsed with `ast` and evaluated by a whitelist interpreter
@@ -3824,8 +4148,8 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `trigger_list` | all? | LEU |
 | `trigger_delete` | trigger_id | LEU |
 | `read_file` | path, offset?, limit? | LEU |
-| `write_file` | path, content | LE |
-| `edit_file` | path, old_text, new_text, replace_all? | LE |
+| `write_file` | path, content (an existing file only after reading it, both modes, §7.3) | LE |
+| `edit_file` | path, old_text, new_text, replace_all? (only after reading the file, both modes, §7.3) | LE |
 | `list_files` | path?, depth? | LEU |
 | `lock_file` | path, minutes?, unlock? | LE |
 | `file_unlock` | path (as it was locked: a member's lock removed by the user, the waiters woken, §7 "Lock waiters") | U |
@@ -3858,8 +4182,11 @@ LLM set is revision 6. `swarm_control` also takes `complete_goal?` (boolean) and
 sessions only: the user completes the goal (§22.4).
 
 Tool results are plain text (compact, line-oriented), language = English for data, ToolError texts in
-English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
-`ctx.runtime.note_sent_to_user()` when USER is a recipient.
+English, except the read-before-write refusals and the held calls' `wait_refused`, `complete_refused`,
+`goal_complete_refused` and `vote_refused`, which are in the member's language (§7.3; the forum's refusals,
+§22.11). The `wait` tool calls `ctx.runtime.end_turn()`, unless a read-before-write refusal came earlier in the same
+response (§7.3 "A `wait` after a refusal"). `send_message` calls `ctx.runtime.note_sent_to_user()` when USER is a
+recipient.
 
 `send_message` and `pause_swarm` (§3.1). The description (en and ru) keeps "wakes its recipients" and
 adds that `pause_swarm=true` is only for a question to ["user"] whose answer decides how the team goes on, so that
@@ -4150,12 +4477,14 @@ it with the question and the swarm goes on; `swarm_control` action=resume goes o
 is live, so external members see `pause_swarm` at once). The user's side also learns `skills`, `skill_attach`,
 `skill_detach` and `skill_approve` (not for a member the client acts as); the members' side that skills (SKILL.md
 folders under `.scratch/_skills/`) are listed by `join_swarm` and `swarm_status`, and that `skill_propose` proposes
-one.
+one; and the members' side the file rule (`write_file` / `edit_file` of an existing file only after reading it, §7.3
+"Texts").
 
 In a thread session (§22.9) `on_list_tools` lists the E∪U tools of that mode only (`hub_specs(mode)`, the schema of
 `spec.parameters_for(mode)`, `_description(spec, language, mode)`), and `instructions=` is `INSTRUCTIONS_THREAD`: the
 feed, posts, comments, votes and subscriptions, the vote on #1 and the user's direct completion instead of the task
-board. `INSTRUCTIONS` stays as it is. A tool of the other mode is refused by `call_tool` (§22.5), for every surface.
+board. `INSTRUCTIONS` keeps its board text. A tool of the other mode is refused by `call_tool` (§22.5), for every
+surface.
 
 ## 14. Web (web.py) — REST for the UI and the console
 
@@ -9775,10 +10104,13 @@ discussion by everyone in the system post `#2`.
   subscriptions and delivery; §22.4 the goal and its vote; §22.5 the thread tool set (revision 6); §22.6 the agents'
   texts; §22.7 liveness (the scheduler); §22.8 the surfaces of a home: settings, sessions, the web UI, the CLI, the
   TUI and print mode; §22.9 the outside: hub MCP, launcher MCP, external members, instructions from outside, HTTP API
-  v1, export and import, traces; §22.10 what is not in v1.
+  v1, export and import, traces; §22.10 what is not in v1; §22.11 read before write: a member writes to a post or
+  the feed only while it has read its current state (read marks, the refusals that show what is new); the same
+  rule for files holds in both modes (§7.3).
 - Where the texts live: the `f_*` items in §22.3; the system posts, the vote lines, the decision summaries and
   `u_goal_decided` in §22.4; the quiet check's, the wrap-up's and the money notice's texts and `u_thread_quiet` in
-  §22.7; every other agent text in §22.6.
+  §22.7; the forum's read-before-write refusals and the rule's prompt sentences in §22.11 (the file refusals and
+  `wait_refused`: §7.3); every other agent text in §22.6.
 
 ### 22.1 Data model
 - **Where the mode lives.** kv `swarm_mode` → `"board"` | `"thread"` is the database's authority on its mode:
@@ -9833,6 +10165,8 @@ discussion by everyone in the system post `#2`.
       by_member TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, created_at REAL,
       UNIQUE (member, kind, target, by_member));
   CREATE INDEX IF NOT EXISTS subscriptions_match ON subscriptions(kind, target);
+  CREATE TABLE IF NOT EXISTS read_marks (
+      member TEXT NOT NULL, target TEXT NOT NULL, version TEXT, ts REAL, PRIMARY KEY (member, target));
   INSERT INTO sqlite_sequence(name, seq) SELECT 'posts', 2
       WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'posts');
   ```
@@ -9859,6 +10193,9 @@ discussion by everyone in the system post `#2`.
     cannot duplicate a row: `subscribe` is one upsert `ON CONFLICT (member, kind, target, by_member) DO UPDATE SET
     mode = excluded.mode`, the automatic rows `ON CONFLICT DO NOTHING`, and a member's feed row stays unique under
     repeated calls and races.
+  - `read_marks`: what each member has read, for the read-before-write rule (§22.11): `target` `p<id>` (a post, at
+    the `version` it read, NULL = known by its title only) or `c<id>` (a comment); one row per (member, target).
+    File read marks are not here: they are kv rows in both modes (§7.3).
   - **When they are created.** `Database(path, *, forum: bool = False)` runs `SCHEMA`, then `FORUM_SCHEMA` when
     `forum` is true, then `_add_columns`; `Database.ensure_forum()` runs `FORUM_SCHEMA` on an open database (every
     statement is `IF NOT EXISTS` or guarded, so it is idempotent). `SessionManager.create` of a thread session uses
@@ -9887,8 +10224,10 @@ discussion by everyone in the system post `#2`.
     computes `changed_files` from its own `api.base_commit` (§21.7).
 - **kv `tools:<agent>`** records gain `"mode"`: `{"rev", "language", "tools", "mode"}`, a record without it is board;
   thread records are revision 6 (§22.5). `wait_progress:<actor>` is the same cursor for the thread progress of
-  `wait_for_events` (§22.5). There is no per-member read mark (no `forum_seen:<member>`): what a member has not seen
-  is its undelivered notifications (§22.3).
+  `wait_for_events` (§22.5). There is no kv read mark for the forum (no `forum_seen:<member>`): what a member has
+  not been told yet is its undelivered notifications (§22.3), and what it has read, which gates its writes and never
+  its news, is the table `read_marks` for posts and comments (§22.11) and, for files, the kv rows
+  `file_read:<member>:<path key>` (§7.3, both modes).
 - Unchanged tables: `tasks`, `comments`, the review and crew columns stay empty in a thread session. The traces keep
   their schema: no thread tool takes `task_id` or `parent_id` (`tracing.TASK_ARG_KEYS` unchanged), so a thread
   session's `traces.tasks` stays empty and `trace_line` shows no tasks; the `task` filter is refused there (§22.9).
@@ -9917,10 +10256,16 @@ class Forum:                                         # swarm.forum in a thread s
     def rewrite_goal_rule(self) -> bool             # #1's text for Swarm.goal_rule; True when it changed (§22.4)
     def reset_goal_votes(self, actor: str | None, reason: str) -> None
         # reason "new_goal" | "reopened" | "wrap_up_end"
-    def reopen(self, actor: str, comment: str) -> None  # the thread part of reopen_goal (§22.4)
+    def reopen(self, actor: str, comment: str) -> int | None  # the thread part of reopen_goal (§22.4); the id of
+                                                     # the comment it posted on #1, None when none (§22.11)
     def similar_open(self, post: dict) -> list[dict]
+    def mark_read(self, member: str, marks: dict[str, str | None]) -> None   # read marks p<id>/c<id> (§22.11);
+                                                     # nothing for USER or a non-member
+    def note_shown(self, member: str, rows: list) -> None   # render_wake: the `_read` of the rows it shows
+    def drop_reads(self, member: str) -> int         # at retire: every read mark of the member
 
 def goal_tally(conn, rule: str) -> dict             # pure: the one vote rule (§22.4), also sessions.read_stats
+def post_version(post: dict) -> str                 # pure: a post's content version (§22.11)
 ```
 - **Dicts.** A post: `{"id", "kind", "title", "text", "author", "created_at", "edited_at", "active_at", "likes",
   "dislikes", "comments"}` (`comments` a count; `data` stays internal). A comment: `{"id", "post_id", "author",
@@ -9943,7 +10288,9 @@ def goal_tally(conn, rule: str) -> dict             # pure: the one vote rule (�
 - **Actors.** Every method that writes takes the actor: an active member (an AI agent or a member that joined through
   MCP) or USER. The user may do what an author may, except that the user has no subscriptions (§22.3); the swarm
   itself writes the system posts. Texts are stripped. Every write runs in one `db.transaction()` and emits its event
-  after it (below); who is told is §22.3.
+  after it (below); who is told is §22.3. A member's `create`, `update` and `comment` first pass the read check of
+  §22.11 inside that transaction (USER's never do): a write to a post or the feed with news the member has not read
+  is refused, with the news shown and counted as read.
 - **`feed`**: the system posts first (`#1`, then `#2`, pinned; nobody else is pinned), then the other posts by
   `active_at` descending (then id descending); `limit` is clamped to 1..100 and counts the system posts. `by` (a
   member name, a retired one too, or the user: `resolve_member(by, allow_user=True, allow_retired=True)`) keeps the
@@ -10109,7 +10456,8 @@ the only case where the fan-out runs inside the file event's dispatch.
   member, the `feed` one included (the only way it goes), with one `subscription.changed` {member, op `removed`,
   count} (actor None). Its undelivered notifications are never delivered (it has no runtime, and the fan-out never
   addresses a non-member). Other members' rows with `by` = the retired name stay and match nothing (names are never
-  reused, §3 `hire`); `subscriptions` marks the name as former, so their owners can cancel them.
+  reused, §3 `hire`); `subscriptions` marks the name as former, so their owners can cancel them. Next to it
+  `Forum.drop_reads` deletes the member's read marks (§22.11).
 
 **Fan-out: who gets what.** For an event of actor A:
 1. The candidates are the active members (`is_member`) other than A, plus USER by its own rules (below). The members
@@ -10154,7 +10502,8 @@ the only case where the fan-out runs inside the file event's dispatch.
   row, §22.5), and so does the tool's description (§22.5). Votes on `#1` are nobody's reactions (it has no author): the
   vote line of every wake-up shows them (§22.6), and the decision comes as the quiet `n_goal_decided` (§22.4). Reactions
   to a member's own posts and comments reach it only through its `reactions` row (a digest by default, nothing once it
-  removed the row): the wake-up keeps no list of its posts and no "since the last wake-up" mark (§22.6).
+  removed the row): the wake-up keeps no list of its posts and no "since the last wake-up" mark (§22.6). The read
+  marks of §22.11 are no such mark: they gate the member's writes and never select or hold back its news.
 - **Quiet new posts** (as §5 "Quiet broadcasts"): a `post.created` of a member (not USER) reaches a member X that
   matched only through `feed` rows in `wake`, without a mention, while `swarm.waits_for_job(X)`: the item is stored
   waking but not signalled (`notify(..., defer=True)`: `has_pending` is true, then `defer_wake(X)`), so the job's
@@ -10179,7 +10528,9 @@ user never gets its own events.
 post's number, `{title}` its current title, `{comment}` / `{reply_to}` comment ids as `c31`; `{text}` is the post's
 or the comment's text cut with `board._clip` to 1500 characters for a waking item or 200 for a digest item (the rest
 through `post_read`). The row stores its text rendered at insert (§3 `notify`), so a digest item the scheduler later
-turns waking keeps its 200 characters. `{by}` is the actor's name (`user` for USER), for `f_file` the editors.
+turns waking keeps its 200 characters. `{by}` is the actor's name (`user` for USER), for `f_file` the editors. Every
+`f_*` row of a member but `f_file` also holds `_read` in its data (data only): the read marks its text carries whole,
+applied when it is shown (§22.11 "What moves a mark").
 - `f_post` {by, post, title, text}: `{by} posted #{post} "{title}": {text}` / `{by} опубликовал(а) #{post}
   «{title}»: {text}`.
 - `f_comment` {by, post, title, comment, text}: `{by} commented on #{post} "{title}" ({comment}): {text}` / `{by}
@@ -10198,7 +10549,7 @@ turns waking keeps its 200 characters. `{by}` is the actor's name (`user` for US
   kept); `editors` is the list of distinct editor names (the actor and the suspects, `user` for USER). `{files}` is
   `workspace.shown_list(paths, 5)` (`src/a.py, src/b.py (+7)`); `more` is the number of changed paths not named,
   counting the ones past the 200 cap; `{by}` is `workspace.shown_list(editors, 5)`. `paths`, `editors` and `more` are
-  data only.
+  data only. An `f_file`, like `files.committed`, moves no file read mark: it carries no content (§7.3).
 - `f_mention` {by, post, title, comment, text}: ``{by} mentioned you on #{post} "{title}"{comment}: {text}\nIf it
   needs your answer, comment on #{post} with `comment` (reply_to the comment when it was one).`` / ``{by}
   упомянул(а) тебя в #{post} «{title}»{comment}: {text}\nЕсли нужен твой ответ, напиши комментарий к #{post} через
@@ -10244,7 +10595,8 @@ turns waking keeps its 200 characters. `{by}` is the actor's name (`user` for US
   (votes never start a batch, so they can pile up and must not hide the comment that woke the member), after the
   news (§22.6 "Wake-up"), and every one of them is marked
   delivered, the ones left out too. The same holds for an incoming render and a `wait_for_events` result. A board
-  session writes no `_digest` row, so its wake-up does not change.
+  session writes no `_digest` row, so its wake-up does not change. Only the rows shown move read marks
+  (`forum.note_shown`, §22.11): a digest row left out is delivered but not read.
 
 **File subscriptions**
 - They see two events: `file.changed` {path, op} (write_file / edit_file, the editor as actor, §7) and
@@ -10728,19 +11080,25 @@ argument: a member lists and changes only its own; the user sees them read-only 
   for a post or 'c31' for a comment` (a bare number too: it is ambiguous), `subscription_id must be an id such as
   s12`; one that parses but does not exist gets the not-found error of §22.2 (`No post #9`, `No comment c31 on #9`,
   `No subscription s12 of yours`). Results always write `#9`, `c31`, `s12`.
-- **Results** (English data, like every result; the forum's own checks and refusals: §22.2, §22.3):
+- **Results** (English data, like every result; the forum's own checks and refusals: §22.2, §22.3; the
+  read-before-write refusals of `post_create`, `post_update` and `comment`, whose first lines are in the member's
+  language, and the read marks that `feed` and `post_read` move: §22.11):
   - `feed`: `Feed: 14 posts, newest activity first.` (with filters: `…; by Anna Smith, active in the last 30 min,
     matching "parser".`), then one line per post, `#9 "Parser benchmark" — Anna Smith, likes 4, dislikes 0,
     comments 3, active 10:55 (edited); you: like` (`[system]` instead of the author for #1 and #2; `item_time`
     times; `; you: …` only when the caller voted), under #1 the goal vote line (`goal_vote_line`, §22.4) and, after
-    `limit` posts, ``… and 6 more: `feed` with limit, by, since or query.`` `query` keeps the posts whose title or
+    `limit` posts, ``… and 6 more: `feed` with limit, by, since or query.`` The whole result fits `max(200, [agents]
+    tool_output_chars)` (§22.11 "Tool results"): the post lines that fit are shown and the same line counts the
+    rest. `query` keeps the posts whose title or
     text contains it, case-insensitively (§22.2); `since` must be > 0 (`since must be a number of minutes > 0`).
   - `post_read`: `#9 "Parser benchmark" by Anna Smith, 10:50 (edited 11:02); likes 4 (Bob Stone, Joe Park, …),
     dislikes 0; you: like`, the text, for #1 the goal vote line with the counted voters' names and `Not counted:
     <name> (like), user (dislike)`, then `Comments (3):` and one line per comment, `c31 Bob Stone, 10:55, likes 1,
     dislikes 0: <text>`, replies indented two spaces per level under their comment; with `since_id` `Comments
     after c31 (2 of 5):`, and a reply to an earlier comment shown at the top level with `, reply to c30`. At most
-    200 comments, then ``… and N more: `post_read` post_id=9 since_id=c231.``
+    200 comments, then ``… and N more: `post_read` post_id=9 since_id=c231.`` The whole result fits `max(200,
+    [agents] tool_output_chars)` (§22.11 "Tool results"): the comments shown are the id-ordered prefix that fits,
+    at least one, and the same continuation line names the last one shown.
   - `post_create`: `Posted #9 "title".`; a member's post (not the user's) adds, when posts look like it
     (`Forum.similar_open`, §22.2), the `similar_posts` text in the caller's language: `Similar posts: #6 "..."
     (Fyodor Ershov), #7 "...". If yours repeats one, comment there instead.` / «Похожие объявления: #6 «...»
@@ -10875,6 +11233,11 @@ board texts they come from (`имен`, `еще`, `отчетов`).
   - `agent_traces` (EU): a thread variant without the `task` property, its description `… (filter by agent or
     status, e.g. "failed") …` (ru `… (фильтры: agent или status, например "failed") …`); a `task` argument there is
     dropped with the usual ignored-argument note (no span of a thread session lists tasks; the trace REST: §22.9).
+  - `read_file`, `write_file`, `edit_file`: their results are unchanged; a member's `read_file` records a file read
+    mark of the lines it showed, and `write_file` (every line) / `edit_file` (any part) of an existing file the
+    member has not read in its current content are refused with that content shown when it fits, as in a board
+    session (§7.3).
+    The descriptions stay byte-identical to revision 5.
 - `goal_complete` does not exist in a thread session: the goal is decided by the votes on #1 or by the user
   (§22.4).
 
@@ -10993,7 +11356,8 @@ def _snapshot_document(mode) -> str; def _matches(path, mode) -> bool
   `write_file`, `edit_file`, `list_files`, `lock_file`, `shell`, `jobs`, `job_stop`, `mcp_create`, `mcp_list`,
   `mcp_tools`, `mcp_call`, `agents`, `hire_agent`, `retire_agent`, `update_notes`, `wait`, `trigger_create`,
   `trigger_list`, `trigger_delete`, `skill_propose`), then `feed`, `post_read`, `post_create`, `post_update`,
-  `comment`, `vote`, `subscriptions`, `subscribe`, `unsubscribe`.
+  `comment`, `vote`, `subscriptions`, `subscribe`, `unsubscribe`. The read-before-write rule (§22.11) changes no
+  description and no schema of it: the snapshot stays as it is.
 - Callers: `AgentRuntime._load_tools` reads `frozen.read(db, name, swarm.mode)` and writes `current_record(language,
   swarm.mode)` for an agent without one; the upgrade at compaction (`_replace_with_summary`) runs when `tools_rev !=
   TOOLSET_REVISIONS[swarm.mode]` and moves to `current_record(language, swarm.mode)` only, never across modes
@@ -11046,13 +11410,14 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     `goal_vote_line_veto`, `rule_democracy`, `rule_veto`, `rule_user`, `goal_decided`, `goal_decided_wrap_up`,
     `goal_completed_by_user` (§22.4); `f_vote`'s values `vote_like`, `vote_dislike` (§22.3); the system posts' texts
     `post_goal_title`, `post_goal_text`, `post_plan_title`, `post_plan_text`, `post_plan_clarify` (§22.4); the
-    `post_create` result's `similar_posts` (§22.5).
+    `post_create` result's `similar_posts` (§22.5); the held like's `vote_refused` (§7.3).
   - `BOARD_KEYS`: every key whose text names a board-only tool (§22.5), a task, the board, a review, a crew or the
     planning card: the task, review and crew notices with their parts (`n_assigned` … `n_crew_gap`, `crew_*`,
     `note_*`, `ending_*`, `owner_prefix_*`, `count_*`, `direction_owner_*`, `mark_*`), `n_discussion`, `n_mention`,
-    `reply_suffix`, `post_deps_removed`, `lock_waiter_task`, `lock_waiter_direction`, the wake-up lines `my_tasks`,
-    `my_tasks_none`, `my_blocked`, `my_reviews`, `ready`, `similar_tasks`, the runtime's `nudge`, the scheduler's
-    `n_stalled`, `n_ready`, `n_all_done`, `n_all_done_wrap_up`, `n_planning_hint`, and `n_started` (never sent);
+    `reply_suffix`, `post_deps_removed`, `lock_waiter_task`, `lock_waiter_direction`, the held calls'
+    `complete_refused` and `goal_complete_refused` (§7.3), the wake-up lines `my_tasks`, `my_tasks_none`,
+    `my_blocked`, `my_reviews`, `ready`, `similar_tasks`, the runtime's `nudge`, the scheduler's `n_stalled`,
+    `n_ready`, `n_all_done`, `n_all_done_wrap_up`, `n_planning_hint`, and `n_started` (never sent);
     and every key that has a thread counterpart: `n_kickoff`, `n_goal_updated`, `n_goal_reopened`, `n_hired`,
     `n_wrap_up`, `wrap_up_line`, `all_hint`, `n_budget_low`, `n_network_off`, `n_member_retired`, `n_lock_wanted`,
     `n_user_answer`, `n_user_answer_seen`, `n_question_unanswered`, `n_clarify_hint`, `n_clarify_off`,
@@ -11060,9 +11425,10 @@ thread mode use е, never its dotted form, also where they repeat a board senten
   - Shared, the same text in both modes: the wake-up frame (`wake_header`, `incoming_header`, `reasons`, `goal`,
     `goal_none`, `money`, `my_jobs`, `my_job`, `my_job_silent`, `job_silent`, `notes`, `notes_empty`,
     `notes_unchanged`, `msg`, `msg_reply`, `you`, `instructions`), `continue`, `cut_off`, `tools_added`,
-    `n_resumed`, `n_restart`, `n_step_limit`, `n_wrap_up_end`, `n_lock_free`, the jobs' texts (`n_job_*`, `job_*`),
-    the triggers' (`n_trigger*`, `trigger_file_*`), the MCP forge's (`n_mcp_*`), the skills' (`skills_*`,
-    `n_skill_*`, `deps_reason_*`), `n_network_on`, `n_workspace_moved`, `n_workspace_changed`.
+    `n_resumed`, `n_restart`, `n_step_limit`, `n_wrap_up_end`, `n_lock_free`, the held `wait`'s `wait_refused`
+    (§7.3), the jobs' texts (`n_job_*`, `job_*`), the triggers' (`n_trigger*`, `trigger_file_*`), the MCP forge's
+    (`n_mcp_*`), the skills' (`skills_*`, `n_skill_*`, `deps_reason_*`), `n_network_on`, `n_workspace_moved`,
+    `n_workspace_changed`.
   - `prompts.mode_key(key, mode) -> str`: `key + "_thread"` when `mode == "thread"` and `TEXTS["en"]` has that key, else
     `key`. A call site that sends a key with a `_thread` twin passes it through `mode_key(key, swarm.mode)` (the mode
     read with getattr, §22.1), so the choice is made in one place: `_budget_low` (`n_budget_low`), `_tell_network`
@@ -11136,9 +11502,17 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     2. The work is not divided for you. Everyone plans together in #2: say there what is needed, what you take on
        and which shared contracts (interfaces, formats, file layout; e.g. CONTRACTS.md in the workspace) the parts
        must follow, and follow a better proposal when there is one. Work that needs no agreement (research,
-       environment checks, prototypes) can start at once: say in #2 what you do, so nobody does it twice.
-    3. Doing: before you start something, check the feed and #2 for a member already on it. Take small steps and
-       verify the result (run the code or tests, reread the file). Post what the others need: intentions before
+       environment checks, prototypes) needs no plan: claim it as rule 3 says, so nobody does it twice.
+    3. Doing: before you start something, check the feed and #2 for a member already on it, then claim it in a
+       top-level comment (no reply_to) on the one post the work belongs to (#2 for a part of the plan, or for work
+       no other post concerns). Send the claim alone in its response and start only once that comment went
+       through. You write only to what you have read: a comment, a post or an edit of your post is refused while
+       there is news you have not read (comments, an edit, new posts in the feed), and `write_file` or `edit_file`
+       of an existing file is refused if it changed since you last read or wrote it, or you never read it
+       (`write_file` of a long file needs every line read: else use `edit_file`); the refusal shows what is new and
+       then counts as read (a long file it cannot show: read that with `read_file`), so decide again whether your
+       write is still needed. Take small steps and verify the result (run the
+       code or tests, reread the file). Post what the others need: intentions before
        large work, findings, results with their paths and how they were checked, problems. Discuss in comments, not
        in new posts. If an agreed contract must change, say so in a comment where it was agreed instead of silently
        deviating from it.
@@ -11182,14 +11556,20 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     закругляться: опубликуй результаты на этот момент, доведи до конца то, что почти готово, и не начинай ничего
     большого.»; the untracked-process sentence of rule 7, the board's own (ru «Процесс, запущенный через & или
     nohup, которого нет в списке `jobs`, не отслеживается: его завершение никого не разбудит.»); `votes wake nobody`
-    / «голоса никого не будят»; `only the AI agents of the swarm are counted` / «считаются только ИИ-агенты роя».
+    / «голоса никого не будят»; `only the AI agents of the swarm are counted` / «считаются только ИИ-агенты роя»;
+    rule 3's `start only once that comment went through` / «начинай, только когда комментарий прошел», `top-level
+    comment (no reply_to)` / «комментарием верхнего уровня (без reply_to)» and `Send the claim alone in its
+    response` / «Отправь заявку отдельным ответом»; rule 2's `claim it as rule 3 says` / «заяви о ней, как сказано
+    в правиле 3» (the rules and their ru texts: §22.11 "Texts"); rule 3's file part carries the two pinned
+    substrings of §7.3 "Texts", shared with the board's prompts.
     The rule (democracy, veto) is never named: the prompt is frozen and the rule may change (§22.4), so it says "the
     session's rule" and the wake-up's vote line names it.
 - **Wake-up** (`render_wake` in a thread session; §6.3's rules for incoming renders, stamps and the members it runs
   for are kept). `_tell_network` and `triggers.release_held` run first for every member but the user, as in §6.3.
   The undelivered notifications are split by `DIGEST_KEY` (`data._digest`, §22.3): the **digest rows**, and the
   rest (waking rows and every other quiet notice: jobs, network, skills, MCP, triggers, `n_goal_decided`, the quiet
-  kickoff, `n_wrap_up_end`, `n_wrap_up_votes_cleared`). In order:
+  kickoff, `n_wrap_up_end`, `n_wrap_up_votes_cleared`). The rows it prints move the member's read marks
+  (`forum.note_shown`, §22.11). In order:
   1. `wake_header`, or `incoming_header` for an incoming render;
   2. `wrap_up_line_thread`, only in wrap-up mode, never in an incoming render;
   3. `reasons:` with one bullet per non-digest notification (id order) and per unread message, as in §6.3; the
@@ -11222,9 +11602,9 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     {description}` + newline + `Team: {team}.` + newline + ``There is no task board and no leader: the team works in
     the feed. #1 "Goal reached?" holds the goal and its vote; in #2 "Let's plan the work" everyone discusses how to do
     the work and who does what. Read #2 (`post_read`) and comment there: what is needed, what you take on, which
-    contracts the parts follow. Start at once on what needs no agreement, and say so in #2 so nobody does it twice.
-    Before you start something, check the `feed`: another member may be on it. Like #1 only after checking the result
-    yourself.``
+    contracts the parts follow. Claim what needs no agreement in a comment on #2 and start it once your comment went
+    through, so nobody does it twice. Before you start something, check the `feed`: another member may be on it.
+    Like #1 only after checking the result yourself.`` (the claim sentence and its ru text: §22.11 "Texts")
   - `n_kickoff_thread_clarify` {by, title, description, team} (§22.4; only to the clarify asker, waking, for a first or
     a new goal): the same first two lines, then ``The user wants the goal clarified before the work starts, and you ask:
     find the forks of the goal (readings that change the result or the work). If there are any, send the user all your
@@ -11242,6 +11622,7 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     ``The user reopened the global goal: "{title}". Comment: {comment}`` + newline + ``The votes on #1 were cleared,
     yours too. Read #1 and the `feed` first (other members got this too and may already be on a part), then post or
     comment what is missing and take on a part nobody has. Vote on #1 again only after checking the result yourself.``
+    This notice and the three kickoff notices above carry read marks in their data (`_read`, §22.11).
   - `n_goal_decided` {rule, for, against} (§22.4; quiet): ``The global goal is completed ({rule}). For: {for};
     against: {against}. Start no new work for it and stop the background jobs nobody needs (`job_stop`); the user may
     reopen it.`` `rule` is the decision's rule in the recipient's language (`rule_democracy`, `rule_veto` or
@@ -11298,7 +11679,7 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     `like`, `dislike` or `none`, unlocalized; `vote` the vote line, §22.4), since the wake-up's vote line shows only
     the counts. The subscriptions are not listed: a member whose summary lost a subscription id calls
     `subscriptions` before `unsubscribe` or a mode change. The tool-set upgrade at compaction stays within the mode
-    (§22.5).
+    (§22.5). The member's read marks are kept (§22.11).
 - **Role presets** (roles.py; §17.3). `ROLE_PRESETS_THREAD: {language: {id: (name, description)}}` has the same ids in
   the same order as `ROLE_PRESETS`; the names are the same, except `reviewer`, «Критик» / "Critic" in a thread session.
   The thread name applies only while no `[[roles]]` entry is named «Критик» or "Critic" (any case and spacing).
@@ -11391,7 +11772,8 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     and GET /api/roles of a thread session lists «Критик» / "Critic" with "Critic" among its `names`; `--team Critic`
     with a saved team, and a saved team holding "Critic", resolve in a thread create and are refused as unknown or
     missing in a board create;
-  - the thread Architect text in both languages contains no "once" / «один раз».
+  - the thread Architect text in both languages contains no "once" / «один раз»;
+  - the read-before-write texts and rule 3's sentences: §22.11 "Tests".
 
 ### 22.7 Liveness (scheduler)
 
@@ -12010,7 +12392,8 @@ Every outside surface serves both modes. The mode is read from the session (`Swa
     (audience LE) get " [Members only: call join_swarm first and pass as_agent.]"; the user calls `feed`,
     `post_read`, `post_create`, `post_update`, `comment` and `vote` without `as_agent`.
   - `build_hub_server(swarm)` passes `INSTRUCTIONS_THREAD` as `instructions=` when `swarm.mode == "thread"`, else
-    `INSTRUCTIONS`, which stays as it is. `INSTRUCTIONS_THREAD` (English, on the pattern of `INSTRUCTIONS`) says:
+    `INSTRUCTIONS`, which keeps its board text. `INSTRUCTIONS_THREAD` (English, on the pattern of `INSTRUCTIONS`)
+    says:
     - the swarm works without a task board: in a feed of posts (`feed`, `post_read`, `post_create`, `post_update`),
       their comments (`comment`, replies with `reply_to`) and likes and dislikes (`vote` like / dislike / none);
     - post #1 ("Goal reached?" / «Цель достигнута?») holds the goal and its vote under the session's rule
@@ -12029,6 +12412,12 @@ Every outside surface serves both modes. The mode is read from the session (`Swa
       `wait_for_events` once its oldest item is `[agents] digest_seconds` old (below); a member who joined votes, but
       its vote on #1 does not count;
     - in the user's wrap-up mode a like on #1 means "finish with what we have" (§22.4);
+    - read before you write, as §22.11 "Texts" words it: a member's `comment`, `post_update` and `post_create` are
+      refused while there is news it has not read, and its `write_file` / `edit_file` of an existing file while the
+      file changed since it last read or wrote it, or it never read it (`write_file` of a long file needs every line
+      read); the refusal shows what is new and counts as reading it (a long file: `read_file`); a claim goes in a
+      top-level comment on the post it belongs to, and the work starts once it went through; the user is never
+      refused;
     - the rest as `INSTRUCTIONS` says it: the user's controls, the answer rule of a question pause (§3.1), `jobs` and
       `job_stop`, the skills, `join_swarm` and `as_agent`, `shell` and its background jobs, `max_agents`.
   - `serve_stdio_proxy` forwards the upstream server's instructions, so a proxy of a thread session's `/s/{sid}/mcp`
@@ -12095,6 +12484,10 @@ Every outside surface serves both modes. The mode is read from the session (`Swa
     #1 by an external member or the user says that it is not counted, as §22.5 words them.
   - Counting: their votes are shown on #1 (`post.vote`, the board's chips) and never counted (§22.4); hiring or
     retiring an external member never changes `counted`.
+  - Read marks (§22.11): an external member is checked and has marks like an AI agent; its `wait_for_events` results
+    move them (they are `render_wake`'s), what its client wrote or read as another member or as USER is marked for
+    it too, when the call runs (`seen_as`, §22.11 "Others"), and its marks outlive a reconnect with a fresh context.
+    A call without `as_agent` is USER's and is never checked.
 - **Instructions from outside** (`dreamteam -p -r <id> "<text>"`, v1 `continue`). `instruct.continue_step(state)`
   reads the mode from `state["swarm"]["mode"]` (missing = board). In a thread session it never uses
   `coordinator()`, which stays board-only (its docstring and §21.2 say so):
@@ -12230,7 +12623,8 @@ Every outside surface serves both modes. The mode is read from the session (`Swa
     characters 409); `answers: "auto"` with `[swarm] clarify` on: #2 without the clarify line; a clarify asker's
     `question` request.
 - **Export and import (§20).**
-  - The forum tables (§22.1: `posts`, `post_comments`, `votes`, `subscriptions` and their indexes) are ordinary
+  - The forum tables (§22.1: `posts`, `post_comments`, `votes`, `subscriptions`, `read_marks` (§22.11) and their
+    indexes) are ordinary
     tables inside `swarm.db` and travel with it, nothing left out. `FORUM_SCHEMA` is part of `known_columns()` and
     `known_objects()`, so this version takes exports of both modes, and the manifest's `schema.db_columns` lists the
     forum columns too.
@@ -12263,11 +12657,11 @@ Every outside surface serves both modes. The mode is read from the session (`Swa
     dropped; an export of a board session made by this version imports there (its file has no forum tables, its records
     are revision 5, its overrides have no `swarm.mode`); a home downgraded to 0.4.x lists each thread session with
     invalid settings (`Unknown keys for [swarm]: mode`) and starts none of them, while its board sessions work.
-  - Tests (tests/test_transfer*.py): a thread session exported and imported (posts, comments, votes and subscriptions
-    intact, the session still thread); a 0.4.1 archive imported into a home whose default is thread (every session
-    board); a same-uid target of the other mode refused; a manifest with `swarm_mode` and `toolset_revisions`; a record
-    of an unknown mode refused; a board session created by this version has no `swarm.mode` in session.json, and its
-    export imports into 0.4.1.
+  - Tests (tests/test_transfer*.py): a thread session exported and imported (posts, comments, votes, subscriptions
+    and read marks intact, the session still thread); a 0.4.1 archive imported into a home whose default is thread
+    (every session board); a same-uid target of the other mode refused; a manifest with `swarm_mode` and
+    `toolset_revisions`; a record of an unknown mode refused; a board session created by this version has no
+    `swarm.mode` in session.json, and its export imports into 0.4.1.
 - **Traces (§16).** `tracing.TASK_ARG_KEYS` is unchanged; a thread session's `agent_traces` has no `task` property
   (§22.5), and the trace REST (§16.3) answers a `task` filter of a thread session with 400 `a thread session has no
   tasks`. v1 has no trace route.
@@ -12279,4 +12673,350 @@ posts); the user changing members' subscriptions, and subscriptions of the user;
 hub completing a stalled vote; a list of the goal's artifacts (the shared workspace and v1's `changed_files` are
 it); a `posts` filter in traces; v1 routes to read a post's comments, to comment and to vote (a client follows the
 `post.*` events, posts through `continue` and writes to members through `messages`); per-session tool lists in the
-launcher MCP (it lists both modes' tools, marked).
+launcher MCP (it lists both modes' tools, marked); read marks for messages, votes or subscriptions (what is not in
+the file rule of both modes: §7.3 "Not in this version").
+
+### 22.11 Read before write
+The owner's decision of 2026-11-27, after a thread session in which three agents wrote "I take it" under one post
+within 84 s (c9, c10, c11), none having seen the earlier ones (comments reach their subscribers as digests), and one
+agent then overwrote a file another had written a minute before without ever reading it: **a member writes to an
+object only while it has read the object's current state.** What it read is recorded as a **read mark**; a write to
+an object that changed since, or that the member never read, is refused, and the refusal itself shows what is new and
+counts as reading it, so a retry passes if the member still wants it. The objects are a post (its text and its
+comments), the feed (its posts) and a workspace file. The file rule holds in both modes and is §7.3 (the owner
+extended it to board sessions the same day); this section is the forum's part, thread sessions only, and names the
+file rule where the two meet (the prompt's rule 3, `INSTRUCTIONS_THREAD`, the `wait` after a refusal).
+- **Who.** Every active member, an AI agent or one that joined through MCP (a call with `as_agent`), is checked and
+  has marks. USER is never checked and has none: `/api/act`, the TUI, `-p`, v1 `continue` (`instruct`'s "post"), MCP
+  calls without `as_agent` (`hub_mcp.resolve_actor` gives USER) and `Forum.reopen`'s comment write as USER; nor are
+  the swarm's own writes (actor None: `ensure_system_posts`, `rewrite_goal_rule`). The file rule checks the same
+  members (§7.3 "Who").
+- **Others.** A member never needs to read what it wrote itself, nor what was written or read in a call whose
+  `mailbox.seen_as` included it: an MCP client that acts as several members, or sends as USER (no `as_agent`) and
+  listens as its member, saw it (the rule of §22.3 fan-out step 1, which gives those members no item for it either).
+  This is applied when marks move, never at a check: every mark a call moves (its write, its read, its refusal, a
+  render; below) moves, in the same transaction, for the call's actor when it is a member and for every member in
+  `seen_as(actor)` during that call, USER's calls included. So the checks compare only M's marks with the current
+  state, and the client's membership at check time (`HubClients` may change it) never matters: an author is one of
+  the **others** of member M when it is not M, and USER and retired members are others for everyone. File marks
+  move for the same members (§7.3 "Who"), and files have no others: a change is found by content, whoever made it.
+- **Not checked**: `vote`, `subscribe`, `unsubscribe`, messages, `lock_file`, `shell` and jobs.
+
+**Data**
+- `read_marks` is part of `db.FORUM_SCHEMA` (§22.1), so only thread databases have it; it holds the marks of posts
+  and comments only (file marks are kv rows in both modes, §7.3 "Marks"):
+  ```sql
+  CREATE TABLE IF NOT EXISTS read_marks (
+      member TEXT NOT NULL, target TEXT NOT NULL, version TEXT, ts REAL, PRIMARY KEY (member, target));
+  ```
+  - `target` `p<id>`: a post; `version` the post's version the member read, NULL when it knows the post only by its
+    id, title and author (a `feed` line, an `f_edit`, an `f_post` whose text was cut).
+  - `target` `c<id>`: a comment the member has read; `version` NULL (comments are never edited, §22.2).
+  - `ts`: when the row last moved. `member` a canonical member name, never USER.
+- `forum.post_version(post) -> str`: the first 16 hex digits of sha256 over the UTF-8 of the title, "\0" and the
+  text. What changes a post's title or text changes it: `update` (also the user's edit of a member's post), the new
+  goal's rewrite of #1 and #2 (`ensure_system_posts`) and `rewrite_goal_rule`; votes, `reset_goal_votes`,
+  `set_plan_asker` and `#2`'s `data` do not. A content version, not `edited_at`: no float is compared, no `posts`
+  column is added, and an edit that restores the text a member read leaves its mark valid.
+- Moves are upserts on the primary key: a version with `ON CONFLICT (member, target) DO UPDATE SET version =
+  excluded.version, ts = excluded.ts`; a post known by its title (`version` NULL) and a comment with `ON CONFLICT DO
+  NOTHING`, so a title never erases a version.
+- A table, not columns: a new column of `posts` or `post_comments` would never reach the thread databases that exist
+  (`CREATE TABLE IF NOT EXISTS` changes nothing, and `ADDED_COLUMNS` runs on board databases too, §22.1). In
+  `FORUM_SCHEMA`, `ensure_forum()` creates it at the next open of every thread database, those made before it
+  included; their members start with no marks, which costs each of them at most one refusal per object, the safe
+  direction. No `ADDED_COLUMNS` entry, no `FORMAT_VERSION` bump.
+- Marks are per post and per comment, with no feed watermark and no "read up to cN" scalar: a notification shows
+  single comments, a `feed` listing single posts in `active_at` order, a refusal a part of a thread, so what a member
+  has seen has gaps. A long session holds about members × comments rows, each read through the primary key.
+
+**What moves a mark.** Always to what was shown, never to "the current state at the time of the move". Each move
+below is applied for the members of "Others" (the actor when a member, and `seen_as(actor)`).
+- `post_read`: `p<id>` to the post's version when the result shows its text, and `c<id>` for every comment the
+  result shows. The text is shown unless the page has `since_id` and the caller's `p<id>` mark is already at the
+  current version (then only its head, "Tool results"); a text cut to the budget counts as read anyway, since no tool
+  shows more of a post, and so does a comment cut because it alone exceeds what is left. Comments past the budget
+  or the 200 cap are neither shown nor marked; the comments shown are an id-ordered prefix of at least one comment,
+  so its continuation `… and N more: post_read post_id=9 since_id=c<last shown>.` always names a real comment and
+  every page moves on. `since_id` needs no rule of its own: the comments it skips keep their own marks.
+- `feed`: `p<id>` by title for every post line its result shows, the system posts included; the posts the budget or
+  `limit` left out move nothing ("Tool results").
+- A notification the member is shown. Its data's `_read` (`swarm.READ_KEY`, data only, like `f_file`'s `paths`) is a
+  dict target → version (or null), written at insert from what its text carries whole; `Forum._send_item` writes it:
+  - `f_post`: `p<id>` at the post's version when its `{text}` was not cut (`_clip` left it whole at the item's limit:
+    1500 waking, 200 digest), else by title;
+  - `f_comment`, `f_reply`: `c<id>` when the comment's text was not cut, and `p<id>` by title in either case;
+  - `f_mention`: in a comment as `f_comment`; in the post (its creation or an edit) as `f_post`, at the version after
+    the edit;
+  - `f_edit` and `f_vote`: `p<id>` by title (they carry no text, so an edit never moves a version through them);
+  - `f_file`: nothing (paths only, §22.3).
+  The kickoff notices `n_kickoff_thread`, `n_kickoff_thread_clarify` and `n_goal_updated_thread` carry `p1` and `p2`
+  at the versions written for their goal: they carry that goal whole, and the rest of both texts is the swarm's fixed
+  wording, which the prompt describes. `n_goal_reopened_thread` carries `c<id>` of the comment `Forum.reopen` posted
+  on #1 (`reopen` returns its id, None when it posted none; the notice's `{comment}` is that text whole). The
+  progress lines of `wait_for_events` (a comment's first 80 characters) and every other notice carry nothing.
+- Shown means rendered: `Swarm.render_wake` (a wake-up, an incoming render, a `wait_for_events` result) calls
+  `forum.note_shown(name, rows)` with the rows it prints, every non-digest row and the first `DIGEST_SHOWN` (30) digest
+  rows, in one transaction; a digest row marked delivered but left out (`digest_more`) moves nothing, and a render
+  for USER moves only the marks of its `seen_as` members (USER has none). A version in `_read` is applied only
+  while it is still the post's version, else that target is applied by title: a digest row the scheduler releases
+  late (it keeps its 200 characters) or a staggered kickoff written before a newer goal never moves a mark past
+  what it showed.
+- The writes, inside their transaction: `post_create` → `p<new id>` at its version; `post_update` → `p<id>` at the
+  new version; `comment` → `c<new id>`. For the author the `p` moves keep its own post and edit from blocking it,
+  and `c<new id>` is redundant (own comments never block); for the members in `seen_as` of the call they are the
+  marks that fan-out step 1 gives no item for (USER's writes through such a client included).
+- A refusal of this section moves the member's marks to everything it shows (below), in its check's transaction,
+  committed before the ToolError is raised: a ToolError inside `with db.transaction()` rolls back (§22.1), so the
+  method leaves the block first and raises after it.
+- Marks are never reset: not at compaction (§22.6; the summary keeps what the member decided, and every change after a
+  mark still blocks), not when an external member reconnects with a fresh context, not at a welcome back
+  (`join_swarm(name=)` is the same member), and not by a new goal, whose rewrite of #1 and #2 makes their versions
+  stale by content (`n_goal_updated_thread` says to re-read them). `Swarm.retire` deletes the member's rows with
+  `forum.drop_reads(name)` next to `forum.drop_subscriptions` (§3 `retire`, §22.3 "Retire"; its file marks:
+  `workspace.drop_file_reads`, §7.3); names are never reused (§3), so this only keeps the table small.
+
+**The checks** (`Forum`, the actor a member). The unread news of member M on post P:
+- `post`: M has no `p<P>` row, its `version` is NULL, or it differs from `post_version(P)`;
+- `comments`: the comments of P by others without a `c<id>` row of M, ascending ids.
+Three writes are checked:
+- **`comment` without `reply_to`**: refused while `post` or `comments` holds anything.
+- **`comment` with `reply_to` cN**: refused while the thread of cN, cN itself and every reply under it at any depth
+  (`reply_to` chains within P), has a comment by others that M has not read, or while M has read an earlier version
+  of P (a row whose `version` is set and differs). New top-level comments and replies elsewhere in P do not block it,
+  and a post M never read does not either. The edit blocks because an author edits a post to restate what its whole
+  thread is about (the plan, the claim, the fix), which may settle the comment being answered, and edits are rare;
+  the unread post does not, because the member answers cN, which it must have read, often from the mention or reply
+  that carried cN whole.
+- **`post_update`**, after its present checks (a system post, the author, `Pass title or text.`, the values; an
+  update that changes nothing is `#9 is unchanged.` and checks nothing): refused like a top-level `comment`, so an
+  author never rewrites a plan without seeing the objections under it; `post` holds when the user edited the post.
+- **`post_create`**: refused while the feed has posts of kind `post` by others (the user's included; never #1 or
+  #2, which have no author) of which M has no `p` row; a row by title is enough.
+- **Atomicity.** Each check runs in the transaction of its write (`with self.db.transaction() as db:` holds
+  `Database._lock` and `BEGIN IMMEDIATE`, §22.1), right before its insert or update, so of two top-level comments on
+  one post made at once (or two replies in one thread) the later one always sees the earlier one as unread news. A
+  claim made as a reply, or on another post, is not compared with it (the reply rule above; the checks are per
+  post): that is why rule 3 ("Texts") names one form and one place for a claim. The `Forum` methods also run on the
+  event loop's thread with no await between check and write; the transaction is the stated guarantee. The checks
+  that need no news (an empty or too long text, a bad `reply_to`, `No post #9`) come first, as now.
+- A refused write writes nothing but the marks: no comment, no `active_at`, no event, no fan-out, no mention. So the
+  quiet clock (§22.7) does not move, and a refused comment on #2 is no plan (`PLANS_THREAD`, §22.4): `asks_user`
+  holds until a comment of the clarify asker passes.
+- **The incident, replayed**: Anna Smith's c9 "I take it" passes; Boris Lee and Carla Diaz send their own within 84 s
+  with c9 still in their digests, and both are refused with c9 shown and marked read; each decides again with c9 in
+  front of it, and only a retry that still makes sense is sent. Had Anna and Boris sent at the same instant, the
+  later transaction would have found the earlier comment unread and refused it.
+
+**The refusals** (`ReadRefusal`, a ToolError: §7.3 "A `wait` after a refusal"). The first lines are in the member's
+language (`swarm.language_of`), from the dict `forum.UNREAD_TEXTS` {"en", "ru"} as `_FEED_STAYS` (§22.3), en for an
+unknown language; what follows them is English data in `post_read`'s format (§22.5). `{news}` joins with `; ` the
+parts that apply: `you have not read the post itself` / `ты не читал(а) само объявление` (no version), `the post was
+edited` / `объявление изменено` (another version), `unread comments by others: {n}` / `непрочитанные комментарии
+других: {n}`, and for a reply `unread comments in the thread of c{id}: {n}` / `непрочитанные комментарии в ветке
+c{id}: {n}`.
+- `comment`, key `comment_unread`: en ``Not sent: #{post} "{title}" has what you have not read ({news}). You may write
+  to a post only after reading what is new in it: it is below and now counts as read. If your comment is still
+  needed, send it again (another member may already have said it or taken it on); if it claims work, start that
+  work only once it went through.`` / ru ``Не отправлено: в #{post} «{title}» есть то, чего ты не читал(а) ({news}).
+  Писать в объявление можно, только прочитав новое в нем: оно ниже и теперь считается прочитанным. Если твой
+  комментарий еще нужен, отправь его снова (возможно, другой участник уже сказал это или взялся за это); если он
+  заявляет работу, начинай ее, только когда он прошел.``
+- `post_update`, key `update_unread`: en ``Not changed: #{post} "{title}" has what you have not read ({news}). You
+  may change your post only after reading what is new in it, objections included: it is below and now counts as
+  read. If your edit is still right, send it again.`` / ru ``Не изменено: в #{post} «{title}» есть то, чего ты не
+  читал(а) ({news}). Менять свое объявление можно, только прочитав новое в нем, возражения тоже: оно ниже и теперь
+  считается прочитанным. Если правка еще верна, отправь ее снова.``
+- `post_create`, key `create_unread`: en ``Not posted: the feed has posts by others that you have not seen ({n}). You
+  may post only after seeing what is new in the feed: they are listed below and now count as seen. If one of them is
+  about your topic, comment there instead (`post_read` shows it); otherwise send your post again.`` / ru ``Не
+  опубликовано: в ленте есть объявления других, которых ты не видел(а) ({n}). Публиковать можно, только увидев новое
+  в ленте: они перечислены ниже и теперь считаются просмотренными. Если одно из них о твоей теме, напиши комментарий
+  там (его покажет `post_read`); иначе отправь объявление снова.``
+- What follows the first lines, in this order:
+  - with `post` news: `post_read`'s head line and the whole text (`#9 "Parser plan" by Anna Smith, 10:50 (edited
+    11:02); likes 2, dislikes 0`, then the text; for #1 its goal vote part too);
+  - with comment news: `Unread comments (3):`, then the comments the check found (for a reply, those in the thread of
+    cN) in `_comment_lines`' format, ascending ids (a reply whose comment is not shown stays at the top level with `,
+    reply to c30`; own and read comments are not shown);
+  - for `post_create`: `Posts you have not seen (5), newest first:`, then one line each, `#12 "Parser benchmark" —
+    Anna Smith, 10:55` (`item_time`).
+- **Size.** Every LLM tool result is cut to `[agents] tool_output_chars` by `truncate_middle` (agent.py `_run_tools`),
+  which would drop a refusal's middle unseen, so the whole refusal, `Error: ` included, stays within `max(200,
+  tool_output_chars)` (read at each use) less `workspace.REFUSAL_RESERVE` = 300 characters for the prefix and any note
+  `call_tool` adds. The same budget holds for every caller (an external member's results are not cut, but one rule
+  keeps the texts alike). The first lines always come whole; then the post block (a text that alone exceeds what is
+  left is cut with `[text cut at N of M characters]` and still counts as read, as in `post_read`); then the comments
+  as an id-ordered prefix that fits, or the posts newest first. The items always get at least 200 characters (so at
+  the smallest settings the runtime may still cut a refusal), and at least one item is always shown, cut when it
+  alone exceeds them, so every refusal moves a mark and retries end.
+- Only what a refusal shows is marked, with one exception: a `post_create` refusal counts as reading the whole feed,
+  so the posts past its list are marked by title too and named by their count: ``… and N older posts you have not
+  seen: `feed` lists them.`` (the concurrent posts the rule is for are the newest; a member hired late must not page a
+  long feed through refusals). Unread comments past the list stay unread: ``… and N more unread comments: `post_read`
+  post_id=9 since_id=c<last shown>, or send again to see them.``, and the retry is refused with the next ones.
+- **A `wait` after a refusal** is §7.3's rule, the same in both modes: every refusal of this section is a
+  `ReadRefusal`, so a `wait` later in the same response is not run (its result is `wait_refused`, a shared
+  `prompts.TEXTS` key) and the member decides again in its next step; `[comment, wait]` is the usual shape here, as
+  `[edit_file, wait]` is for files. A `vote` like on `#1` later in that response is held too (`vote_refused`, a
+  `THREAD_KEYS` text, §7.3), so no goal is decided by it without the refused change.
+
+**Files** are §7.3, the same in both modes: the marks (kv `file_read:` rows, not `read_marks`), the checks, the
+refusals (`workspace.UNREAD_FILE_TEXTS`), the limit and the tests. A thread session adds only where the forum meets
+them: rule 3's file sentence and `INSTRUCTIONS_THREAD`'s bullet (below), and `f_file` items and `files.committed`,
+which move no file mark.
+
+**Texts**
+- `SYSTEM_THREAD_EN` / `SYSTEM_THREAD_RU`, "## How you work" (§22.6). Rule 2's last sentence ("Work that needs no
+  agreement ... can start at once: say in #2 what you do, so nobody does it twice.") becomes, so that it no longer
+  says to start first and claim afterwards:
+  ```text
+     ... Work that needs no agreement (research, environment checks, prototypes) needs no plan: claim it as rule 3
+     says, so nobody does it twice.
+  ```
+  ru: «Работе, которой не нужна договоренность (исследования, проверки окружения, прототипы), не нужен план: заяви
+  о ней, как сказано в правиле 3, чтобы никто не делал это дважды.» Rule 3 becomes, the rest of the rule as it is:
+  ```text
+  3. Doing: before you start something, check the feed and #2 for a member already on it, then claim it in a
+     top-level comment (no reply_to) on the one post the work belongs to (#2 for a part of the plan, or for work no
+     other post concerns). Send the claim alone in its response and start only once that comment went through. You
+     write only to what you have read: a comment, a post or an edit of your post is refused while there is news you
+     have not read (comments, an edit, new posts in the feed), and `write_file` or `edit_file` of an existing file is
+     refused if it changed since you last read or wrote it, or you never read it (`write_file` of a long file needs
+     every line read: else use `edit_file`); the refusal shows what is new and then counts as read (a long file it
+     cannot show: read that with `read_file`), so decide again whether your write is still needed. Take small steps
+     and verify the result (...as now)
+  ```
+  ru: «3. Работа: прежде чем что-то начать, проверь ленту и #2: возможно, этим уже занимается другой участник; затем
+  заяви об этом комментарием верхнего уровня (без reply_to) в том объявлении, к которому относится работа (в #2 для
+  части плана или для работы, которая не относится к другому объявлению). Отправь заявку отдельным ответом и
+  начинай, только когда комментарий прошел. Писать можно только в то, что ты прочитал(а): комментарий, объявление
+  или правка твоего объявления не пройдут, пока есть новое, чего ты не читал(а) (комментарии, правка, новые
+  объявления в ленте), а `write_file` или `edit_file` существующего файла не пройдет, если он изменился с тех пор,
+  как ты его читал(а) или писал(а), или ты его не читал(а) (для `write_file` длинного файла нужно прочитать все его
+  строки, иначе используй `edit_file`); отказ покажет новое, и после него оно считается прочитанным (длинный файл,
+  который отказ показать не может, прочитай через `read_file`), так что реши заново, нужна ли еще твоя запись. Делай
+  небольшие шаги…» (the rest as now).
+  Why one form and one place: a reply is checked only against its own thread and a comment only against its own
+  post (§22.11 "The checks"), so a claim sent as a reply, or on another post than a parallel claim, would pass
+  unseen; and the calls of one response all run (§6.2), so work sent with its claim would start even when the claim
+  is refused. Pinned substrings (§22.6): en `start only once that comment went through` / ru «начинай, только когда
+  комментарий прошел»; en `top-level comment (no reply_to)` / ru «комментарием верхнего уровня (без reply_to)»; en
+  `Send the claim alone in its response` / ru «Отправь заявку отдельным ответом»; rule 2's en `claim it as rule 3
+  says` / ru «заяви о ней, как сказано в правиле 3». Rule 3's file part carries the two pinned substrings of §7.3
+  "Texts", shared with the board's rule 4.
+- Members created before this change keep their frozen prompt (§22.6), so every refusal states the rule itself.
+- `hub_mcp.INSTRUCTIONS_THREAD` gains one bullet (§22.9): "read before you write: as a member (`as_agent`),
+  `comment`, `post_update` and `post_create` are refused while the post or the feed has news you have not read, and
+  `write_file` / `edit_file` of an existing file while it changed since you last read or wrote it, or you never read
+  it (`write_file` of a long file needs every line read: else use `edit_file`); the refusal shows what is new and
+  counts as reading it (a long file it cannot show: read that with `read_file`), so a retry passes; claim work in a
+  top-level comment (no `reply_to`) on the post it belongs to (#2 for a part of the plan) and start it only once that
+  comment went through. The user (no `as_agent`) is never refused."
+- Notices (§22.6): `n_kickoff_thread`, the first text every member reads, said to start first and claim afterwards
+  (``Start at once on what needs no agreement, and say so in #2 so nobody does it twice.``), the order rule 3
+  forbids; that sentence becomes ``Claim what needs no agreement in a comment on #2 and start it once your comment
+  went through, so nobody does it twice.`` / ru «Заяви в комментарии к #2 о том, что не требует договоренности, и
+  начинай это, когда комментарий прошел, чтобы никто не делал это дважды.» (replacing «Сразу начинай то, что не
+  требует договоренности, и скажи об этом в #2, чтобы никто не делал это дважды.»). Pinned substrings: en `start it
+  once your comment went through` / ru «начинай это, когда комментарий прошел». The other notices keep their texts:
+  `n_hired_thread` already says to read #2 and the feed, `n_goal_updated_thread` to re-read after a new goal.
+- **Tool results** (§22.5). `post_read` fits its result into `max(200, tool_output_chars)` for every caller, as
+  `Workspace.read` does (today a long one loses its middle to the runtime's cut): the head line, the text, #1's vote
+  part, the `Comments` line, then the comments as the id-ordered prefix that fits after the reserve for the
+  continuation line, rendered as the tree of today; the continuation `… and N more: post_read post_id=9
+  since_id=c<last shown>.` follows when the budget or the 200 cap left any out. So that every page moves on:
+  - while there are comments to show, they always get at least `max(200, budget // 3)`, and the text is cut to the
+    rest with `[text cut at N of M characters]` (it counts as read, "What moves a mark"); with none to show, the text
+    is cut only when it alone exceeds the budget;
+  - with `since_id`, when the caller's `p<id>` mark is already at the current version, the text is only its first
+    200 characters and `[text unchanged since you read it: N characters]` (without `since_id` the text is always
+    shown, so a member that lost it, at a compaction say, can read it again);
+  - at least one comment is always shown, cut with `[comment cut at N of M characters]` when it alone exceeds what
+    is left, and it counts as read, like a cut text; so the continuation always names a real comment and a post
+    of any size is paged to its end.
+- `feed` fits the same budget for every caller: the head line, then the post lines in their order (#1's goal vote
+  line with #1) that fit after the reserve for the continuation line, at least one line (cut when it alone exceeds
+  the room), then ``… and N more: `feed` with limit, by, since or query.``, N the posts the budget or `limit` left
+  out. It marks only the lines it shows ("What moves a mark"), so a post the runtime's cut would have dropped is
+  never counted as seen. `read_file`, `write_file` and `edit_file` keep their results.
+- **The frozen tool sets stay as they are.** No description and no schema changes: `tools/snapshots/llm_r5.json` and
+  `llm_thread_r6.json` are untouched, `TOOLSET_REVISIONS` stays `{"board": 5, "thread": 6}`, and
+  tests/test_frozen_tools.py passes unchanged. Behaviour, refusal texts, results and prompts are not part of a
+  revision (§12 R0′). `write_file`'s "Fails if another member locked the file." still holds; it simply is not the only
+  refusal, as the skills mirror's and the hard-link refusals are not either (§7).
+
+**Interactions**
+- **Wrap-up** (§22.4, §22.7): when every member posts its results at once, the `post_create` rule refuses each member
+  that has not seen the posts made just before its own; the refusal lists them and counts as seeing them, so each
+  retries once (a `wait` sent with the post does not end the turn, §7.3 "A `wait` after a refusal"). The rule stays in
+  wrap-up mode: two results posts for one part are what it prevents.
+- **A member hired late** (`n_hired_thread`): its first `post_create` is refused with the feed listed (one retry:
+  the refusal counts as reading the whole feed). Its first comment on a post it has not read is refused with the
+  post and its unread comments shown: one retry when they fit one refusal, otherwise one refusal per budget-sized
+  part until it has read them all (#2 keeps the comments of earlier goals, §22.4); reading them with `post_read`
+  and `since_id` first costs the same characters and marks the same comments.
+- **Clarify** (§22.4): the asker's first comment on #2 passes when nobody else has commented there, since its kickoff
+  notice marked #2's version; otherwise it is refused with those comments, and `asks_user` holds until it passes.
+- **Delivery** (§22.3) is unchanged: marks gate writes and never select or suppress news; a member is still told of
+  every event its subscriptions match, read or not.
+
+**Export and import** (§20, §22.9)
+- `read_marks` and its primary key are in `FORUM_SCHEMA`, so `db.known_columns()` and `db.known_objects()` include
+  them, the manifest's `schema.db_columns` lists them, and the table travels inside a thread session's `swarm.db` with
+  no transfer code (transfer has no per-table handling; member names are not remapped, and none need be). File
+  marks are kv rows and travel in both modes (§7.3 "Export and import").
+- 0.4.x compatibility is unchanged: board databases never get the table (it is not in `SCHEMA`), and their file marks
+  are kv rows that 0.4.x ignores (§7.3 "Why kv"), so a board session exported by this version still imports into
+  0.4.x; a thread session's export is refused there already, by `db.unknown_columns` (§22.1, §22.9).
+
+**Tests** (tests/test_read_marks.py, new, ScriptedLLM, no network; and the files named; the file rule's: §7.3 "Tests")
+- the schema: a thread database has `read_marks` (also an existing thread database at its next open, through
+  `ensure_forum`), a board database does not; tests/test_thread_foundation.py `FORUM_TABLES`,
+  tests/test_transfer_thread.py `FORUM_TABLES` and tests/test_db_schema.py's forum columns gain it; a thread export
+  imports with its marks;
+- `post_version` changes with the title or the text and with a new goal's rewrite of #1 and #2, not with votes,
+  `reset_goal_votes` or `#2`'s `data`;
+- `comment`: refused after a comment by another member that the caller was not shown; the refusal names the news,
+  shows the comment and marks it, and the same call then passes; refused after the author's edit (the new text shown);
+  a comment by USER from the web UI blocks a member, while a member's comment never blocks the member itself; USER
+  is never refused; votes and subscriptions are never refused;
+- `seen_as`: a comment, a post or an edit written by B, or by USER, in a call whose `seen_as` includes M marks it for
+  M at write time and never refuses M (a client that comments and posts as USER and then comments and posts as its
+  member M passes at once); a `post_read` by the client as B marks for M; a mark written so stays when the client's
+  association changes before M's check;
+- `comment` with `reply_to`: blocked by an unread reply anywhere under cN and by an unread cN, not by a new top-level
+  comment or a reply elsewhere (so a claim sent as a reply passes an unread top-level claim: the limit that rule 3's
+  one form answers); blocked by an edit of a post read in an earlier version, not by a post never read;
+- `post_update`: refused after an unread comment on the post and after the user's edit of it; an unchanged update
+  checks nothing;
+- `post_create`: refused while a post by another member or by USER is unseen, never for #1 or #2; a `feed` listing, an
+  `f_post` shown and `post_read` each count; a refusal with more posts than fit lists the newest and marks them all;
+- atomicity: two `comment` calls whose callers have read the same state, run so that the second checks after the
+  first's insert (two tasks, or a patched transaction), give one comment and one refusal; a refused write leaves no
+  row, no event and no notification, and its marks survive the ToolError (committed);
+- a `wait` after a refusal: a ScriptedLLM response `[comment (refused), wait]` keeps the activation running, the
+  `wait` result is `wait_refused` in the member's language, and the next step's retry passes (`[write_file
+  (refused), wait]`, in both modes, and `[write_file (refused), vote like on #1]`: §7.3 "Tests"); a `wait` alone in
+  the next response ends it;
+- delivery: a waking `f_comment` with a text of 1500 characters or less marks its comment once rendered, a longer one
+  does not; a digest item marks only when its text has 200 characters or less and it is among the 30 shown; an
+  `f_edit` never moves a version; a stale version in `_read` is applied by title only; an external member's
+  `wait_for_events` result marks what it shows; USER's renders mark nothing but for its `seen_as` members; the
+  kickoff marks `p1` and `p2`;
+- `post_read` fits `tool_output_chars` (a post with comments longer than the budget gives the id-ordered prefix and
+  the continuation; a text longer than the budget is cut with its note and counts as read), and marks exactly what it
+  shows; a post whose text is about the budget's length, with comments, and a post with a single 15 000-character
+  comment followed by more comments are each paged with `since_id` to the end, every page showing at least one
+  comment; a `since_id` page of a post whose text the caller has read shows only its head; a refusal stays within
+  the budget at the default settings, and still shows (and marks) one item with `tool_output_chars` = 1;
+- `feed` longer than the budget (100 posts with long titles) lists the lines that fit with the continuation count
+  and marks only the posts shown; a later `post_create` is refused for a post that was left out;
+- files: §7.3 "Tests", whose cases also run in a thread session; a thread database has no file marks in
+  `read_marks`;
+- retire drops the member's rows; a welcome back and a compaction keep them;
+- texts (tests/test_prompts.py): `UNREAD_TEXTS` has the same keys, placeholders and backticked identifiers in en and
+  ru, names only real tools of revision 6, and no ru text contains the dotted letter (U+0451) (`UNREAD_FILE_TEXTS`
+  and `wait_refused`: §7.3); the pinned substrings of rules 2 and 3 are in both thread prompts and those of
+  `n_kickoff_thread` in both its texts, and neither keeps the old "start at once" sentence; `INSTRUCTIONS_THREAD`
+  names the top-level form of a claim; the frozen-tool tests pass with the snapshots unchanged.
