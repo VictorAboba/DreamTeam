@@ -2467,6 +2467,9 @@ class Swarm:
         for job in jobs:
             if job["status"] == "running":
                 running_jobs[job["owner"]] = running_jobs.get(job["owner"], 0) + 1
+        # the thread mode (docs/SPEC.md §22.8 "Snapshot and REST"): one query each, nothing in a board session
+        posts = self.forum.listing(USER) if self.forum is not None else []
+        subscriptions = self.forum.subscriptions_by_member() if self.forum is not None else {}
         members = []
         for m in self.members(include_retired=True):
             members.append({
@@ -2478,6 +2481,7 @@ class Swarm:
                 "open_tasks": open_tasks.get(m["name"], []),
                 "unread": unread.get(m["name"], 0),
                 "jobs": running_jobs.get(m["name"], 0),  # its running background jobs
+                "subscriptions": subscriptions.get(m["name"], []),  # [{id, kind, target, by, mode, auto}]
             })
         pause = self.db.get("paused") or {}
         goal = self.goal()
@@ -2514,9 +2518,13 @@ class Swarm:
                 "question": question,
                 "clarify": bool(self.config.swarm.clarify),  # the setting ([swarm] clarify)
                 "auto_reply": self.auto_reply_active,  # a `dreamteam -p` client answers questions automatically
-                "clarify_wait": clarify_wait,  # {name, task_id} | None
+                "clarify_wait": clarify_wait,  # {name, task_id} | {name, post_id: 2} (a thread session) | None
+                "mode": self.mode,  # the session's work mode, "board" | "thread" (docs/SPEC.md §22.8)
+                "goal_rule": self.goal_rule,
             },
             "tasks": [t.to_dict() for t in tasks],
+            "posts": posts,  # every post without its text, in the feed's order ([] in a board session)
+            "goal_vote": self.forum.goal_vote() if self.forum is not None else None,  # forum.goal_tally | None
             "agents": members,
             "triggers": self.triggers.list(include_inactive=False),
             "jobs": jobs,

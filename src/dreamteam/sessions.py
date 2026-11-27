@@ -49,9 +49,12 @@ from .copyfrom import (_SYSTEM_ROOTS, API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOW
                        copy_sources, done_with, hub_in_container, left_over, printable_line, resolve_source,
                        source_refusal, source_rules, staging_name, unquote)
 from .folderlist import network_path
-from .db import MODE_KEY, MODES, Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
+from .db import (MODE_KEY, MODES, Database, loads, made_by_earlier_version, reading_file, remap_sql, session_mode,
+                 sqlite_uri)
 from .events import event_data, read_page
 from .eventtext import without_abs_paths
+from .forum import GOAL_POST, goal_tally
+from .forum import RULES as GOAL_RULES
 from .goal_text import shorten_title, split_goal
 from .instruct import without_api_sessions
 from .models import API_VIA, USER, Status, Task, ToolError
@@ -1018,7 +1021,8 @@ def external_workspaces(home: str | Path) -> list[tuple[str, str]]:
 
 
 def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify: bool = False,
-               running: bool = True, requests: bool = False) -> dict[str, Any]:
+               running: bool = True, requests: bool = False, mode: str = "board",
+               goal_rule: str = "democracy") -> dict[str, Any]:
     """Board/agent/budget figures of a session database (read-only; zeros when it does not exist), and whether an
     earlier version made it (`earlier_version`). A file of its own is read through db.reading_file, which writes
     nothing next to it (a plain read-only open of a WAL database would leave a -wal and a -shm in every stopped
@@ -1026,12 +1030,18 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify
     (autoreply.requests_from: the same kinds the HTTP API v1 lists, docs/SPEC.md §21.5), `clarify` being the session's
     [swarm] clarify; of a session that does not run (`running` False) only those that hold its work
     (autoreply.listed_requests). Only the HTTP API v1's summary asks for it: those queries take longer as the journal
-    grows, and the board's summaries (the sessions page polls them, default_session reads them all) never show it."""
+    grows, and the board's summaries (the sessions page polls them, default_session reads them all) never show it.
+
+    The thread mode (docs/SPEC.md §22.8 "Summary"): `mode` is the session's cached mode, replaced by the file's kv
+    swarm_mode when it has one; `goal_rule` the session's effective rule. "mode", "goal_rule" (null in a board
+    session), "goal_vote" (forum.goal_tally, null in a board session and before #1 exists) and "posts" (the ordinary
+    posts) are added; a thread session's goal carries "decision" (kv goal's while it is done, else null)."""
     stats: dict[str, Any] = {
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
         "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
         "jobs": {"running": 0}, "question": None, "earlier_version": False,
+        "mode": mode, "goal_rule": goal_rule if mode == "thread" else None, "goal_vote": None, "posts": 0,
     }
     if requests:
         stats["requests"] = 0
@@ -1043,14 +1053,37 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify
                 conn, _immutable = stack.enter_context(reading_file(db_path, timeout=2.0))
             except (sqlite3.Error, OSError):
                 return stats
-        _read_stats(conn, db_path, stats, clarify, running, requests)
+        _read_stats(conn, db_path, stats, clarify, running, requests, goal_rule)
     return stats
 
 
+def _read_thread_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], goal_rule: str) -> None:
+    """The mode of `stats` from kv swarm_mode when the file has one, and in a thread session its goal rule, its
+    ordinary posts and the goal vote (read_stats). A file without the forum tables gives 0 and null."""
+    try:
+        if conn.execute("SELECT 1 FROM kv WHERE key = ?", (MODE_KEY,)).fetchone() is not None:
+            stats["mode"] = session_mode(conn)
+    except sqlite3.Error as exc:
+        log.debug("cannot read the mode of %s: %s", db_path, exc)
+    thread = stats["mode"] == "thread"
+    stats["goal_rule"] = goal_rule if thread else None
+    stats["goal_vote"], stats["posts"] = None, 0
+    if not thread:
+        return
+    try:
+        stats["posts"] = int(conn.execute("SELECT COUNT(*) FROM posts WHERE kind = 'post'").fetchone()[0] or 0)
+        if conn.execute("SELECT 1 FROM posts WHERE id = ?", (GOAL_POST,)).fetchone() is not None:
+            stats["goal_vote"] = goal_tally(conn, goal_rule)
+    except (sqlite3.Error, ValueError) as exc:   # (no forum tables; a rule this version does not know)
+        log.debug("cannot read the forum of %s: %s", db_path, exc)
+        stats["goal_vote"], stats["posts"] = None, 0
+
+
 def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], clarify: bool = False,
-                running: bool = True, requests: bool = False) -> None:
+                running: bool = True, requests: bool = False, goal_rule: str = "democracy") -> None:
     """Fill `stats` (read_stats) from an open connection; what cannot be read keeps its default. `requests`: count the
     requests to the user too (read_stats)."""
+    _read_thread_stats(conn, db_path, stats, goal_rule)
     try:
         def kv(key: str) -> Any:
             row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
@@ -1058,8 +1091,12 @@ def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], 
 
         goal = kv("goal")
         if isinstance(goal, dict):
+            status = goal.get("status", "active")
+            decision = goal.get("decision") if status == "done" else None
             stats["goal"] = {"title": goal.get("title", ""), "description": goal.get("description", ""),
-                             "status": goal.get("status", "active"), "summary": goal.get("summary", "")}
+                             "status": status, "summary": goal.get("summary", "")}
+            if stats["mode"] == "thread":   # (a board session's goal never has one: its summary stays as it was)
+                stats["goal"]["decision"] = decision if isinstance(decision, dict) else None
         by_status = {r[0]: r[1] for r in conn.execute("SELECT status, COUNT(*) FROM tasks GROUP BY status")}
         total = sum(by_status.values())
         done = by_status.get("done", 0)
@@ -2396,15 +2433,24 @@ class SessionManager:
         db_path = cfg.data_dir / "swarm.db" if config_error is None else self.dir_of(sid) / ".dreamteam" / "swarm.db"
         clarify = bool(cfg.swarm.clarify)   # (a clarify planner that waits for the user is a request: read_stats)
         running = sid in self.running        # (a session that does not run counts only the requests that block it)
+        # the cached mode and the effective rule; read_stats replaces the mode with the database's (§22.8 "Summary")
+        mode = dict(mode=cfg.swarm.mode, goal_rule=cfg.swarm.goal_rule)
+        if config_error is not None:   # (the home's settings stand in: the cache alone says the mode)
+            cached = self._cached_swarm(meta)
+            mode = dict(mode="thread" if cached.get("mode") == "thread" else "board",
+                        goal_rule=cached.get("goal_rule") if cached.get("goal_rule") in GOAL_RULES
+                        else cfg.swarm.goal_rule)
         if swarm is not None:
             with swarm.db._lock:
-                stats = read_stats(db_path, swarm.db.conn, clarify=clarify, running=running, requests=requests)
+                stats = read_stats(db_path, swarm.db.conn, clarify=clarify, running=running, requests=requests,
+                                   **mode)
         else:
-            stats = read_stats(db_path, clarify=clarify, running=running, requests=requests)
+            stats = read_stats(db_path, clarify=clarify, running=running, requests=requests, **mode)
         limits = stats.pop("limits") or {}
         pending = pending_goal(meta)
         if stats["goal"] is None and pending:
-            stats["goal"] = {**pending, "status": "pending", "summary": ""}
+            stats["goal"] = {**pending, "status": "pending", "summary": "",
+                             **({"decision": None} if stats["mode"] == "thread" else {})}
         profile = cfg.agents.default_model
         model = cfg.models.get(profile)
         attached = self._attached_skills(sid)
@@ -3705,6 +3751,66 @@ class SessionManager:
             result[section] = current
         return self.clean_overrides(result)
 
+    @staticmethod
+    def _cached_swarm(meta: dict[str, Any]) -> dict[str, Any]:
+        """The [swarm] overrides session.json holds (the mode's cache and the frozen rule live there), {} if none."""
+        overrides = meta.get("overrides")
+        swarm = overrides.get("swarm") if isinstance(overrides, dict) else None
+        return swarm if isinstance(swarm, dict) else {}
+
+    def stored_mode(self, sid: str, meta: dict[str, Any] | None = None) -> str:
+        """The session's mode: kv swarm_mode of its database when it exists (db.session_mode; the loaded swarm's
+        when it is loaded), else the overrides' cache ("board" without it). docs/SPEC.md §22.8."""
+        swarm = self.swarms.get(sid)
+        if swarm is not None:
+            return swarm.mode
+        if sid != LEGACY_ID:
+            path = self._data_dir(sid) / "swarm.db"
+            if path.is_file():
+                try:
+                    with reading_file(path, timeout=2.0) as (conn, _immutable):
+                        if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kv'").fetchone() \
+                                and conn.execute("SELECT 1 FROM kv WHERE key = ?", (MODE_KEY,)).fetchone():
+                            return session_mode(conn)
+                except (sqlite3.Error, OSError) as exc:
+                    log.debug("cannot read the mode of session %s: %s", sid, exc)
+        cached = self._cached_swarm(meta if meta is not None else self.meta(sid)).get("mode")
+        return "thread" if cached == "thread" else "board"
+
+    def _kept_mode(self, sid: str, meta: dict[str, Any], clean: dict[str, Any],
+                   settings: dict[str, Any] | None) -> dict[str, Any]:
+        """`clean` (the overrides an update would store) with the session's mode and frozen goal rule kept
+        (docs/SPEC.md §22.8 "Updating a session"): SessionError 400 for another mode, a cleared mode or rule of a
+        thread session, and a rule given to a board session. A thread session's cache is put back (the database's
+        mode wins over a hand edit), a board session never stores swarm.mode; a full `overrides` without the rule
+        keeps the stored one. `settings` is the partial update as given (None: `clean` is a full replacement)."""
+        mode = self.stored_mode(sid, meta)
+        given = settings.get("swarm") if isinstance(settings, dict) else None
+        given = given if isinstance(given, dict) else {}
+        swarm = dict(clean.get("swarm") or {})
+        if settings is not None:
+            named, value = "mode" in given, given.get("mode")
+        else:
+            named, value = "mode" in swarm, swarm.get("mode")
+        if named and value != mode and not (mode != "thread" and value in (None, "", "board")):
+            raise SessionError("the mode is chosen when the session is created")
+        rule_given = given.get("goal_rule") if settings is not None else swarm.get("goal_rule")
+        if mode == "thread":
+            if settings is not None and "goal_rule" in given and rule_given in (None, ""):
+                raise SessionError("the goal rule of a thread session cannot be cleared")
+            swarm["mode"] = "thread"
+            stored_rule = self._cached_swarm(meta).get("goal_rule")
+            if "goal_rule" not in swarm and stored_rule not in (None, ""):
+                swarm["goal_rule"] = copy.deepcopy(stored_rule)
+        else:
+            if rule_given not in (None, ""):
+                raise SessionError("goal_rule applies to a thread session")
+            swarm.pop("mode", None)
+        out = {k: v for k, v in clean.items() if k != "swarm"}
+        if swarm:
+            out["swarm"] = swarm
+        return out
+
     def update(self, sid: str, *, title: str | None = None, overrides: dict[str, Any] | None = None,
                settings: dict[str, Any] | None = None) -> dict[str, Any]:
         """Rename a session, replace its overrides (`overrides`) or change some of them (`settings`: {section: {key:
@@ -3729,6 +3835,7 @@ class SessionManager:
                 raise SessionError("The main session uses the global settings directly; edit them instead.")
             clean = (self.clean_overrides(overrides) if settings is None
                      else self._patched_overrides(meta.get("overrides"), settings))
+            clean = self._kept_mode(sid, meta, clean, settings)
             try:
                 config = self._apply_workspace(self._config_from(self.raw, sid, clean), sid, meta)
             except SessionError:

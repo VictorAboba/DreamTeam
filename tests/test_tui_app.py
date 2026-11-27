@@ -733,6 +733,79 @@ async def test_a_question_pause_makes_the_asker_the_addressee(launch):
         go.set()
 
 
+async def test_a_thread_session_in_the_tui(launch):
+    """docs/SPEC.md §22.8 "TUI": attaching shows #1's vote line and the feed's first rows instead of the board summary;
+    /feed, /post N, /post and a new post, /comment, a vote on #1 with the refreshed vote line under it, `#` listing the
+    posts, the board's commands answered, and /done after a confirmation."""
+    conn = await launch()
+    sid = (await conn.client.create_session("Poem", "Write a poem", overrides={"swarm": {"mode": "thread"}}))["id"]
+    h = launch.tui(conn, continue_last=True)
+    await h.until(lambda: h.tui.attached and h.tui.members, 20, "the attach")
+    assert h.tui.sid == sid and h.tui.mode == "thread"
+    await h.see("📌 Goal vote (#1, democracy): 0 of 1 for, 0 against; needs 1.")
+    await h.see('📌 #1 Goal reached? · likes 0 · comments 0')
+    assert "Tasks:" not in h.text and "#2 Let's plan the work" in h.text
+
+    await h.run("/feed", "Feed: 2 posts")
+    await h.run("/post 1", "Comments (0)")
+    assert "Goal vote (#1, democracy)" in h.out[-1] and "Reply: /comment 1 text" in h.out[-1]
+    h.type("/post\r")
+    await h.until(lambda: h.tui.input_mode == ("post", None), what="the post's input")
+    assert h.tui.box_title() == "new post"
+    h.type("Rhymes" + CTRL_J + "Which ones?\r")
+    await h.see("📎 #3 Rhymes — you")
+    detail = await conn.client.post(sid, 3)
+    assert detail["post"]["text"] == "Which ones?" and detail["post"]["author"] == "user"
+    await h.run("/comment 3 Cross rhymes", "💬 you → #3: Cross rhymes")
+    await h.run("/post 3", "c")
+    comment_id = (await conn.client.post(sid, 3))["comments"][0]["id"]
+    assert f"c{comment_id} you" in h.out[-1] and h.tui.open_post["post"]["id"] == 3
+    h.type("/like c")
+    await h.until(lambda: [s.label for s in h.tui.suggestions] == [f"c{comment_id}"], what="the comment suggestions")
+    h.type(CTRL_C)
+    h.type("see #")
+    await h.until(lambda: "#3 Rhymes" in [s.label for s in h.tui.suggestions], what="the post suggestions")
+    h.type(CTRL_C)
+
+    await h.run("/like 1", "Liked #1")
+    await h.see("⎿  Goal vote (#1, democracy): 0 of 1 for, 0 against; needs 1.")   # the user's vote is not counted
+    assert "you like #1" in h.text
+    await h.run("/task 1", "A thread has no tasks: /post N, /comment N, /like N")
+    await h.run("/board", "Feed: 3 posts")
+    await h.run("/mode", "This session's work mode: thread")
+
+    h.type("/done The poem is written\r")
+    dialog = await confirm_dialog(h, "Mark the goal reached?")
+    assert dialog.select.index == 1   # «No» preselected
+    h.type("1")
+    await h.see("Goal completed by the user's decision", timeout=20)
+    goal = (await conn.client.state(sid))["swarm"]["goal"]
+    assert goal["status"] == "done" and goal["decision"]["rule"] == "user"
+    assert await h.quit() == 0
+
+
+async def test_mode_and_rule_of_the_windows_new_sessions(launch):
+    """`--mode` / `--goal-rule` (and /mode, /rule without a session) are the window's settings for its new sessions;
+    in the thread session it creates, /rule changes the session's rule live through PATCH, /mode refuses a change."""
+    conn = await launch()
+    h = launch.tui(conn, overrides={"mode": "thread"})
+    await h.see("New sessions from this window work as: thread")
+    await h.run("/rule veto", "New thread sessions from this window decide the goal by: veto")
+    h.type("Write a limerick\r")
+    await h.until(lambda: h.tui.attached and h.tui.members and h.tui.mode == "thread", 30, "the new thread session")
+    sid = h.tui.sid
+    summary = (await conn.client.session(sid))["session"]
+    assert summary["overrides"]["swarm"] == {"mode": "thread", "goal_rule": "veto"} and summary["mode"] == "thread"
+    await h.run("/rule", "Goal decision in this session: veto")
+    await h.run("/rule democracy", "Goal decision in this session is now: democracy")
+    assert (await conn.client.session(sid))["session"]["overrides"]["swarm"]["goal_rule"] == "democracy"
+    await h.until(lambda: ((h.tui.state or {}).get("swarm") or {}).get("goal_rule") == "democracy",
+                  what="the refreshed rule")
+    await h.run("/mode board", "The mode is chosen when a session is created")
+    assert (await conn.client.session(sid))["session"]["mode"] == "thread"
+    assert await h.quit() == 0
+
+
 async def test_clarify_flag_and_command_against_the_hub(launch):
     """`--clarify` is the window's setting for its new sessions (said at the start, like --workspace); in the session
     it created, `/clarify` reads and changes that session's own setting through PATCH /api/sessions/{sid}."""

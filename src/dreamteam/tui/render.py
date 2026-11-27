@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -32,10 +33,10 @@ from rich.text import Text
 from .. import prompts, roles
 from ..eventtext import (_ANSI, _TASK_SYMBOL, TOOL_CALL_CHARS, TextContext, _clock, _comment_head, _committed_text,
                          _crew_size, _d, _deps_reason, _deps_word, _echo_target, _first_line, _float, _int,
-                         _job_result, _list, _names, _post_author, _post_updated_text, _reason, _recipients_text,
+                         _job_result, _list, _names, _post_author, _post_symbol, _post_updated_text, _reason, _recipients_text,
                          _review_text, _session_run, _status_label, _subscription_text, _via_text, _vote_text,
                          _wake_summary, _who, clean, first_name, fmt_cost, fmt_elapsed, tool_call_text)
-from ..models import API_VIA
+from ..models import API_VIA, USER
 from . import theme
 
 log = logging.getLogger(__name__)
@@ -61,7 +62,9 @@ HOUSEKEEPING_TOOLS = frozenset({"wait", "wait_for_events"})   # their calls and 
 # Tools whose effect has its own line (the message, the task, the goal panel, the team change): in normal
 # verbosity their successful calls would only repeat it ("⏺ Анна → вам …" + "send_message(…) ⎿ Sent message #2").
 ECHOED_TOOLS = frozenset({"send_message", "task_claim", "task_create", "task_complete", "task_comment",
-                          "goal_complete", "hire_agent", "retire_agent"})
+                          "goal_complete", "hire_agent", "retire_agent", "post_create", "post_update", "comment"})
+# a thread session's tools whose effect shows in verbose only (docs/SPEC.md §22.8): their calls and results too
+VERBOSE_TOOLS = frozenset({"subscribe", "unsubscribe", "vote"})
 TOOL_HOLD = 1.0           # ToolPairs: a call waits this long for its result before it is printed alone
 RESULT_LINES = 20         # tool result lines in verbose
 THINKING_LINES = 12
@@ -77,6 +80,9 @@ class RenderContext(TextContext):
     width: int = 100
     unicode: bool = True          # False -> ASCII symbols (symbols.SYMBOLS_ASCII)
     me: str = "user"
+    # the type of the last post.created / post.comment / post.updated event rendered: the user's f_mention right
+    # after a post.updated (a mention the edit added; the edit has no highlighted line) is printed (_ev_notification)
+    last_post_event: str = ""
 
     @property
     def quiet(self) -> bool:
@@ -352,7 +358,11 @@ def agent_message(ctx: RenderContext, msg: dict) -> RenderableType:
 
 
 # ---- goal -----------------------------------------------------------------------------------------
-def goal_panel(ctx: RenderContext, goal: dict | None) -> RenderableType:
+def goal_panel(ctx: RenderContext, goal: dict | None, *, vote: dict | None = None,
+               rule: Any = None) -> RenderableType:
+    """The goal (title, description; once done the summary). A thread session's goal adds how it was decided (its
+    `decision`, docs/SPEC.md §22.4), and `/goal` passes #1's vote line (`vote`: the snapshot's goal_vote, which
+    names the rule) or, before #1 exists, the session's `rule`. A board session's panel has none of them."""
     goal = _d(goal)
     if not goal:
         return _out(ctx, Panel(Text(ctx.t("no_goal"), style="dim"), title=ctx.t("goal"), title_align="left",
@@ -361,9 +371,22 @@ def goal_panel(ctx: RenderContext, goal: dict | None) -> RenderableType:
     rows: list[RenderableType] = [Text(clean(goal.get("title")) or "—", style="bold")]
     if goal.get("description"):
         rows += [Text(""), _markdown(ctx, goal.get("description"), style="dim")]
+    extra: list[RenderableType] = []
+    decision = _d(goal.get("decision"))
+    if done and decision:
+        line = goal_decision_line(ctx, decision)
+        # the summary generated from a vote (forum.decision_summary) already opens with this line: not twice
+        if not " ".join(clean(goal.get("summary")).split()).startswith(" ".join(line.split())):
+            extra.append(Text(line, style=theme.OK))
+    if _d(vote):
+        extra.append(Text(goal_vote_text(ctx, vote), style="dim"))
+    elif rule in ("democracy", "veto"):
+        extra.append(Text(ctx.t("goal_rule_line", rule=_status_label(ctx, "ev_rule_", rule)), style="dim"))
+    if done and goal.get("summary"):
+        rows += [Text(""), _markdown(ctx, goal.get("summary"))]
+    if extra:
+        rows += [Text(""), *extra]
     if done:
-        if goal.get("summary"):
-            rows += [Text(""), _markdown(ctx, goal.get("summary"))]
         title = Text(f"{ctx.sym['check']} {ctx.t('goal_done')}", style=f"bold {theme.OK}")
         border = theme.OK
     else:
@@ -372,6 +395,189 @@ def goal_panel(ctx: RenderContext, goal: dict | None) -> RenderableType:
         border = theme.ACCENT
     return _out(ctx, Panel(Group(*rows), title=title, title_align="left", box=_box(ctx), border_style=border,
                            padding=(0, 1)))
+
+
+def goal_decision_line(ctx: RenderContext, decision: Any) -> str:
+    """How a thread session's goal was decided: «Цель достигнута голосованием (демократия): за 3 из 4 — Анна,
+    Борис» (wrap-up mode said), or «Цель завершена решением пользователя»."""
+    decision = _d(decision)
+    if decision.get("rule") == "user":
+        return ctx.t("goal_by_user_line")
+    rule = decision.get("rule") if decision.get("rule") in ("democracy", "veto") else "democracy"
+    names = [clean(n) for n in _list(decision.get("for")) if n]
+    line = ctx.t("goal_by_vote_line", rule=_status_label(ctx, "ev_rule_", rule), n=len(names),
+                 counted=_int(decision.get("counted")))
+    if names:
+        line += f" {ctx.sym['dash']} {', '.join(names)}"
+    return line + (" " + ctx.t("goal_by_vote_wrap_up") if decision.get("wrap_up") is True else "")
+
+
+def goal_vote_text(ctx: RenderContext, tally: Any) -> str:
+    """#1's vote line of a goal_tally (the snapshot's goal_vote, docs/SPEC.md §22.2) as the members read it:
+    «Голосование по цели (#1, демократия): за 2 из 3, против 0; нужно 2.» (prompts' goal_vote_line)."""
+    tally = _d(tally)
+    rule = tally.get("rule") if tally.get("rule") in ("democracy", "veto") else "democracy"
+    key = "goal_vote_line_veto" if rule == "veto" else "goal_vote_line"
+    return prompts.t(ctx.lang, key, rule=prompts.t(ctx.lang, "rule_" + rule), counted=_int(tally.get("counted")),
+                     against=len(_list(tally.get("against"))), needed=_int(tally.get("needed")),
+                     **{"for": len(_list(tally.get("for")))})
+
+
+def goal_vote_line(ctx: RenderContext, tally: Any, *, cont: bool = False) -> RenderableType | None:
+    """The vote line as a line of its own (on attach), or under the vote it follows (`cont`: `  ⎿  …`); None
+    without a tally (a board session, or no #1 yet)."""
+    if not _d(tally):
+        return None
+    text = Text(goal_vote_text(ctx, tally), style="dim")
+    return _out(ctx, _cont(ctx, text) if cont else _line(ctx, ctx.sym["pin"], "dim", text))
+
+
+# ---- the thread's feed and posts (docs/SPEC.md §22.8 "TUI") -------------------------------------------------
+def post_counts(ctx: RenderContext, post: Any) -> str:
+    """`нравится 4 · комментариев 2`: what a `#` suggestion says of a post."""
+    post = _d(post)
+    return (f"{ctx.t('pv_likes', n=_int(post.get('likes')))} {ctx.sym['dot']} "
+            f"{ctx.t('pv_comments', n=_int(post.get('comments')))}")
+
+
+def _vote_word(ctx: RenderContext, value: Any) -> str:
+    return ctx.t("pv_my_like") if value == "like" else ctx.t("pv_my_dislike") if value == "dislike" else ""
+
+
+def _post_line(ctx: RenderContext, post: dict) -> Table:
+    """`📎 #3 Title — Anna · нравится 4 · не нравится 1 · комментариев 2 · ваш голос: нравится`."""
+    author = post.get("author")
+    body = Text(f"#{clean(post.get('id')) or '?'} ", style="bold")
+    body.append(ctx.short(post.get("title"), 160) or ctx.sym["dash"])
+    if author:
+        body.append(f" {ctx.sym['dash']} {_who(ctx, author, short=True)}", style=theme.agent_style(clean(author)))
+    counts = [ctx.t("pv_likes", n=_int(post.get("likes")))]
+    if _int(post.get("dislikes")):
+        counts.append(ctx.t("pv_dislikes", n=_int(post.get("dislikes"))))
+    counts += [ctx.t("pv_comments", n=_int(post.get("comments"))), _vote_word(ctx, post.get("my_vote"))]
+    body.append_text(_sep(ctx))
+    body.append_text(_join(ctx, counts, style="dim"))
+    return _line(ctx, _post_symbol(ctx, post.get("id")), "", body)
+
+
+def feed_rows(ctx: RenderContext, posts: Any, limit: int | None = None) -> RenderableType:
+    """The snapshot's `posts` (the feed's order: #1, #2, then by activity), one line each; with `limit`, the first
+    rows and «… еще N: /feed» (on attach, in place of the board summary)."""
+    items = [_d(p) for p in _list(posts) if isinstance(p, dict)]
+    if not items:
+        return info(ctx, ctx.t("feed_empty"))
+    shown = items[:limit] if limit else items
+    rows: list[RenderableType] = [_post_line(ctx, p) for p in shown]
+    if len(items) > len(shown):
+        rows.append(Text("  " + ctx.t("feed_more", n=len(items) - len(shown)), style="dim"))
+    return _out(ctx, Group(*rows))
+
+
+def feed_text(ctx: RenderContext, text: Any) -> RenderableType:
+    """`/feed`: the hub's `feed` tool text (with `by` and `query`): its first line bold after the post symbol, the
+    posts under it."""
+    lines = clean(text).rstrip().split("\n")
+    head = Text(f"{ctx.sym['post']} ", style=theme.ACCENT)
+    head.append(lines[0], style="bold")
+    rest = "\n".join(lines[1:])
+    if not rest.strip():
+        return _out(ctx, head)
+    return _out(ctx, Group(head, Padding(Text(rest), (0, 0, 0, 2))))
+
+
+POST_DEPTH = 6   # /post N: replies deeper than this are indented no further
+
+
+def post_view(ctx: RenderContext, data: Any) -> RenderableType:
+    """`/post N` from GET /api/posts/{id} (docs/SPEC.md §22.8): the post (author, time, likes, dislikes, the user's
+    vote), its text as markdown, who voted (for #1 the vote line, the counted voters and the votes shown but not
+    counted), then the comments as a tree (replies under their comment, `cM` ids, votes) and the reply hint."""
+    data = _d(data)
+    post = _d(data.get("post"))
+    if not post:
+        return error(ctx, clean(data.get("error")) or ctx.t("pv_not_found"))
+    s = ctx.sym
+    pid = clean(post.get("id")) or "?"
+    head = Text(f"#{pid} ", style="bold")
+    head.append(clean(post.get("title")) or s["dash"], style="bold")
+    rows: list[RenderableType] = [_line(ctx, _post_symbol(ctx, pid), theme.ACCENT, head)]
+    author = post.get("author")
+    meta = [Text(_who(ctx, author) if author else ctx.t("pv_system"), style=theme.agent_style(clean(author))),
+            _clock(post.get("created_at"), True),
+            ctx.t("pv_edited", time=_clock(post.get("edited_at"), True)) if post.get("edited_at") else "",
+            ctx.t("pv_likes", n=_int(post.get("likes"))), ctx.t("pv_dislikes", n=_int(post.get("dislikes"))),
+            _vote_word(ctx, post.get("my_vote"))]
+    rows.append(Padding(_join(ctx, meta, style="dim"), (0, 0, 0, 2)))
+    if clean(post.get("text")).strip():
+        rows += [Text(""), Padding(_markdown(ctx, post.get("text")), (0, 0, 0, 2))]
+    votes = [_d(v) for v in _list(data.get("votes")) if isinstance(v, dict) and v.get("voter")]
+    tally = _d(data.get("goal_vote"))
+    lines: list[Text] = []
+    if tally:
+        lines.append(Text(goal_vote_text(ctx, tally)))
+        names = {key: ", ".join(clean(n) for n in _list(tally.get(key)) if n) or s["dash"]
+                 for key in ("for", "against")}
+        lines.append(Text(ctx.t("pv_for_against", **names), style="dim"))
+        others = [f"{_who(ctx, v['voter'])} ({ctx.t('pv_' + clean(v.get('value')))})"
+                  for v in votes if not v.get("counted") and v.get("value") in ("like", "dislike")]
+        if others:
+            lines.append(Text(ctx.t("pv_not_counted", names=", ".join(others)), style="dim"))
+    else:
+        for value, key in (("like", "pv_liked_by"), ("dislike", "pv_disliked_by")):
+            names = [_who(ctx, v["voter"]) for v in votes if v.get("value") == value]
+            if names:
+                lines.append(Text(ctx.t(key, names=", ".join(names)), style="dim"))
+    if lines:
+        rows += [Text(""), *(Padding(line, (0, 0, 0, 2)) for line in lines)]
+    comments = [_d(c) for c in _list(data.get("comments")) if isinstance(c, dict) and c.get("id") is not None]
+    rows += [Text(""), Text(ctx.t("pv_comments_title", n=max(_int(post.get("comments")), len(comments))),
+                            style="bold")]
+    if not comments:
+        rows.append(Padding(Text(ctx.t("pv_no_comments"), style="dim"), (0, 0, 0, 2)))
+    rows += _comment_tree(ctx, comments)
+    rows += [Text(""), Text(ctx.t("pv_hint", id=pid), style="dim")]
+    return _out(ctx, Group(*rows))
+
+
+def _comment_tree(ctx: RenderContext, comments: list[dict]) -> list[RenderableType]:
+    """The comments as a tree: a reply under the comment it answers (two cells deeper per level); a reply to a
+    comment not shown (since_id) at the top with its `↳ cM`."""
+    s = ctx.sym
+    shown = {_key(c.get("id")) for c in comments}
+    children: dict[Any, list[dict]] = {}
+    roots: list[dict] = []
+    for c in comments:
+        parent = _key(c.get("reply_to"))
+        if parent is not None and parent in shown and parent != _key(c.get("id")):
+            children.setdefault(parent, []).append(c)
+        else:
+            roots.append(c)
+    rows: list[RenderableType] = []
+
+    def add(c: dict, depth: int, seen: set) -> None:
+        key = _key(c.get("id"))
+        if key in seen:   # a loop of replies in a malformed answer
+            return
+        seen.add(key)
+        author = c.get("author")
+        head = Text(f"c{clean(c.get('id'))} ", style="bold")
+        head.append(_who(ctx, author) if author else ctx.t("pv_system"), style=theme.agent_style(clean(author)))
+        tail = [_clock(c.get("ts")), f"{s['up']}{_int(c.get('likes'))} {s['down']}{_int(c.get('dislikes'))}",
+                _vote_word(ctx, c.get("my_vote"))]
+        if c.get("reply_to") and depth == 0:
+            tail.append(f"{s['reply']} c{clean(c.get('reply_to'))}")
+        head.append_text(_sep(ctx))
+        head.append_text(_join(ctx, tail, style="dim"))
+        indent = 2 + 2 * min(depth, POST_DEPTH)
+        rows.append(Padding(_line(ctx, s["chat"], "", head), (0, 0, 0, indent)))
+        rows.append(Padding(_markdown(ctx, c.get("text")), (0, 0, 0, indent + 3)))
+        for child in children.get(key, []):
+            add(child, depth + 1, seen)
+
+    seen: set = set()
+    for c in roots:
+        add(c, 0, seen)
+    return rows
 
 
 # ---- tasks ----------------------------------------------------------------------------------------
@@ -511,7 +717,11 @@ _QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_goal_decided", "u_member_joined
 _WARN_NOTES = frozenset({"u_budget", "u_mcp_pending", "u_review_requested", "u_review_fallback",
                          "u_review_handed_over", "u_reviews_waiting", "u_skill_proposed", "u_skill_deps_failed",
                          "u_role_skills_missing", "u_role_skills_over_cap", "u_question_left", "u_cost_unknown",
-                         "u_auto_reply_limit", "u_budget_low", "u_team_asleep", "u_team_waits"})
+                         "u_auto_reply_limit", "u_budget_low", "u_team_asleep", "u_team_waits",
+                         "u_thread_quiet"})
+# a thread session's notices to the user whose post or comment line says it from normal on (a mention highlighted):
+# quiet, which has no comment lines, shows them (docs/SPEC.md §22.8 "Rendering")
+_EVENT_LINE_NOTES = frozenset({"f_comment", "f_reply", "f_mention"})
 
 
 def _ev_notification(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -522,7 +732,10 @@ def _ev_notification(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | 
         body = Text(f"{ctx.sym['arrow']} {first_name(recipient) or '?'}: ", style="dim")
         body.append(ctx.short(_first_line(text), 200), style="dim")
         return _line(ctx, ctx.sym["bell"], "dim", body)
-    if kind in _QUIET_SKIP_NOTES:
+    if kind == "f_mention" and not ctx.quiet and ctx.last_post_event == "post.updated":
+        # a mention an edit added: post.updated has no highlighted line, so the notice says it
+        return _line(ctx, ctx.sym["bell"], theme.WARN, Text(clean(text).strip() or kind, style=theme.WARN))
+    if kind in _QUIET_SKIP_NOTES or (kind in _EVENT_LINE_NOTES and not ctx.quiet):
         return None
     if kind == "u_agent_error":  # normal/verbose show the agent.activity error line instead
         return error(ctx, clean(text)) if ctx.quiet else None
@@ -607,7 +820,7 @@ def _ev_activity(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None
     if ctx.quiet:
         return None
     if kind in ("tool_call", "tool_result") and not ctx.verbose and not d.get("is_error") \
-            and clean(d.get("tool")) in HOUSEKEEPING_TOOLS | ECHOED_TOOLS:
+            and clean(d.get("tool")) in HOUSEKEEPING_TOOLS | ECHOED_TOOLS | VERBOSE_TOOLS:
         return None
     if kind == "tool_call":
         # normal: one line ("⏺ " + name + " · " take 5 cells; the TUI prints one column narrower than ctx.width)
@@ -661,38 +874,63 @@ def _ev_file(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
 
 
 # ---- the thread mode's events (docs/SPEC.md §22.2, §22.8) ------------------------------------------------
+# @user / @пользователь (board.find_mentions' names of USER): the viewer's own mention, highlighted in its line
+_MENTION_ME = re.compile(r"(?<!\w)@(?:user|пользователь)(?!\w)", re.IGNORECASE)
+
+
+def _mentions_me(ctx: RenderContext, author: Any, *values: Any) -> bool:
+    """Whether a post or a comment by someone else names the viewer (USER) as @user / @пользователь: its line is
+    highlighted, since the user's f_mention notice is not printed from normal on."""
+    if ctx.me != USER or author == ctx.me:
+        return False
+    return any(_MENTION_ME.search(clean(value)) for value in values if isinstance(value, str))
+
+
+def _mention_mark(ctx: RenderContext) -> str:
+    return f" {ctx.sym['dot']} {ctx.t('post_mentions_you')}"
+
+
 def _ev_post_created(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
-    """`📌 #9 Title — Anna` at every verbosity (the title only)."""
+    """`📎 #9 Title — Anna` (`📌` for #1 and #2) at every verbosity (the title only); a post that mentions the user is highlighted."""
     post = _d(d.get("post"))
+    author = post.get("author") or ev.get("actor")
     body = Text(f"#{clean(post.get('id')) or '?'} ", style="bold")
     body.append(ctx.short(post.get("title"), 0) or ctx.sym["dash"])
     who = _post_author(ctx, ev, post)
     if who:
-        author = post.get("author") or ev.get("actor")
         body.append(f" {ctx.sym['dash']} {who}", style=theme.agent_style(clean(author)))
-    return _line(ctx, ctx.sym["post"], "", body)
+    if author and _mentions_me(ctx, author, post.get("title"), post.get("text")):
+        body.append(_mention_mark(ctx), style=f"bold {theme.WARN}")
+        return _line(ctx, _post_symbol(ctx, post.get("id")), theme.WARN, body)
+    return _line(ctx, _post_symbol(ctx, post.get("id")), "", body)
 
 
 def _ev_post_comment(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
-    """`💬 Anna → #9: first line…` (`#9 ↳ c31` for a reply): one folded line; verbose: the text, clipped."""
+    """`💬 Anna → #9: first line…` (`#9 ↳ c31` for a reply): one folded line; verbose: the text, clipped. A comment
+    that mentions the user is highlighted (`… · mentions you:`)."""
     if ctx.quiet:
         return None
     comment, who, post, _cid = _comment_head(ctx, ev, d)
     reply = clean(comment.get("reply_to"))
-    head = f"{who} {ctx.sym['arrow']} {post}" + (f" {ctx.sym['reply']} c{reply}" if reply else "") + ": "
+    mention = _mentions_me(ctx, comment.get("author") or ev.get("actor"), comment.get("text"))
+    head = (f"{who} {ctx.sym['arrow']} {post}" + (f" {ctx.sym['reply']} c{reply}" if reply else "")
+            + (_mention_mark(ctx) if mention else "") + ": ")
+    style, symbol_style = (f"bold {theme.WARN}", theme.WARN) if mention else ("", "")
     if not ctx.verbose:
         lines = [line.strip() for line in clean(comment.get("text")).splitlines() if line.strip()]
         first = (lines[0] + (ctx.sym["ellipsis"] if len(lines) > 1 else "")) if lines else ""
-        return _line(ctx, ctx.sym["chat"], "", _one(ctx, head + " ".join(first.split())))
+        return _line(ctx, ctx.sym["chat"], symbol_style, _one(ctx, head + " ".join(first.split()), style))
     text, rest = _clip_lines(ctx, comment.get("text"), RESULT_LINES)
-    body = Text(head, style="bold")
+    body = Text(head, style=style or "bold")
     body.append(text)
     if rest:
         body.append("\n").append_text(_more(ctx, rest))
-    return _line(ctx, ctx.sym["chat"], "", body)
+    return _line(ctx, ctx.sym["chat"], symbol_style, body)
 
 
 def _ev_post_updated(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """Verbose only (docs/SPEC.md §22.8). A mention the edit added reaches the user as its f_mention notice, which
+    _ev_notification prints after a post.updated: the post's text may name the user from before the edit."""
     if not ctx.verbose:
         return None
     return _line(ctx, ctx.sym["edit"], "dim", Text(_post_updated_text(ctx, ev, d), style="dim"))
@@ -968,6 +1206,8 @@ def _event(ctx: RenderContext, ev: dict) -> RenderableType | None:
     typ = ev.get("type") if isinstance(ev.get("type"), str) else ""
     if typ.startswith("trace."):
         return None
+    if typ in ("post.created", "post.comment", "post.updated"):
+        ctx.last_post_event = typ
     handler = _HANDLERS.get(typ)
     if handler is None:
         return _generic(ctx, ev) if ctx.verbose else None
@@ -2430,8 +2670,8 @@ def _command_fields(ctx: RenderContext, item: Any) -> tuple[str, str, str]:
     return ", ".join(n if n.startswith("/") else "/" + n for n in names), clean(args), clean(desc)
 
 
-def help_view(ctx: RenderContext, commands: list) -> RenderableType:
-    """Commands table (name, args, description) and the key hints."""
+def help_view(ctx: RenderContext, commands: list, *, thread: bool = False) -> RenderableType:
+    """Commands table (name, args, description) and the key hints (`thread`: `#` names a thread session's posts)."""
     grid = Table.grid(padding=(0, 2))
     wide = ctx.width >= 70
     grid.add_column(no_wrap=wide, overflow="fold", style=theme.ACCENT)
@@ -2448,7 +2688,7 @@ def help_view(ctx: RenderContext, commands: list) -> RenderableType:
                 cell.append(" " + args, style="dim")
             grid.add_row(cell, Text(desc))
     return _out(ctx, Group(Text(ctx.t("help_title"), style="bold"), Padding(grid, (0, 0, 0, 2)), Text(""),
-                           Text(ctx.t("help_footer"), style="dim")))
+                           Text(ctx.t("help_footer_thread" if thread else "help_footer"), style="dim")))
 
 
 SHORTCUTS = (("Enter", "k_enter"), ("Alt+Enter, Ctrl+J", "k_newline"), ("/", "k_slash"),

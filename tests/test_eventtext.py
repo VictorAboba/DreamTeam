@@ -602,7 +602,7 @@ def test_the_thread_types_are_journaled_and_have_handlers():
         assert type_ in JOURNALED and type_ in eventtext._HANDLERS and type_ in render._HANDLERS, type_
 
 
-@pytest.mark.parametrize(("lang", "line"), [("en", '📌 #9 "Parser plan" — Анна'), ("ru", "📌 #9 «Parser plan» — Анна")])
+@pytest.mark.parametrize(("lang", "line"), [("en", '📎 #9 "Parser plan" — Анна'), ("ru", "📎 #9 «Parser plan» — Анна")])
 def test_post_created_line(lang, line):
     """The title only, never the text; the author by the first name, the user as "you"; a system post by none."""
     assert event_text(ev("post.created", ANNA, post=_post()), lang) == line

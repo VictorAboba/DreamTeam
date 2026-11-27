@@ -261,6 +261,50 @@ const I18N = {
     sk_pkgs_trust: "Установка запускает собственный код пакетов с вашими правами (вне песочницы Docker).",
     sk_pkgs_unsupported: "Его {files} не ставится автоматически: {reason}; нужное агенты поставят сами.",
     sk_pkgs_off: "Установка пакетов выключена в настройках.",
+    // the thread mode (docs/SPEC.md §22.8): the tabs, the feed of posts, the open post, #1's vote, the composers
+    tab_thread: "Тред", tab_events: "События", search_posts: "Поиск по треду…", new_post: "+ Объявление",
+    clarify_wait_thread: "{name} ждет ваших ответов на вопросы по цели (#2) — ответьте в чате",
+    mode_board: "доска задач", mode_thread: "тред", sf_mode_line: "Режим работы: {mode} — выбирается при создании сессии",
+    sg_thread: "Тред", sf_goal_rule: "Решение о цели",
+    goal_rule_democracy: "демократия — больше половины ИИ-агентов за", goal_rule_veto: "вето — все ИИ-агенты за, никто против",
+    sf_digest: "Сводка подписок, с",
+    sf_digest_hint: "Бездействующий агент получает накопленные уведомления подписок одним пробуждением, не чаще раза в столько секунд",
+    sf_plan_hint_thread: "Только при уточнении цели: когда напомнить спрашивающему агенту задать вопросы или написать в #2; 0 — выключено",
+    sf_clarify_thread_hint: "Вкл: важный вопрос агента ставит рой на паузу до вашего ответа, а обсуждение #2 начинается с вопросов вам. Уже опубликованный #2 не меняется.",
+    rule_democracy: "демократия", rule_veto: "вето", rule_user: "решение пользователя",
+    th_empty: "Объявлений пока нет", th_no_match: "Ничего не найдено", th_select: "Выберите объявление слева",
+    th_loading: "Загрузка…", th_kind_goal: "цель", th_kind_plan: "план", th_news: "Есть новое с вашего последнего просмотра",
+    th_likes: "нравится", th_dislikes: "не нравится", th_comments_n: "комментариев",
+    th_like: "Нравится", th_dislike: "Не нравится", th_withdraw: "Снять голос",
+    th_own_vote: "Свое объявление или комментарий оценить нельзя",
+    th_goal_closed: "Цель достигнута: голосование по #1 закрыто, пока цель не вернут в работу",
+    th_edited: "изменено {time}", th_votes: "Голоса", th_comments: "Комментарии ({n})", th_no_comments: "Комментариев пока нет",
+    th_write_comment: "Комментарий… (@Имя — упомянуть, Ctrl+Enter — отправить)", th_comment_btn: "Комментировать",
+    th_reply_to: "Перейти к комментарию, на который это ответ",
+    th_new_post: "Новое объявление", th_edit_post: "Изменить объявление #{id}", th_text: "Текст",
+    th_text_hint: "Markdown; @Имя — упомянуть участника", th_title_required: "Укажите заголовок объявления",
+    th_rule_line: "Решение о цели: {rule}", th_vote_bar: "за: {for} из {counted}, нужно {needed}",
+    th_counted: "Голоса ИИ-агентов", th_not_counted: "Показаны, но не учитываются", th_no_vote: "не голосовал(а)",
+    th_decided_vote: "Цель достигнута голосованием ({rule})", th_decided_user: "Цель достигнута решением пользователя",
+    goal_vote_short: "{for}/{counted} за, нужно {needed}",
+    edit_goal: "Изменить цель", mark_goal_reached: "Цель достигнута", reopen_goal: "Вернуть цель в работу",
+    complete_ask: "Отметить цель достигнутой? Голосование по #1 закроется, агенты получат уведомление.",
+    goal_summary_opt: "Итог, необязательно",
+    goal_rewrite_note: "Посты #1 и #2 будут переписаны, голоса за цель сброшены",
+    goal_rewrite_ask: "Посты #1 и #2 будут переписаны, голоса за цель сброшены. Продолжить?",
+    th_subs: "Подписки", sub_kind_feed: "лента", sub_kind_post: "пост", sub_kind_file: "файлы", sub_kind_reactions: "реакции",
+    sub_mode_wake: "будит", sub_mode_digest: "сводкой", sub_by: "только {name}", sub_auto: "авто", sub_workspace: "вся папка",
+    ev_post_created: "{who} опубликовал(а) #{id} «{title}»", ev_post_created_system: "системный пост #{id} «{title}»",
+    ev_post_updated: "{who} изменил(а) #{id}", ev_post_rewritten: "#{id} переписан по цели",
+    ev_post_votes_reset: "#{id}: голоса сброшены", ev_post_comment: "{who} к #{post} (c{cid}): «{text}»",
+    ev_vote_like: "{who} ставит «нравится» {target}", ev_vote_dislike: "{who} ставит «не нравится» {target}",
+    ev_vote_none: "{who} снимает голос с {target}",
+    ev_sub_created: "{who} следит за {target} ({mode})", ev_sub_changed: "{who} следит за {target}: режим сменен на {mode}",
+    ev_sub_removed: "{who} отписывается от s{id}", ev_subs_dropped: "{who}: удалено подписок: {n}",
+    ev_sub_feed: "лентой", ev_sub_reactions: "реакциями", ev_sub_workspace: "рабочей папкой",
+    ev_files_committed: "{who}: коммит ({kind}), файлов: {n}", ev_commit_shell: "shell", ev_commit_job: "процесс {id}",
+    ev_commit_jobs: "процессы {ids}", ev_commit_held: "отложенные новые файлы",
+    ev_goal_vote: "цель достигнута голосованием ({rule})", ev_goal_user: "цель завершена пользователем",
   },
   en: {
     goal: "Goal", budget: "Budget", budget_hint: "Spent / budget limit", agents: "Agents", team: "Team",
@@ -518,6 +562,49 @@ const I18N = {
     sk_pkgs_trust: "Installing runs the packages' own install code with your rights (outside the Docker sandbox).",
     sk_pkgs_unsupported: "Its {files} is not installed automatically: {reason}; agents install what they need themselves.",
     sk_pkgs_off: "Package installation is off in the settings.",
+    tab_thread: "Thread", tab_events: "Events", search_posts: "Search the thread…", new_post: "+ Post",
+    clarify_wait_thread: "{name} waits for your answers about the goal (#2): reply in the chat",
+    mode_board: "task board", mode_thread: "thread", sf_mode_line: "Work mode: {mode}, chosen when the session is created",
+    sg_thread: "Thread", sf_goal_rule: "Goal decision",
+    goal_rule_democracy: "democracy: more than half of the AI agents for it", goal_rule_veto: "veto: all AI agents for it, none against",
+    sf_digest: "Subscription digest, s",
+    sf_digest_hint: "An idle agent gets what its subscriptions gathered in one wake-up, at most once per this many seconds",
+    sf_plan_hint_thread: "Only while the goal is clarified: when to remind the asking agent to ask its questions or to comment on #2; 0 = off",
+    sf_clarify_thread_hint: "On: an agent's critical question pauses the swarm until you answer, and the discussion #2 starts with questions to you. A #2 already posted stays as it is.",
+    rule_democracy: "democracy", rule_veto: "veto", rule_user: "the user's decision",
+    th_empty: "No posts yet", th_no_match: "Nothing found", th_select: "Select a post on the left",
+    th_loading: "Loading…", th_kind_goal: "goal", th_kind_plan: "plan", th_news: "New since you last opened it",
+    th_likes: "likes", th_dislikes: "dislikes", th_comments_n: "comments",
+    th_like: "Like", th_dislike: "Dislike", th_withdraw: "Withdraw the vote",
+    th_own_vote: "You cannot vote on your own post or comment",
+    th_goal_closed: "The goal is reached: #1 is closed for votes until the goal is reopened",
+    th_edited: "edited {time}", th_votes: "Votes", th_comments: "Comments ({n})", th_no_comments: "No comments yet",
+    th_write_comment: "Comment… (@Name to mention, Ctrl+Enter to send)", th_comment_btn: "Comment",
+    th_reply_to: "Go to the comment this replies to",
+    th_new_post: "New post", th_edit_post: "Edit post #{id}", th_text: "Text",
+    th_text_hint: "Markdown; @Name mentions a member", th_title_required: "Give the post a title",
+    th_rule_line: "Goal decision: {rule}", th_vote_bar: "for: {for} of {counted}, needs {needed}",
+    th_counted: "Votes of the AI agents", th_not_counted: "Shown, not counted", th_no_vote: "no vote",
+    th_decided_vote: "Goal reached by vote ({rule})", th_decided_user: "Goal reached by the user's decision",
+    goal_vote_short: "{for} of {counted} for, needs {needed}",
+    edit_goal: "Edit the goal", mark_goal_reached: "Mark goal reached", reopen_goal: "Reopen the goal",
+    complete_ask: "Mark the goal reached? The vote on #1 closes and the members are told.",
+    goal_summary_opt: "Summary, optional",
+    goal_rewrite_note: "Posts #1 and #2 will be rewritten and the goal votes cleared",
+    goal_rewrite_ask: "Posts #1 and #2 will be rewritten and the goal votes cleared. Go on?",
+    th_subs: "Subscriptions", sub_kind_feed: "feed", sub_kind_post: "post", sub_kind_file: "files", sub_kind_reactions: "reactions",
+    sub_mode_wake: "wake", sub_mode_digest: "digest", sub_by: "only {name}", sub_auto: "auto", sub_workspace: "whole workspace",
+    ev_post_created: "{who} posted #{id} \"{title}\"", ev_post_created_system: "system post #{id} \"{title}\"",
+    ev_post_updated: "{who} edited #{id}", ev_post_rewritten: "#{id} rewritten for the goal",
+    ev_post_votes_reset: "#{id}: votes reset", ev_post_comment: "{who} on #{post} (c{cid}): \"{text}\"",
+    ev_vote_like: "{who} likes {target}", ev_vote_dislike: "{who} dislikes {target}",
+    ev_vote_none: "{who} withdrew the vote on {target}",
+    ev_sub_created: "{who} follows {target} ({mode})", ev_sub_changed: "{who} follows {target}: changed to {mode}",
+    ev_sub_removed: "{who} unfollows s{id}", ev_subs_dropped: "{who}: subscriptions removed: {n}",
+    ev_sub_feed: "the feed", ev_sub_reactions: "the reactions", ev_sub_workspace: "the workspace",
+    ev_files_committed: "{who}: commit ({kind}), files: {n}", ev_commit_shell: "shell", ev_commit_job: "job {id}",
+    ev_commit_jobs: "jobs {ids}", ev_commit_held: "held new files",
+    ev_goal_vote: "goal reached by vote ({rule})", ev_goal_user: "goal completed by the user",
   },
 };
 
@@ -534,6 +621,8 @@ const ACTIVITY_PROSE = new Set(["text", "thinking", "compacted"]);   // activity
 // the feed asks the server only for these types: agent.activity / agent.usage would crowd everything else out
 const FEED_TYPES = ["task.*", "message.*", "goal.*", "agent.hired", "agent.retired", "file.*", "trigger.*", "mcp.*", "swarm.*", "job.*", "skill.*", "session.*"];
 const FEED_SKIP = new Set(["agent.activity", "agent.usage", "notification", "agent.status", "agent.compacted"]);
+// the forum's events the thread tab shows and «События» leaves out (docs/SPEC.md §22.8)
+const THREAD_ONLY = new Set(["post.comment", "post.updated", "post.vote", "subscription.changed", "files.committed"]);
 const DND_TYPE = "application/x-dreamteam-task";
 const MAX_SEEN = 5000;
 const MAX_NODES = 800;
@@ -556,6 +645,10 @@ const S = {
   // user closed while that search holds, the parents the user had open when the search began, a press on the toggle or
   // the stack (dragstart cannot tell where it began)
   expanded: new Set(), unforced: new Set(), preSearch: new Set(), noDrag: false,
+  // a thread session (docs/SPEC.md §22.8): the mode the page is laid out for (null: not yet), the open post and its
+  // GET /api/posts/{id} answer, the comment drafts by post, the comment being answered, comment id -> its post
+  mode: null, openPostId: null, postData: null, postSeq: 0, threadDrafts: {}, threadReply: null, commentPost: new Map(),
+  pendingComment: null,   // the comment to scroll to once the open post has loaded (a `cN` link)
 };
 
 /* ---------------------------------------------------------------- utils */
@@ -620,12 +713,23 @@ function highlightMentions(html, names) {
   }
   return html.replace(mentionMemo.re, '$1<span class="mention">@$2</span>');
 }
-/** Task links (`#12`) and mentions in already escaped HTML. */
-function decorate(html, names) {
+/** The work mode of the session (the snapshot's `swarm.mode`, docs/SPEC.md §22.8): "board" | "thread"; missing (an
+ * older hub, no snapshot yet) is a board. */
+function sessionMode(sw = S.state && S.state.swarm) { return sw && sw.mode === "thread" ? "thread" : "board"; }
+function isThread() { return sessionMode() === "thread"; }
+/** Task links (`#12`) and mentions in already escaped HTML; in a thread session `#12` opens post #12 (#1 and #2 alike)
+ * and `c31` opens the post of comment c31 and scrolls to it. */
+function decorate(html, names, mode = sessionMode()) {
+  if (mode === "thread") {
+    const linked = html.replace(/(^|[\s(\[,:])#(\d+)\b/g, '$1<button type="button" class="link" data-open-post="$2">#$2</button>')
+      .replace(/(^|[\s(\[,:])c(\d+)\b/g, '$1<button type="button" class="link" data-open-comment="$2">c$2</button>');
+    return highlightMentions(linked, names);
+  }
   return highlightMentions(html.replace(/(^|[\s(\[,:])#(\d+)\b/g, '$1<button type="button" class="link" data-open-task="$2">#$2</button>'), names);
 }
-/** Escapes text, turns `#12` into task links and highlights mentions. Everything except the inserted markup is escaped. */
-function linkify(text, names) { return decorate(esc(text), names); }
+/** Escapes text, turns `#12` into task links (post links in a thread session) and highlights mentions. Everything except
+ * the inserted markup is escaped. */
+function linkify(text, names, mode = sessionMode()) { return decorate(esc(text), names, mode); }
 
 // markdown.js: a global of the page (loaded before this script), a module in the Node tests
 const MARKDOWN = typeof Markdown !== "undefined" ? Markdown : require("./markdown.js");
@@ -651,13 +755,13 @@ const MD_CACHE_MAX = 400;      // rendered texts kept (the chat alone re-renders
 const MD_CACHE_CHARS = 50000;  // longer texts (a big .md file) are rendered every time instead of being kept
 /** A text written by an agent, an external member or the user, formatted as Markdown (markdown.js: escaped, no raw
  * HTML) with the board's task links and mentions in its plain text: `<div class="md">…</div>`. */
-function md(text, names) {
+function md(text, names, mode = sessionMode()) {
   const src = String(text ?? "");
   const list = names || members(true).map((a) => a.name);
-  const key = list.join("\u0001") + "\u0002" + src;
+  const key = (mode === "thread" ? "t\u0003" : "") + list.join("\u0001") + "\u0002" + src;
   let html = MD_CACHE.get(key);
   if (html !== undefined) { MD_CACHE.delete(key); MD_CACHE.set(key, html); return html; }   // most recently used last
-  html = `<div class="md">${MARKDOWN.render(src, { decorate: (h) => decorate(h, list) })}</div>`;
+  html = `<div class="md">${MARKDOWN.render(src, { decorate: (h) => decorate(h, list, mode) })}</div>`;
   if (src.length <= MD_CACHE_CHARS) {
     MD_CACHE.set(key, html);
     if (MD_CACHE.size > MD_CACHE_MAX) MD_CACHE.delete(MD_CACHE.keys().next().value);
@@ -854,10 +958,12 @@ function setLang(lang, remember = true) {
 
 function renderAll() {
   if (!S.state) return;
+  applyMode();
   syncWorkspace();
   renderHeader();
   renderAgents();
   if (S.tab === "board") renderBoard();
+  if (S.tab === "thread") renderThread();
   if (S.tab === "mcp") renderMcp();
   if (S.tab === "skills") renderSkills();
   if (S.tab === "triggers") renderTriggers();
@@ -906,8 +1012,11 @@ function renderHeader() {
   $("#goal-btn").title = shown ? shown.title + (shown.description ? "\n\n" + shown.description : "") +
     (pendingGoal ? "\n\n" + t("goal_pending_hint") : "") : t("no_goal");
   const gs = $("#goal-status");
-  gs.textContent = goal ? (goal.status === "done" ? t("goal_done") : t("goal_active")) : pendingGoal ? t("goal_pending") : "";
-  gs.className = "badge" + (goal && goal.status === "done" ? " done" : "") + (pendingGoal ? " warn" : "");
+  // a thread session adds #1's count («2/5 за, нужно 3»)
+  const vote = goal && isThread() ? S.state.goal_vote : null;
+  gs.textContent = (goal ? (goal.status === "done" ? t("goal_done") : t("goal_active")) : pendingGoal ? t("goal_pending") : "")
+    + (vote ? " · " + goalVoteShort(vote) : "");
+  gs.className = "badge" + (goal && goal.status === "done" ? " done" : "") + (pendingGoal ? " warn" : "") + (vote ? " vote" : "");
   gs.classList.toggle("hidden", !shown);
   const limit = sw.limits.max_cost_usd;
   $("#budget-text").textContent = `$${(sw.spent_usd || 0).toFixed(2)}` + (limit > 0 ? ` / $${limit.toFixed(2)}` : " / ∞");
@@ -944,7 +1053,7 @@ function renderHeader() {
   banner.classList.toggle("question", !!question);
   banner.classList.toggle("quiet", !!waiting);
   banner.textContent = question ? t("paused_question", { name: question.asker, id: question.message_id })
-    : waiting ? t("clarify_wait", { name: waiting.name })
+    : waiting ? t(isThread() ? "clarify_wait_thread" : "clarify_wait", { name: waiting.name })
     : sw.paused ? `${t("paused")}${sw.pause_reason ? ": " + tv("reason_", sw.pause_reason) : ""}` : "";
   if (asker) banner.dataset.asker = asker;
   else delete banner.dataset.asker;
@@ -1294,6 +1403,8 @@ function toggleStack(id) {
  * that begins notes the stacks the user has open (S.preSearch). */
 function onSearchInput(e) {
   const search = String(e.target.value || "").trim();
+  // a thread session filters the feed's rows; the board's stack state is not used there
+  if (isThread()) { S.search = search; if (S.tab === "thread") renderThreadFeed(); return; }
   if (search && !S.search) S.preSearch = new Set(S.expanded);
   if (search !== S.search) S.unforced.clear();
   S.search = search;
@@ -1433,6 +1544,13 @@ function renderDrawerHead() {
     <code title="${esc(j.command)}">${esc(short(j.command, 90))}</code><span class="muted">${esc(fmtDur(nowSeconds() - j.started_at))}</span>
     <button class="btn small danger" type="button" data-job-stop="${Number(j.id)}">${esc(t("job_stop"))}</button></div>`).join(""));
   jobsBox.classList.toggle("hidden", !jobs.length);
+  // a thread session: the member's subscriptions, read-only (no tool changes another member's rows, §22.2)
+  const subs = a && isThread() && Array.isArray(a.subscriptions) ? a.subscriptions : [];
+  const subsBox = $("#drawer-subs");
+  if (subsBox) {
+    setHtml(subsBox, subs.length ? `<div class="drawer-subs-title">${esc(t("th_subs"))}</div>${subs.map(subscriptionHtml).join("")}` : "");
+    subsBox.classList.toggle("hidden", !subs.length);
+  }
   const retired = !!a && a.status === "retired";
   const box = $("#composer-text");
   box.disabled = retired;
@@ -2109,24 +2227,33 @@ function goalModal() {
   const session = S.state.swarm.session;
   const goal = S.state.swarm.goal || (session && session.pending_goal) || null;
   const done = goal && goal.status === "done";
+  // a thread session (docs/SPEC.md §22.8): a new goal rewrites #1 and #2 and clears the goal votes (said under the
+  // title and asked at the save); an active goal can be marked reached by the user here as on #1
+  const thread = isThread();
+  const rewrites = thread && !!S.state.swarm.goal;
+  const completes = thread && !!S.state.swarm.goal && S.state.swarm.goal.status === "active";
+  const note = rewrites ? `<p class="goal-note full" id="g-rewrite-note">${esc(t("goal_rewrite_note"))}</p>` : "";
+  const completeBtn = completes ? `<button class="btn" id="g-complete" type="button"><i class="ic ic-check"></i>${esc(t("mark_goal_reached"))}</button>` : "";
   openModal(`<div class="modal-head"><h3><i class="ic ic-goal"></i> ${esc(t("set_goal"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
     ${done ? `<div class="section-title">${esc(t("goal_summary"))}</div><div class="result-box">${md(goal.summary || "")}</div>
       <label class="field" style="margin-top:10px"><span>${esc(t("reopen_comment"))}</span><textarea id="g-reopen" rows="2"></textarea></label>
       <div class="modal-actions start"><button class="btn" id="g-reopen-btn" type="button">${esc(t("reopen"))}</button></div>` : ""}
     <div class="form-grid" style="margin-top:10px">
-      <label class="field full"><span>${esc(t("goal_title"))} * <span class="hint">${esc(t("goal_split_hint"))}</span></span><textarea id="g-title" rows="3"></textarea></label>
+      <label class="field full"><span>${esc(t("goal_title"))} * <span class="hint">${esc(t("goal_split_hint"))}</span></span><textarea id="g-title" rows="3"></textarea></label>${note}
       ${mdFieldHtml("g-desc", t("goal_desc"), goal ? goal.description : "", 6)}
     </div>
-    <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="g-save" type="button">${esc(t("save"))}</button></div>`);
+    <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button>${completeBtn}<button class="btn primary" id="g-save" type="button">${esc(t("save"))}</button></div>`);
   $("#g-title").value = goal ? goal.title : "";
   $("#g-desc").value = goal ? goal.description || "" : "";
   S.modalInitial = new Map([["g-title", $("#g-title").value], ["g-desc", $("#g-desc").value], ["g-reopen", ""]]);
   $("#g-save").addEventListener("click", async () => {
     const title = $("#g-title").value.trim();
     if (!title) { toast(t("required"), "err"); $("#g-title").focus(); return; }
+    if (rewrites && !confirm(t("goal_rewrite_ask"))) return;
     const res = await act("set_goal", { title, description: $("#g-desc").value.trim() });
     if (res.ok) closeModal(true);
   });
+  if (completes) $("#g-complete").addEventListener("click", () => completeGoalModal());
   if (done) $("#g-reopen-btn").addEventListener("click", async () => {
     const comment = $("#g-reopen").value.trim() || "-";
     const res = await act("swarm_control", { reopen_goal_comment: comment });
@@ -2214,10 +2341,18 @@ const SESSION_FIELDS = [
   { group: "agents", section: "agents", key: "file_max_wait_seconds", label: "sf_file_max_wait", kind: "num", min: 0, hint: "sf_file_max_wait_hint" },
   { group: "agents", section: "agents", key: "trigger_wake_seconds", label: "sf_trigger_wake", kind: "num", min: 0, hint: "sf_trigger_wake_hint" },
   // [swarm] network (docs/SPEC.md §7.2): "" inherits the general setting; the hint says what this machine gives
-  { group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"] },
+  { group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"], optionKey: "net_" },
   // [swarm] clarify (docs/SPEC.md §3 "Clarify mode"): questions pause the swarm, a new planning task asks first
   { group: "clarify", section: "swarm", key: "clarify", label: "sf_clarify", kind: "bool", hint: "sf_clarify_hint" },
+  // thread sessions only (docs/SPEC.md §22.8): the goal rule is the session's own (frozen at create: no inherit option,
+  // never cleared), the digest batching age
+  { group: "thread", section: "swarm", key: "goal_rule", label: "sf_goal_rule", kind: "choice", options: ["democracy", "veto"], optionKey: "goal_rule_", inherit: false, modes: ["thread"] },
+  { group: "thread", section: "agents", key: "digest_seconds", label: "sf_digest", kind: "num", min: 10, hint: "sf_digest_hint", modes: ["thread"] },
 ];
+/** The fields of the dialog in a work mode: a field without `modes` is in both. */
+function sessionFields(mode = "board", fields = SESSION_FIELDS) {
+  return fields.filter((f) => !Array.isArray(f.modes) || f.modes.includes(mode));
+}
 function sessionFieldId(f) { return `sf-${f.section}-${f.key}`; }
 /** The session's own value of a field; undefined when it inherits the global one. */
 function sessionOverride(overrides, f) {
@@ -2243,12 +2378,19 @@ function parseSessionField(f, text) {
 /** {patch, errors} of the dialog's texts ({"section.key": text}): the "settings" of PATCH /api/sessions/{sid} with
  * only the keys that differ from the session's overrides (an emptied field is null: the global value again), and
  * [{field, text}] for the invalid ones. */
-function sessionSettingsPatch(texts, overrides, fields = SESSION_FIELDS) {
+function sessionSettingsPatch(texts, overrides, fields = SESSION_FIELDS, defaults = null) {
   const patch = {}, errors = [];
   for (const f of fields) {
     const parsed = parseSessionField(f, texts[`${f.section}.${f.key}`]);
     if (parsed.error) { errors.push({ field: f, text: parsed.error }); continue; }
     const own = sessionOverride(overrides, f);
+    if (f.inherit === false) {
+      // a value of the session's own (the thread's goal rule): never cleared, sent only when it changed from what
+      // the select started at (the session's value, else the global one)
+      const start = own !== undefined ? own : defaults && defaults[f.section] ? defaults[f.section][f.key] : undefined;
+      if (parsed.value !== null && String(start ?? "") !== String(parsed.value)) (patch[f.section] = patch[f.section] || {})[f.key] = parsed.value;
+      continue;
+    }
     // a value stored as text ("4" in a hand-edited file) is the same as the number
     const same = parsed.value === null ? own === undefined : own !== undefined && String(own).trim().toLowerCase() === String(parsed.value);
     if (!same) (patch[f.section] = patch[f.section] || {})[f.key] = parsed.value;
@@ -2268,29 +2410,51 @@ function networkHint(isolation) {
 }
 /** The per-session groups of the dialog: each input holds the session's own value, its placeholder the global one
  * (a select: its first option, which inherits it). `isolation`: the network hint's (networkHint). */
-function sessionFieldsHtml(overrides, defaults, config, fields = SESSION_FIELDS, isolation = null) {
+function sessionFieldsHtml(overrides, defaults, config, fields = SESSION_FIELDS, isolation = null, mode = "board") {
+  fields = sessionFields(mode, fields);   // a field hidden in the mode is never rendered (nor read, nor sent)
+  const thread = mode === "thread";
+  const hintOf = (f) => {
+    if (f.key === "context_tokens") return contextHint(config);
+    if (f.key === "network") return networkHint(isolation);
+    // a thread session has no planning task: the hints name the clarify asker and #2 instead
+    if (thread && f.hint === "sf_plan_hint") return t("sf_plan_hint_thread");
+    if (thread && f.hint === "sf_clarify_hint") return t("sf_clarify_thread_hint");
+    return f.hint ? t(f.hint) : "";
+  };
   const field = (f) => {
     const own = sessionOverride(overrides, f);
     const inherited = defaults && defaults[f.section] ? defaults[f.section][f.key] : undefined;
-    const text = f.key === "context_tokens" ? contextHint(config) : f.key === "network" ? networkHint(isolation) : f.hint ? t(f.hint) : "";
+    const text = hintOf(f);
     const hint = text ? ` <span class="hint">${esc(text)}</span>` : "";
     if (f.kind === "choice" || f.kind === "bool") {
-      const label = (v) => t(`net_${v}`);
+      const label = (v) => t(`${f.optionKey || "net_"}${v}`);
+      // inherit: false (the goal rule): no «как в общих настройках», the select starts at the session's value, else
+      // the global one
+      const start = f.inherit === false ? String(own ?? inherited ?? f.options[0]) : String(own ?? "");
       const options = f.kind === "bool"
         ? [["", t("sf_inherit", { value: t(inherited ? "b_on" : "b_off") })],
            ["true", t("b_on")], ["false", t("b_off")]]
-        : [["", t("sf_inherit", { value: label(inherited ?? f.options[0]) })], ...f.options.map((v) => [v, label(v)])];
+        : [...(f.inherit === false ? [] : [["", t("sf_inherit", { value: label(inherited ?? f.options[0]) })]]),
+           ...f.options.map((v) => [v, label(v)])];
       return `<label class="field"><span>${esc(t(f.label))}${hint}</span><select id="${sessionFieldId(f)}">${options.map(([v, l]) =>
-        `<option value="${esc(v)}"${String(own ?? "") === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>`;
+        `<option value="${esc(v)}"${start === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>`;
     }
-    const mode = f.kind === "int" ? "numeric" : f.kind === "num" ? "decimal" : "text";
-    return `<label class="field"><span>${esc(t(f.label))}${hint}</span><input id="${sessionFieldId(f)}" inputmode="${mode}" autocomplete="off" value="${esc(own ?? "")}" placeholder="${esc(inherited ?? "")}" data-empty-edit></label>`;
+    const inputMode = f.kind === "int" ? "numeric" : f.kind === "num" ? "decimal" : "text";
+    return `<label class="field"><span>${esc(t(f.label))}${hint}</span><input id="${sessionFieldId(f)}" inputmode="${inputMode}" autocomplete="off" value="${esc(own ?? "")}" placeholder="${esc(inherited ?? "")}" data-empty-edit></label>`;
   };
-  const group = (name, title) => `<div class="section-title">${esc(title)}</div>
-    <div class="form-grid">${fields.filter((f) => f.group === name).map(field).join("")}</div>`;
+  const group = (name, title) => {
+    const items = fields.filter((f) => f.group === name);
+    if (!items.length && name === "thread") return "";   // (a board session has no «Тред» group)
+    return `<div class="section-title">${esc(title)}</div>
+    <div class="form-grid">${items.map(field).join("")}</div>`;
+  };
   return group("jobs", t("sg_jobs")) + group("agents", t("agents")) + group("network", t("sg_network"))
-    + group("clarify", t("sg_clarify"))
+    + group("clarify", t("sg_clarify")) + group("thread", t("sg_thread"))
     + `<p class="muted" style="font-size:12px;margin:10px 0 0">${esc(t("sf_hint"))}</p>`;
+}
+/** The read-only line at the top of the ⚙ dialog: the session's work mode, chosen when it was created. */
+function modeLineHtml(mode) {
+  return `<p class="mode-line muted">${esc(t("sf_mode_line", { mode: t(mode === "thread" ? "mode_thread" : "mode_board") }))}</p>`;
 }
 
 async function settingsModal() {
@@ -2315,12 +2479,17 @@ async function settingsModal() {
     if (modalOpen()) return;
   }
   const muted = (key) => `<p class="muted" style="font-size:12px;margin:10px 0 0">${esc(t(key))}</p>`;
+  // the session's work mode from the snapshot (also for main and a standalone run): shown, never an input, so the
+  // patch never carries swarm.mode; the fields of the other mode are neither rendered, read nor sent
+  const mode = sessionMode();
+  const fields = sessionFields(mode);
   openModal(`<div class="modal-head"><h3>${esc(t("settings"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
+    ${modeLineHtml(mode)}
     <div class="form-grid">
       <label class="field"><span>${esc(t("max_cost"))}</span><input id="s-cost" type="number" min="0" step="0.5" value="${cost}"></label>
       <label class="field"><span>${esc(t("max_agents"))}</span><input id="s-agents" type="number" min="1" step="1" value="${maxAgents}"></label>
     </div>
-    ${session ? sessionFieldsHtml(session.overrides, session.defaults, session.config, SESSION_FIELDS, session.isolation)
+    ${session ? sessionFieldsHtml(session.overrides, session.defaults, session.config, fields, session.isolation, mode)
       : muted(perSession ? "sf_not_loaded" : "sf_general_only")}
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="s-save" type="button">${esc(t("save"))}</button></div>`);
   $("#s-save").addEventListener("click", async () => {
@@ -2328,8 +2497,8 @@ async function settingsModal() {
     if (!args) { toast(t("invalid_limits"), "err"); return; }
     let patch = {};
     if (session) {
-      const texts = Object.fromEntries(SESSION_FIELDS.map((f) => [`${f.section}.${f.key}`, $("#" + sessionFieldId(f)).value]));
-      const result = sessionSettingsPatch(texts, session.overrides);
+      const texts = Object.fromEntries(fields.map((f) => [`${f.section}.${f.key}`, $("#" + sessionFieldId(f)).value]));
+      const result = sessionSettingsPatch(texts, session.overrides, fields, session.defaults);
       if (result.errors.length) { toast(result.errors[0].text, "err"); $("#" + sessionFieldId(result.errors[0].field)).focus(); return; }
       patch = result.patch;
     }
@@ -2340,7 +2509,7 @@ async function settingsModal() {
         const data = await launcherApi(`/api/sessions/${encodeURIComponent(sid)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: patch }) });
         session.overrides = data.session.overrides || {};  // a second save (after a failed limits change) does not resend them
         // stored now: closing the dialog after a failed limits change does not offer to discard them
-        if (S.modalInitial) for (const f of SESSION_FIELDS) S.modalInitial.set(sessionFieldId(f), $("#" + sessionFieldId(f)).value);
+        if (S.modalInitial) for (const f of fields) S.modalInitial.set(sessionFieldId(f), $("#" + sessionFieldId(f)).value);
         saved = true;
       } catch (e) { toast(errText(e), "err"); return; }
     }
@@ -2809,7 +2978,16 @@ function describeEvent(ev) {
     case "task.comment": return ru ? `${who} в обсуждении #${d.task_id}: ${short(d.post && d.post.text)}` : `${who} in discussion of #${d.task_id}: ${short(d.post && d.post.text)}`;
     case "message.sent": { const m = d.message || {}; return `${displayName(m.sender)} → ${(m.recipients || []).map(displayName).join(", ")}: ${short(m.text)}`; }
     case "goal.set": return ru ? `${who} задал(а) цель: ${short(d.goal && d.goal.title)}` : `${who} set the goal: ${short(d.goal && d.goal.title)}`;
-    case "goal.completed": return ru ? `${who}: цель достигнута — ${short(d.goal && d.goal.summary)}` : `${who}: goal achieved — ${short(d.goal && d.goal.summary)}`;
+    case "goal.completed": {
+      // a thread session's goal carries its decision (docs/SPEC.md §22.4): by vote or by the user, never the actor
+      const decision = d.goal && d.goal.decision && typeof d.goal.decision === "object" ? d.goal.decision : null;
+      if (decision && decision.rule) {
+        const summary = short(d.goal.summary);
+        const line = decision.rule === "user" ? t("ev_goal_user") : t("ev_goal_vote", { rule: tv("rule_", decision.rule) });
+        return summary ? `${line} — ${summary}` : line;
+      }
+      return ru ? `${who}: цель достигнута — ${short(d.goal && d.goal.summary)}` : `${who}: goal achieved — ${short(d.goal && d.goal.summary)}`;
+    }
     case "goal.reopened": return ru ? `${who} вернул(а) цель в работу${d.comment ? ": " + short(d.comment) : ""}` : `${who} reopened the goal${d.comment ? ": " + short(d.comment) : ""}`;
     case "agent.hired": return ru ? `${who} нанял(а) ${d.name} (${d.role})` : `${who} hired ${d.name} (${d.role})`;
     case "agent.retired": return ru ? `${d.name} покинул(а) рой${d.reason ? ": " + short(d.reason, 80) : ""}` : `${d.name} left the swarm${d.reason ? ": " + short(d.reason, 80) : ""}`;
@@ -2876,6 +3054,51 @@ function describeEvent(ev) {
       if (d.status === "failed") return t("ev_skill_deps_failed", { name: d.name, error: short(d.error, 200) });
       return t("ev_skill_deps_installing", { name: d.name, files });
     }
+    // the thread mode's events (docs/SPEC.md §22.2); the Events tab lists post.created only, the thread tab the rest
+    case "post.created": {
+      const p = d.post || {};
+      const title = short(p.title, 90);
+      return p.author ? t("ev_post_created", { who: displayName(p.author), id: Number(p.id), title })
+        : t("ev_post_created_system", { id: Number(p.id), title });
+    }
+    case "post.updated": {
+      const p = d.post || {};
+      const changes = Array.isArray(d.changes) ? d.changes : [];
+      if (changes.length && changes.every((c) => c === "votes")) return t("ev_post_votes_reset", { id: Number(p.id) });
+      return ev.actor ? t("ev_post_updated", { who, id: Number(p.id) }) : t("ev_post_rewritten", { id: Number(p.id) });
+    }
+    case "post.comment": {
+      const c = d.comment || {};
+      return t("ev_post_comment", { who: displayName(c.author || ev.actor), post: Number(d.post_id ?? c.post_id), cid: Number(c.id),
+                                    text: short(c.text) });
+    }
+    case "post.vote": {
+      const target = String(d.target || "");
+      const value = d.value === "like" || d.value === "dislike" ? d.value : "none";
+      return t("ev_vote_" + value, { who: displayName(d.voter || ev.actor), target: /^p\d+$/.test(target) ? "#" + target.slice(1) : target });
+    }
+    case "subscription.changed": {
+      const member = displayName(d.member || ev.actor);
+      const sub = d.subscription && typeof d.subscription === "object" ? d.subscription : null;
+      if (!sub) return t("ev_subs_dropped", { who: member, n: Number(d.count) || 0 });   // a retire: every row at once
+      if (d.op === "removed") return t("ev_sub_removed", { who: member, id: Number(sub.id) });
+      const target = sub.kind === "post" ? "#" + sub.target : sub.kind === "file" ? sub.target || t("ev_sub_workspace")
+        : tv("ev_sub_", sub.kind);
+      const mode = tv("sub_mode_", sub.mode);
+      if (d.op === "changed") return t("ev_sub_changed", { who: member, target, mode });
+      const extra = [mode, sub.by ? t("sub_by", { name: displayName(sub.by) }) : "", sub.auto ? t("sub_auto") : ""];
+      return t("ev_sub_created", { who: member, target, mode: extra.filter(Boolean).join(", ") });
+    }
+    case "files.committed": {
+      const files = Array.isArray(d.files) ? d.files : [];
+      const n = files.length + (Number(d.more) || 0);
+      const kind = String(d.kind || "");
+      const kindText = kind.startsWith("job ") ? t("ev_commit_job", { id: kind.slice(4) })
+        : kind.startsWith("jobs ") ? t("ev_commit_jobs", { ids: kind.slice(5) })
+          : kind === "shell" || kind === "held" ? t("ev_commit_" + kind) : kind;
+      const first = files[0] && files[0].path ? `: ${files[0].path}${n > 1 ? ", …" : ""}` : "";
+      return t("ev_files_committed", { who, n, kind: kindText }) + first;
+    }
     // a run's start and end, journaled by the session manager (SPEC §21.6; no actor)
     case "session.started": return t("ev_session_started");
     case "session.stopped": {
@@ -2902,10 +3125,13 @@ function feedLine(ev) {
   return `<div class="ev"><time>${esc(fmtTime(ev.ts))}</time><span class="ev-text">${text}</span></div>`;
 }
 
+/** The types the feed asks for: a thread session's «События» also lists the new posts (the decision comes as
+ * goal.completed); the other forum events stay out (THREAD_ONLY), the thread tab shows them. */
+function feedTypes(mode = sessionMode()) { return mode === "thread" ? FEED_TYPES.concat(["post.created"]) : FEED_TYPES; }
 async function loadFeed() {
   try {
-    const data = await api(`/api/events?limit=400&types=${encodeURIComponent(FEED_TYPES.join(","))}`);
-    S.feed = (data.events || []).filter((e) => !FEED_SKIP.has(e.type));
+    const data = await api(`/api/events?limit=400&types=${encodeURIComponent(feedTypes().join(","))}`);
+    S.feed = (data.events || []).filter((e) => !FEED_SKIP.has(e.type) && !THREAD_ONLY.has(e.type));
     S.feedMaxId = S.feed.reduce((m, e) => Math.max(m, e.id), 0);
     renderFeed();
   } catch (e) { toast(errText(e), "err"); }
@@ -3002,6 +3228,471 @@ async function openFile(path, quiet = false) {
 }
 const scheduleFiles = makeScheduler(() => { if (S.tab === "files") openDir(S.fileDir); }, undefined);
 
+/* ---------------------------------------------------------------- thread mode (docs/SPEC.md §22.8) */
+/** The page laid out for the session's mode: a thread session has the thread tab (first, the default) in place of
+ * the board, «События» for the feed, the thread's search placeholder and «+ Объявление». Runs on every render, acts
+ * when the mode changes (the first snapshot); a board session keeps the page as it is. */
+function applyMode() {
+  const mode = sessionMode();
+  if (S.mode === mode) return;
+  S.mode = mode;
+  const thread = mode === "thread";
+  $('#tabs > button[data-tab="board"]')?.classList.toggle("hidden", thread);
+  $('#tabs > button[data-tab="thread"]')?.classList.toggle("hidden", !thread);
+  const relabel = (el, attr, key, set) => { if (el && el.dataset) { el.dataset[attr] = key; set(el, t(key)); } };
+  relabel($('#tabs > button[data-tab="feed"] > span[data-i18n]'), "i18n", thread ? "tab_events" : "tab_feed", (el, v) => { el.textContent = v; });
+  relabel($("#search"), "i18nPlaceholder", thread ? "search_posts" : "search", (el, v) => { el.placeholder = v; });
+  relabel($("#new-task-btn"), "i18n", thread ? "new_post" : "new_task", (el, v) => { el.textContent = v; });
+  if (thread && S.tab === "board") setTab("thread");
+  else if (!thread && S.tab === "thread") setTab("board");
+}
+/** #1's short count for the header: «2/5 за, нужно 3». */
+function goalVoteShort(vote) {
+  return t("goal_vote_short", { for: (vote.for || []).length, counted: Number(vote.counted) || 0, needed: Number(vote.needed) || 0 });
+}
+/** The header's goal: #1 in the thread tab in a thread session that has it, else the goal dialog. */
+function onGoalButton() {
+  if (!S.state) return;
+  if (isThread() && (S.state.posts || []).some((p) => Number(p.id) === 1)) openPost(1);
+  else goalModal();
+}
+
+// what the user has seen of each post: localStorage `dt-seen:<session id>` (the swarm's name on a standalone run) ->
+// {post_id: active_at}; nothing on the server, and a page without storage shows every post as new
+function seenKey() { return "dt-seen:" + (sessionSid() || (S.state && S.state.swarm && S.state.swarm.name) || ""); }
+function seenPosts() {
+  try {
+    const value = JSON.parse(localStorage.getItem(seenKey()) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch (e) { return {}; }
+}
+function markSeen(post) {
+  if (!post || post.id === undefined || post.id === null) return;
+  try {
+    const seen = seenPosts();
+    if (seen[post.id] === post.active_at) return;
+    seen[post.id] = post.active_at;
+    localStorage.setItem(seenKey(), JSON.stringify(seen));
+  } catch (e) { /* no storage */ }
+}
+/** A post with news since the user last opened it (or never opened). */
+function postHasNews(post, seen) {
+  const at = seen ? seen[post.id] : undefined;
+  return at === undefined || at === null || Number(post.active_at) > Number(at);
+}
+/** The search of a thread session: the snapshot's posts have no texts, so the title, the author and `#id`. */
+function postMatches(post, search) {
+  if (!search) return true;
+  const hay = [post.title, post.author ? displayName(post.author) : t("system"), post.author || "", "#" + post.id].join(" ");
+  return hay.toLowerCase().includes(String(search).toLowerCase());
+}
+function postKindBadge(post) {
+  if (post.kind === "goal") return `<span class="badge">${esc(t("th_kind_goal"))}</span>`;
+  return post.kind === "plan" ? `<span class="badge plain">${esc(t("th_kind_plan"))}</span>` : "";
+}
+/** A row of the feed: id, title, author (the system posts: their kind), likes, dislikes, comments, the news dot. */
+function threadRowHtml(post, open, news) {
+  const id = Number(post.id);
+  const who = post.author ? `<span class="chip">${avatar(post.author, "sm")}${esc(displayName(post.author))}</span>` : postKindBadge(post);
+  const count = (mark, n, key) => `<span class="tfeed-count" title="${esc(t(key))}">${mark}${Number(n) || 0}</span>`;
+  return `<button type="button" class="tfeed-row${open ? " active" : ""}${post.kind && post.kind !== "post" ? " system" : ""}" data-open-post="${id}" data-tf="row-${id}"${open ? ' aria-current="true"' : ""}>
+    <span class="tfeed-top"><span class="card-id">#${id}</span><span class="tfeed-title">${esc(post.title)}</span>${news ? `<span class="tfeed-new" title="${esc(t("th_news"))}" aria-label="${esc(t("th_news"))}"></span>` : ""}</span>
+    <span class="tfeed-meta">${who}${count("▲ ", post.likes, "th_likes")}${count("▼ ", post.dislikes, "th_dislikes")}${count('<i class="ic ic-chat"></i>', post.comments, "th_comments_n")}<time>${esc(fmtTime(post.active_at))}</time></span>
+  </button>`;
+}
+/** Re-renders `box` keeping the keyboard focus on the element of the same `data-tf` key. */
+function keepFocus(box, render) {
+  const active = globalThis.document && document.activeElement;
+  const key = active && box && typeof box.contains === "function" && box.contains(active) && active.dataset ? active.dataset.tf : null;
+  render();
+  if (key) $(`[data-tf="${key}"]`, box)?.focus?.({ preventScroll: true });
+}
+function renderThreadFeed() {
+  const box = $("#thread-feed");
+  if (!box) return;
+  const posts = (S.state && S.state.posts) || [];
+  const seen = seenPosts();
+  const html = posts.filter((p) => postMatches(p, S.search))
+    .map((p) => threadRowHtml(p, Number(p.id) === S.openPostId, Number(p.id) !== S.openPostId && postHasNews(p, seen))).join("")
+    || `<div class="empty">${esc(t(posts.length ? "th_no_match" : "th_empty"))}</div>`;
+  keepFocus(box, () => setHtml(box, html));
+}
+/** The thread tab: the feed and the open post (#1 at first, while it exists). */
+function renderThread() {
+  renderThreadFeed();
+  const first = ((S.state && S.state.posts) || [])[0];
+  if (!S.openPostId && first) { openPost(Number(first.id), { quiet: true }); return; }
+  renderOpenPost();
+}
+/** Like / dislike of a post (`p9`) or a comment (`c31`): a pressed one withdraws the vote (value none); `blocked`, the
+ * reason they are disabled (the user's own post or comment, #1 closed while the goal is done). */
+function voteButtonsHtml(target, item, blocked = "") {
+  const mine = item.my_vote === "like" || item.my_vote === "dislike" ? item.my_vote : null;
+  const one = (value, mark, label) => {
+    const on = mine === value;
+    const title = blocked ? t(blocked) : t(on ? "th_withdraw" : label);
+    const n = Number(item[value === "like" ? "likes" : "dislikes"]) || 0;
+    return `<button type="button" class="vote-btn ${value}${on ? " on" : ""}" data-vote="${esc(target)}" data-vote-value="${on ? "none" : value}" data-tf="${value}-${esc(target)}" aria-pressed="${on}" aria-label="${esc(t(label))}" title="${esc(title)}"${blocked ? " disabled" : ""}><span aria-hidden="true">${mark}</span>${n}</button>`;
+  };
+  return `<span class="votes">${one("like", "▲", "th_like")}${one("dislike", "▼", "th_dislike")}</span>`;
+}
+function voterChip(name, value) {
+  const mark = value === "like" ? "▲" : value === "dislike" ? "▼" : "";
+  const title = value === "like" ? t("th_like") : value === "dislike" ? t("th_dislike") : t("th_no_vote");
+  return `<span class="chip vote-chip${mark ? " " + value : ""}" title="${esc(title)}">${avatar(name, "sm")}${esc(displayName(name))}${mark ? `<span class="vote-mark" aria-hidden="true">${mark}</span>` : ""}</span>`;
+}
+/** The voters of an ordinary post, in vote order. */
+function postVotesHtml(votes) {
+  if (!Array.isArray(votes) || !votes.length) return "";
+  return `<div class="tvotes"><span class="tvotes-label">${esc(t("th_votes"))}:</span>${votes.map((v) => voterChip(v.voter, v.value)).join("")}</div>`;
+}
+/** #1's card: the rule, a bar with the threshold, the counted voters (the active AI agents; a plain chip: no vote yet),
+ * the votes shown and not counted (members joined through MCP, the user), the decision once the goal is done, and
+ * «Изменить цель», «Цель достигнута» (active) or «Вернуть цель в работу» (done). */
+function goalCardHtml(data) {
+  const sw = (S.state && S.state.swarm) || {};
+  const gv = (S.state && S.state.goal_vote) || data.goal_vote || null;
+  const goal = sw.goal || null;
+  const done = !!goal && goal.status === "done";
+  const parts = [];
+  if (gv) {
+    const pro = Array.isArray(gv.for) ? gv.for : [], contra = Array.isArray(gv.against) ? gv.against : [];
+    const counted = Number(gv.counted) || 0, needed = Number(gv.needed) || 0;
+    const text = t("th_vote_bar", { for: pro.length, counted, needed });
+    const fill = counted ? Math.min(100, (100 * pro.length) / counted) : 0;
+    const mark = counted ? Math.min(100, (100 * needed) / counted) : 100;
+    parts.push(`<div class="goal-rule">${esc(t("th_rule_line", { rule: tv("rule_", gv.rule) }))}</div>`);
+    parts.push(`<div class="goal-bar${gv.met ? " met" : ""}" role="img" aria-label="${esc(text)}"><div class="goal-bar-fill" style="width:${fill.toFixed(1)}%"></div><div class="goal-bar-mark" style="left:${mark.toFixed(1)}%"></div></div>`
+      + `<div class="goal-bar-text">${esc(text)}</div>`);
+    const llm = members().filter((a) => a.kind === "llm").map((a) => a.name);
+    const names = llm.concat(pro.concat(contra).filter((n, i, all) => !llm.includes(n) && all.indexOf(n) === i));
+    const voteOf = (n) => (pro.includes(n) ? "like" : contra.includes(n) ? "dislike" : null);
+    if (names.length) parts.push(`<div class="tvotes"><span class="tvotes-label">${esc(t("th_counted"))}:</span>${names.map((n) => voterChip(n, voteOf(n))).join("")}</div>`);
+  }
+  const others = (Array.isArray(data.votes) ? data.votes : []).filter((v) => !v.counted);
+  if (others.length) parts.push(`<div class="tvotes apart"><span class="tvotes-label">${esc(t("th_not_counted"))}:</span>${others.map((v) => voterChip(v.voter, v.value)).join("")}</div>`);
+  if (done && goal.decision && typeof goal.decision === "object" && goal.decision.rule) {
+    const text = goal.decision.rule === "user" ? t("th_decided_user") : t("th_decided_vote", { rule: tv("rule_", goal.decision.rule) });
+    parts.push(`<div class="goal-decision"><i class="ic ic-check" aria-hidden="true"></i>${esc(text)}</div>`
+      + (goal.summary ? `<div class="result-box">${md(goal.summary)}</div>` : ""));
+  }
+  const button = (act, icon, key, primary = false) => `<button class="btn small${primary ? " primary" : ""}" type="button" data-goal-act="${act}" data-tf="goal-${act}"><i class="ic ic-${icon}"></i>${esc(t(key))}</button>`;
+  const buttons = [button("edit", "goal", "edit_goal")];
+  if (goal && goal.status === "active") buttons.push(button("complete", "check", "mark_goal_reached", true));
+  if (done) buttons.push(button("reopen", "repeat", "reopen_goal"));
+  return `<div class="goal-card" id="goal-card">${parts.join("")}<div class="goal-actions">${buttons.join("")}</div></div>`;
+}
+/** The comments of the open post: replies indented under their comment (threadOrder), like / dislike, «Ответить». */
+function commentsHtml(comments) {
+  if (!comments || !comments.length) return `<div class="empty">${esc(t("th_no_comments"))}</div>`;
+  const byId = new Map(comments.map((c) => [c.id, c]));
+  return threadOrder(comments).map(({ post: c, depth }) => {
+    const id = Number(c.id);
+    const parent = c.reply_to ? byId.get(c.reply_to) : null;
+    const replyLink = c.reply_to ? ` <button class="link reply-link" type="button" data-open-comment="${Number(c.reply_to)}" data-tf="to-${id}" title="${esc(t("th_reply_to"))}"><i class="ic ic-reply"></i>${esc(parent ? displayName(parent.author) : "c" + Number(c.reply_to))}</button>` : "";
+    return `<div class="post tcomm${depth ? " reply" : ""}" id="tcomm-${id}" style="margin-left:${Math.min(depth, 4) * 22}px">
+    <div class="post-head">${avatar(c.author, "sm")}<b>${esc(displayName(c.author))}</b><span>c${id}</span>${replyLink}<span>· ${esc(fmtTime(c.ts))}</span>
+    <span class="post-actions">${voteButtonsHtml("c" + id, c, c.author === "user" ? "th_own_vote" : "")}<button class="link" type="button" data-reply-comment="${id}" data-tf="reply-${id}">${esc(t("reply"))}</button></span></div>
+    <div class="post-body">${md(c.text)}</div></div>`;
+  }).join("");
+}
+/** The open post (GET /api/posts/{id}): its head, its text as Markdown, #1's card, its votes and «Изменить» (every
+ * ordinary post: the user may edit any, §22.2), then the comments. */
+function postViewHtml(data) {
+  const p = data.post;
+  const id = Number(p.id);
+  const goal = S.state && S.state.swarm ? S.state.swarm.goal : null;
+  const closed = p.kind === "goal" && !(goal && goal.status === "active");
+  const author = p.author ? `${avatar(p.author, "sm")}<b>${esc(displayName(p.author))}</b>` : `<b>${esc(t("system"))}</b>`;
+  const edited = p.edited_at ? ` · ${esc(t("th_edited", { time: fmtTime(p.edited_at) }))}` : "";
+  const edit = p.kind === "post" ? `<button class="btn small" type="button" data-post-edit="${id}" data-tf="edit-${id}"><i class="ic ic-edit"></i>${esc(t("edit"))}</button>` : "";
+  const blocked = p.author === "user" ? "th_own_vote" : closed ? "th_goal_closed" : "";
+  const comments = data.comments || [];
+  return `<article class="tpost" id="tpost-${id}">
+    <div class="tpost-head"><span class="card-id">#${id}</span><h3 class="tpost-title">${esc(p.title)}</h3>${postKindBadge(p)}</div>
+    <div class="post-head tpost-meta">${author}<span>· ${esc(fmtTime(p.created_at))}${edited}</span></div>
+    ${String(p.text || "").trim() ? `<div class="tpost-body">${md(p.text)}</div>` : ""}
+    ${p.kind === "goal" ? goalCardHtml(data) : ""}
+    <div class="tpost-actions">${voteButtonsHtml("p" + id, p, blocked)}${edit}</div>
+    ${p.kind === "goal" ? "" : postVotesHtml(data.votes)}
+    <div class="section-title">${esc(t("th_comments", { n: comments.length }))}</div>
+    <div class="thread tcomments" id="tcomments">${commentsHtml(comments)}</div>
+  </article>`;
+}
+function renderOpenPost() {
+  const box = $("#tpost-view");
+  if (!box) return;
+  const data = S.postData;
+  const ready = !!(S.openPostId && data && data.post && !data.error);
+  const html = !S.openPostId ? `<div class="empty">${esc(t(((S.state && S.state.posts) || []).length ? "th_select" : "th_empty"))}</div>`
+    : !data ? `<div class="empty">${esc(t("th_loading"))}</div>`
+      : data.error ? `<div class="empty">${esc(data.error)}</div>` : postViewHtml(data);
+  keepFocus(box, () => setHtml(box, html));
+  $("#tpost-composer")?.classList.toggle("hidden", !ready);
+  renderThreadReply();
+}
+/** The comment draft of the open post is kept while another post is open. */
+function saveThreadDraft() {
+  const box = $("#tcomm-text");
+  if (!box || !S.openPostId) return;
+  if (box.value) S.threadDrafts[S.openPostId] = box.value;
+  else delete S.threadDrafts[S.openPostId];
+}
+/** Opens post `id` in the thread tab; `comment`: scroll to that comment once loaded; `quiet`: the tab's first post,
+ * opened by itself. */
+async function openPost(id, { comment = null, quiet = false } = {}) {
+  id = Number(id);
+  if (!Number.isInteger(id) || id < 1) return;
+  if (!quiet && modalOpen() && !closeModal()) return;   // (a link in a dialog: the thread tab shows the post)
+  if (S.openPostId !== id) {
+    saveThreadDraft();
+    S.openPostId = id;
+    S.postData = null;
+    S.threadReply = null;
+    const box = $("#tcomm-text");
+    if (box) box.value = S.threadDrafts[id] || "";
+  }
+  S.pendingComment = comment;
+  if (S.tab !== "thread" && isThread()) setTab("thread");
+  else { renderThreadFeed(); renderOpenPost(); }
+  if (!quiet && isNarrow()) $("#thread-post")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+  await loadPost(true);
+}
+/** GET /api/posts/{id} of the open post: whole (`full`), else only the comments after the last one shown (a live
+ * event: the post, its counts and its votes come fresh, the earlier comments stay). */
+async function loadPost(full = false) {
+  const id = S.openPostId;
+  if (!id) return;
+  const seq = ++S.postSeq;
+  const old = S.postData && S.postData.post && Number(S.postData.post.id) === id && !S.postData.error ? S.postData : null;
+  const last = !full && old ? (old.comments || []).reduce((m, c) => Math.max(m, Number(c.id) || 0), 0) : 0;
+  let data;
+  try {
+    data = await api(`/api/posts/${id}${last ? `?since_id=c${last}` : ""}`);
+  } catch (e) {
+    if (seq !== S.postSeq || S.openPostId !== id) return;
+    S.postData = { error: errText(e) };
+    renderOpenPost();
+    return;
+  }
+  if (seq !== S.postSeq || S.openPostId !== id) return;   // another post was opened, or a newer load is on its way
+  const fresh = data.comments || [];
+  const kept = last ? (old.comments || []).filter((c) => Number(c.id) <= last && !fresh.some((x) => x.id === c.id)) : [];
+  S.postData = { post: data.post, comments: kept.concat(fresh), votes: data.votes || [], goal_vote: data.goal_vote || null };
+  for (const c of S.postData.comments) S.commentPost.set(Number(c.id), id);
+  markSeen(data.post);
+  renderOpenPost();
+  renderThreadFeed();
+  if (last) fresh.forEach((c) => $("#tcomm-" + Number(c.id))?.classList.add("new"));
+  if (S.pendingComment) { const cid = S.pendingComment; S.pendingComment = null; flashComment(cid); }
+}
+const scheduleOpenPost = makeScheduler(() => loadPost());
+/** A forum event: the open post reloads (its later comments only); a vote on one of its comments carries the counts. */
+function onPostEvent(ev) {
+  const d = ev.data || {};
+  if (ev.type === "post.comment" && d.comment && d.comment.id !== undefined) {
+    S.commentPost.set(Number(d.comment.id), Number(d.post_id ?? d.comment.post_id));
+  }
+  const open = S.openPostId;
+  if (!open || !isThread()) return;
+  const target = String(d.target || "");
+  // a vote on a comment of the open post: its counts are in the event
+  const comment = ev.type === "post.vote" && /^c\d+$/.test(target) && S.postData && Array.isArray(S.postData.comments)
+    ? S.postData.comments.find((x) => "c" + x.id === target) : null;
+  if (comment) {
+    comment.likes = Number(d.likes) || 0;
+    comment.dislikes = Number(d.dislikes) || 0;
+    if (d.voter === "user") comment.my_vote = d.value === "like" || d.value === "dislike" ? d.value : null;
+    renderOpenPost();
+    return;
+  }
+  const postId = ev.type === "post.comment" ? Number(d.post_id ?? (d.comment || {}).post_id)
+    : ev.type === "post.vote" ? (/^p\d+$/.test(target) ? Number(target.slice(1)) : S.commentPost.get(Number(target.slice(1))))
+      : Number((d.post || {}).id);
+  if (postId === open) scheduleOpenPost(150);
+}
+function flashComment(id) {
+  const el = $("#tcomm-" + Number(id));
+  if (!el) return;
+  el.scrollIntoView?.({ behavior: "smooth", block: "center" });
+  el.classList.remove("flash");
+  void el.offsetWidth;
+  el.classList.add("flash");
+}
+/** `cN` in a text: the comment's post opens and scrolls to it. Its post is known from the posts loaded and the live
+ * comments; else the posts with comments are asked, the most recently active first. */
+async function openComment(id) {
+  id = Number(id);
+  if (!Number.isInteger(id) || id < 1) return;
+  if (S.postData && (S.postData.comments || []).some((c) => Number(c.id) === id) && !modalOpen()) {
+    if (S.tab !== "thread") setTab("thread");
+    flashComment(id);
+    return;
+  }
+  let postId = S.commentPost.get(id);
+  if (!postId) {
+    const posts = ((S.state && S.state.posts) || []).filter((p) => Number(p.comments) > 0)
+      .sort((a, b) => (Number(b.active_at) || 0) - (Number(a.active_at) || 0));
+    for (const p of posts) {
+      try {
+        const data = await api(`/api/posts/${Number(p.id)}`);
+        for (const c of data.comments || []) S.commentPost.set(Number(c.id), Number(p.id));
+      } catch (e) { continue; }
+      if (S.commentPost.has(id)) break;
+    }
+    postId = S.commentPost.get(id);
+  }
+  if (postId) await openPost(postId, { comment: id });
+}
+function setThreadReply(id) {
+  S.threadReply = Number(id) || null;
+  renderThreadReply();
+  $("#tcomm-text")?.focus();
+}
+function clearThreadReply() { S.threadReply = null; renderThreadReply(); }
+function renderThreadReply() {
+  const el = $("#tcomm-reply");
+  if (!el) return;
+  const id = S.threadReply;
+  const c = id && S.postData && Array.isArray(S.postData.comments) ? S.postData.comments.find((x) => Number(x.id) === id) : null;
+  if (!id) { el.classList.add("hidden"); setHtml(el, ""); return; }
+  el.classList.remove("hidden");
+  setHtml(el, `${esc(t("replying_to"))} <b>${esc(c ? displayName(c.author) : "")}</b> <span class="muted">c${Number(id)}</span> <button class="link" type="button" id="tcomm-reply-cancel" title="${esc(t("cancel"))}" aria-label="${esc(t("cancel"))}"><i class="ic ic-close"></i></button>`);
+}
+/** The comment composer: `comment` on the open post, a reply with `reply_to` cM. */
+async function sendThreadComment() {
+  const id = S.openPostId;
+  const box = $("#tcomm-text");
+  const text = box ? box.value.trim() : "";
+  if (!text || !id) return null;
+  const args = { post_id: id, text };
+  if (S.threadReply) args.reply_to = "c" + S.threadReply;
+  const btn = $("#tcomm-btn");
+  if (btn) btn.disabled = true;
+  const res = await act("comment", args, true);
+  if (btn) btn.disabled = false;
+  if (res.ok && S.openPostId === id) {
+    if (box.value.trim() === text) box.value = "";
+    delete S.threadDrafts[id];
+    clearThreadReply();
+    loadPost();
+  }
+  return res;
+}
+/** A like, a dislike or its withdrawal (none) of a post (`p9`) or a comment (`c31`). */
+async function castVote(target, value) {
+  if (!/^[pc]\d+$/.test(String(target || "")) || !["like", "dislike", "none"].includes(value)) return null;
+  const res = await act("vote", { target, value }, true);
+  if (res.ok) loadPost(true);   // the open post's counts and the user's vote; the feed's rows come with the snapshot
+  return res;
+}
+/** post_update arguments of the edit form: only what changed; null when nothing did. */
+function postUpdateArgs(post, title, text) {
+  const args = { post_id: Number(post.id) };
+  if (norm(title).trim() !== norm(post.title).trim()) args.title = norm(title).trim();
+  if (norm(text).trim() !== norm(post.text).trim()) args.text = norm(text).trim();
+  return Object.keys(args).length > 1 ? args : null;
+}
+async function editPost(id) {
+  let post = S.postData && S.postData.post && Number(S.postData.post.id) === Number(id) ? S.postData.post : null;
+  if (!post) {
+    try { post = (await api(`/api/posts/${Number(id)}`)).post; } catch (e) { toast(errText(e), "err"); return; }
+  }
+  postComposer(post);
+}
+/** The post composer: a new post (post_create) or the edit of an ordinary post (post_update); the text has its own
+ * @-completion. */
+function postComposer(post = null) {
+  if (post && post.kind !== "post") return;
+  const editing = !!post;
+  if (modalOpen() && modalHasUnsaved() && !confirm(t("discard_changes"))) return;
+  openModal(`<div class="modal-head"><h3>${esc(editing ? t("th_edit_post", { id: Number(post.id) }) : t("th_new_post"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
+    <div class="form-grid">
+      <label class="field full"><span>${esc(t("title"))} *</span><input id="tp-title" maxlength="200"></label>
+      <label class="field full"><span>${esc(t("th_text"))} <span class="hint">${esc(t("th_text_hint"))}</span></span><span class="mention-wrap"><textarea id="tp-text" rows="8"></textarea><span class="mention-menu hidden" id="tp-menu" role="listbox"></span></span></label>
+    </div>
+    <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="tp-save" type="button">${esc(t(editing ? "save" : "post"))}</button></div>`);
+  $("#tp-title").value = editing ? norm(post.title) : "";
+  $("#tp-text").value = editing ? norm(post.text) : "";
+  S.modalInitial = new Map([["tp-title", $("#tp-title").value], ["tp-text", $("#tp-text").value]]);
+  attachMentions($("#tp-text"), $("#tp-menu"));
+  const save = async () => {
+    const title = $("#tp-title").value.trim();
+    const text = $("#tp-text").value.trim();
+    if (!title) { toast(t("th_title_required"), "err"); $("#tp-title").focus(); return; }
+    const btn = $("#tp-save");
+    if (btn.disabled) return;
+    if (editing) {
+      const args = postUpdateArgs(post, title, text);
+      if (!args) { closeModal(true); return; }
+      btn.disabled = true;
+      const res = await act("post_update", args, true);
+      btn.disabled = false;
+      if (res.ok) { closeModal(true); if (S.openPostId === Number(post.id)) loadPost(true); }
+      return;
+    }
+    btn.disabled = true;
+    const res = await act("post_create", text ? { title, text } : { title }, true);
+    btn.disabled = false;
+    if (!res.ok) return;
+    closeModal(true);
+    const made = /#(\d+)/.exec(String(res.result || ""));   // «Posted #12 "…"»: the new post opens
+    if (made) openPost(Number(made[1]));
+  };
+  $("#tp-save").addEventListener("click", save);
+  $("#tp-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); } });
+}
+/** #1's buttons. */
+function goalAction(kind) {
+  if (kind === "edit") goalModal();
+  else if (kind === "complete") completeGoalModal();
+  else if (kind === "reopen") reopenGoalModal();
+}
+/** «Цель достигнута» asks first, with an optional summary, then swarm_control complete_goal (a thread session only:
+ * a board's members complete the goal with goal_complete). */
+function completeGoalModal() {
+  if (modalOpen() && modalHasUnsaved() && !confirm(t("discard_changes"))) return;
+  openModal(`<div class="modal-head"><h3><i class="ic ic-check"></i> ${esc(t("mark_goal_reached"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
+    <p class="muted">${esc(t("complete_ask"))}</p>
+    <label class="field"><span>${esc(t("goal_summary_opt"))}</span><textarea id="gc-summary" rows="3"></textarea></label>
+    <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="gc-go" type="button">${esc(t("mark_goal_reached"))}</button></div>`);
+  $("#gc-go").addEventListener("click", async () => {
+    const summary = $("#gc-summary").value.trim();
+    const args = { complete_goal: true };
+    if (summary) args.goal_summary = summary;
+    const res = await act("swarm_control", args);
+    if (res.ok) closeModal(true);
+  });
+}
+/** «Вернуть цель в работу» with an optional comment: an empty one is sent as `-`, which posts nothing on #1. */
+function reopenGoalModal() {
+  if (modalOpen() && modalHasUnsaved() && !confirm(t("discard_changes"))) return;
+  openModal(`<div class="modal-head"><h3><i class="ic ic-repeat"></i> ${esc(t("reopen_goal"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
+    <label class="field"><span>${esc(t("reopen_comment"))}</span><textarea id="gr-comment" rows="3"></textarea></label>
+    <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="gr-go" type="button">${esc(t("reopen_goal"))}</button></div>`);
+  $("#gr-go").addEventListener("click", async () => {
+    const res = await act("swarm_control", { reopen_goal_comment: $("#gr-comment").value.trim() || "-" });
+    if (res.ok) closeModal(true);
+  });
+}
+/** A member's subscription in its drawer, read-only: kind, target, `by`, mode and the «авто» mark. */
+function subscriptionHtml(s) {
+  const target = s.kind === "post" ? `<button type="button" class="link" data-open-post="${Number(s.target)}">#${Number(s.target)}</button>`
+    : s.kind === "file" ? (s.target ? `<code>${esc(s.target)}</code>` : `<span>${esc(t("sub_workspace"))}</span>`) : "";
+  const by = s.by ? `<span>${esc(t("sub_by", { name: displayName(s.by) }))}</span>` : "";
+  return `<div class="drawer-sub"><span class="sub-id">s${Number(s.id)}</span><span class="badge plain">${esc(tv("sub_kind_", s.kind))}</span>${target}${by}`
+    + `<span class="badge${s.mode === "wake" ? "" : " plain"}">${esc(tv("sub_mode_", s.mode))}</span>${s.auto ? `<span class="muted">${esc(t("sub_auto"))}</span>` : ""}</div>`;
+}
+/** The comment composer under the open post (static in index.html, so a live re-render never touches the draft). */
+function wireThread() {
+  const box = $("#tcomm-text");
+  if (!box) return;
+  attachMentions(box, $("#tcomm-menu"));
+  box.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendThreadComment(); } });
+  $("#tcomm-btn").addEventListener("click", sendThreadComment);
+  $("#tcomm-reply").addEventListener("click", (e) => { if (e.target.closest("#tcomm-reply-cancel")) clearThreadReply(); });
+}
+
 /* ---------------------------------------------------------------- live events */
 function handleEvent(ev) {
   if (ev.id !== undefined && ev.id !== null) {
@@ -3019,7 +3710,12 @@ function handleEvent(ev) {
     return;
   }
   // (a question that pauses the swarm: its banner and the message's own toast say it)
-  if (ev.type === "notification" && d.recipient === "user" && d.kind !== "u_question") toast(short(d.text, 400));
+  if (ev.type === "notification" && d.recipient === "user" && d.kind !== "u_question") {
+    // a thread session's mention, comment or reply to the user: the toast opens the post it names
+    const named = /^f_(mention|comment|reply)$/.test(String(d.kind || "")) ? /#(\d+)/.exec(String(d.text || "")) : null;
+    toast(short(d.text, 400), "", named ? () => openPost(Number(named[1])) : null);
+  }
+  if (ev.type.startsWith("post.")) onPostEvent(ev);
   if (ev.type === "message.sent") {
     const m = d.message || {};
     const rcpt = m.recipients || [];
@@ -3029,7 +3725,7 @@ function handleEvent(ev) {
   }
   if (S.openTaskId && ((ev.type === "task.updated" && d.task && d.task.id === S.openTaskId)
       || (ev.type === "task.comment" && d.task_id === S.openTaskId))) refreshOpenTask(150);
-  if (!FEED_SKIP.has(ev.type) && ev.id > S.feedMaxId) {
+  if (!FEED_SKIP.has(ev.type) && !THREAD_ONLY.has(ev.type) && ev.id > S.feedMaxId) {
     S.feedMaxId = ev.id;
     S.feed.push(ev);
     if (S.feed.length > 1000) S.feed.shift();
@@ -3057,6 +3753,7 @@ function resync() {
   if (S.tab === "files") { openDir(S.fileDir); if (S.openFile) openFile(S.openFile, true); }
   if (S.chatWith) { loadMessages(); if (S.dtab === "activity") loadActivity(); }
   if (S.openTaskId) refreshOpenTask(0);
+  if (S.openPostId) loadPost(true);
 }
 
 let connTimer = null;
@@ -3116,7 +3813,7 @@ function connect() {
 function setTab(tab) {
   S.tab = tab;
   $$("#tabs > button[data-tab]").forEach((b) => { b.classList.toggle("active", b.dataset.tab === tab); b.setAttribute("aria-selected", b.dataset.tab === tab); });
-  for (const name of ["board", "feed", "files", "mcp", "skills", "triggers", "jobs", "traces"]) $("#pane-" + name).classList.toggle("hidden", name !== tab);
+  for (const name of ["thread", "board", "feed", "files", "mcp", "skills", "triggers", "jobs", "traces"]) $("#pane-" + name).classList.toggle("hidden", name !== tab);
   if (tab === "traces" && typeof loadTraces === "function") loadTraces();
   if (tab === "skills") loadSkillData();
   if (tab === "feed") loadFeed();
@@ -3148,13 +3845,21 @@ function onDocumentClick(e) {
   const target = e.target.closest("[data-open-task],[data-close],[data-unlock],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-md-edit],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path,"
     + "[data-skill-show],[data-skill-save],[data-skill-nosave],[data-skill-update],[data-skill-detach],[data-skill-log],[data-skill-reinstall],"
     + "[data-skill-preview],[data-skill-attach],[data-skill-libshow],[data-skill-libdel],[data-copy],"
-    + "#paused-banner[data-asker],[data-cd]");
+    + "#paused-banner[data-asker],[data-cd],"
+    + "[data-open-post],[data-open-comment],[data-reply-comment],[data-vote],[data-post-edit],[data-goal-act]");
   if (!target) {
     if (document.body.classList.contains("team-open") && !e.target.closest(".sidebar, #team-btn")) toggleTeamOverlay(false);
     return;
   }
   const ds = target.dataset;
   if ("openTask" in ds) openTask(Number(ds.openTask));
+  // the thread tab (docs/SPEC.md §22.8): a post or a comment link, a reply, a vote, an edit, #1's buttons
+  else if ("openPost" in ds) openPost(Number(ds.openPost));
+  else if ("openComment" in ds) openComment(Number(ds.openComment));
+  else if ("replyComment" in ds) setThreadReply(Number(ds.replyComment));
+  else if ("vote" in ds) castVote(ds.vote, ds.voteValue);
+  else if ("postEdit" in ds) editPost(Number(ds.postEdit));
+  else if ("goalAct" in ds) goalAction(ds.goalAct);
   else if ("close" in ds) closeModal();
   else if ("cd" in ds) changeFolderModal();
   else if ("unlock" in ds) unlockFile(ds.unlock, ds.owner);
@@ -3227,13 +3932,15 @@ function init() {
   wireBoard();
   $$("#tabs > button[data-tab]").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
   $$(".drawer-tabs button").forEach((b) => b.addEventListener("click", () => setDrawerTab(b.dataset.dtab)));
-  $("#new-task-btn").addEventListener("click", newTaskModal);
+  // «+ Задача», «+ Объявление» in a thread session
+  $("#new-task-btn").addEventListener("click", () => (isThread() ? postComposer() : newTaskModal()));
+  wireThread();
   $("#skill-attach-btn").addEventListener("click", () => { if (S.state) attachSkillModal(); });
   // the standalone library section stays open or closed across the re-renders of the tab
   $("#skill-library").addEventListener("toggle", (e) => {
     if (e.target.matches && e.target.matches("details.skill-lib")) S.skillLibOpen = e.target.open;
   }, true);
-  $("#goal-btn").addEventListener("click", () => { if (S.state) goalModal(); });
+  $("#goal-btn").addEventListener("click", onGoalButton);
   $("#hire-btn").addEventListener("click", () => { if (S.state) hireModal(); });
   $("#settings-btn").addEventListener("click", () => { if (S.state) settingsModal(); });
   $("#broadcast-btn").addEventListener("click", () => openChat("all"));
@@ -3314,6 +4021,12 @@ if (typeof module !== "undefined" && module.exports) {
     closeQuestion,
     // a session made by an earlier version: its 409 and the close 1011 (docs/SPEC.md §18.1)
     showEarlier, EARLIER_REASON, responseData, refresh,
+    // a thread session (docs/SPEC.md §22.8): the mode, the thread tab, #1's card, the composers, the ⚙ dialog's fields
+    sessionMode, isThread, applyMode, sessionFields, modeLineHtml, feedTypes, THREAD_ONLY, goalVoteShort, onGoalButton,
+    seenKey, seenPosts, markSeen, postHasNews, postMatches, threadRowHtml, renderThreadFeed, renderThread,
+    voteButtonsHtml, goalCardHtml, commentsHtml, postViewHtml, renderOpenPost, openPost, loadPost, onPostEvent,
+    openComment, setThreadReply, clearThreadReply, sendThreadComment, castVote, postUpdateArgs, editPost, postComposer,
+    goalAction, completeGoalModal, reopenGoalModal, subscriptionHtml, wireThread,
   };
 }
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);

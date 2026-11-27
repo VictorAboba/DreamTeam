@@ -300,6 +300,30 @@ class Forum:
         value = self.db.scalar("SELECT value FROM votes WHERE target = ? AND voter = ?", (f"{kind}{item}", actor))
         return None if not value else ("like" if value > 0 else "dislike")
 
+    def listing(self, viewer: str = USER) -> list[dict]:
+        """Every post without its text in the feed's order, with `viewer`'s vote (`my_vote`: like | dislike | null):
+        the snapshot's `posts` (docs/SPEC.md §22.8), one query whatever the feed's size."""
+        rows = self.db.all(
+            "SELECT p.id, p.kind, p.title, p.author, p.created_at, p.edited_at, p.active_at, "
+            "(SELECT COUNT(*) FROM votes WHERE target = 'p' || p.id AND value > 0) AS likes, "
+            "(SELECT COUNT(*) FROM votes WHERE target = 'p' || p.id AND value < 0) AS dislikes, "
+            "(SELECT COUNT(*) FROM post_comments WHERE post_id = p.id) AS comments, "
+            "(SELECT value FROM votes WHERE target = 'p' || p.id AND voter = ?) AS mine "
+            f"FROM posts p ORDER BY {_SYSTEM_FIRST}", (viewer,))
+        return [{"id": r["id"], "kind": r["kind"], "title": r["title"], "author": r["author"],
+                 "created_at": r["created_at"], "edited_at": r["edited_at"], "active_at": r["active_at"],
+                 "likes": r["likes"], "dislikes": r["dislikes"], "comments": r["comments"],
+                 "my_vote": None if not r["mine"] else ("like" if r["mine"] > 0 else "dislike")} for r in rows]
+
+    def subscriptions_by_member(self) -> dict[str, list[dict]]:
+        """Every member's subscriptions by id, {member: [{id, kind, target, by, mode, auto}]}: the snapshot's
+        `agents[].subscriptions` (docs/SPEC.md §22.8), one query."""
+        out: dict[str, list[dict]] = {}
+        for r in self.db.all("SELECT id, member, kind, target, by_member, mode, auto FROM subscriptions ORDER BY id"):
+            out.setdefault(r["member"], []).append({"id": r["id"], "kind": r["kind"], "target": r["target"],
+                                                    "by": r["by_member"], "mode": r["mode"], "auto": bool(r["auto"])})
+        return out
+
     def plan_data(self) -> dict | None:
         """#2's data {"clarify", "asker"}, None while there is no #2."""
         row = self.db.one("SELECT data FROM posts WHERE id = ?", (PLAN_POST,))

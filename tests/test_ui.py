@@ -144,7 +144,8 @@ def test_jobs_tab_feed_and_settings_fields():
     assert pane in INDEX
     assert 'id="drawer-jobs"' in INDEX
     panes = json.loads(re.search(r'for \(const name of (\[.*?\])\) \$\("#pane-"', APP_JS).group(1))
-    assert panes == ["board", "feed", "files", "mcp", "skills", "triggers", "jobs", "traces"]
+    # (the thread tab of a thread session first: docs/SPEC.md §22.8)
+    assert panes == ["thread", "board", "feed", "files", "mcp", "skills", "triggers", "jobs", "traces"]
     for name in panes:
         assert f'id="pane-{name}"' in INDEX, name
     # one line: the API contract test below reads it
@@ -1426,23 +1427,30 @@ def test_held_trigger_fires_in_the_triggers_tab_and_the_feed():
 
 def test_session_settings_fields_match_the_config():
     """The settings dialog's per-session fields name real [shell] / [agents] settings, with config.py's minimums."""
-    from dreamteam.config import _MIN_ONE, AgentSettings
+    from dreamteam.config import _MIN, AgentSettings
 
     block = re.search(r"const SESSION_FIELDS = \[(.*?)\n\];", APP_JS, re.S).group(1)
     fields = re.findall(r'section: "(\w+)", key: "(\w+)", label: "(\w+)", kind: "(\w+)", min: (\d+)', block)
-    # + the network choice (docs/SPEC.md §7.2) and the clarify bool (docs/SPEC.md §3 "Clarify mode")
-    assert len(fields) == 14 and block.count("{ group:") == 16
-    assert '{ group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"] }' in block
+    # + the network choice (docs/SPEC.md §7.2), the clarify bool (docs/SPEC.md §3 "Clarify mode") and the thread
+    # session's goal rule choice (docs/SPEC.md §22.8)
+    assert len(fields) == 15 and block.count("{ group:") == 18
+    assert ('{ group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", '
+            'options: ["on", "off"], optionKey: "net_" }') in block
     assert ('{ group: "clarify", section: "swarm", key: "clarify", label: "sf_clarify", kind: "bool", '
             'hint: "sf_clarify_hint" }') in block
+    assert ('{ group: "thread", section: "swarm", key: "goal_rule", label: "sf_goal_rule", kind: "choice", '
+            'options: ["democracy", "veto"], optionKey: "goal_rule_", inherit: false, modes: ["thread"] }') in block
+    assert ('{ group: "thread", section: "agents", key: "digest_seconds", label: "sf_digest", kind: "num", min: 10, '
+            'hint: "sf_digest_hint", modes: ["thread"] }') in block
     from dreamteam.config import SwarmSettings
-    assert {"network", "clarify"} <= {f.name for f in dataclasses.fields(SwarmSettings)}
+    assert {"network", "clarify", "goal_rule"} <= {f.name for f in dataclasses.fields(SwarmSettings)}
     known = {"shell": {f.name for f in dataclasses.fields(ShellSettings)},
              "agents": {f.name for f in dataclasses.fields(AgentSettings)}}
     for section, key, label, kind, low in fields:
         assert key in known[section], key
-        assert int(low) == (1 if key in _MIN_ONE else 0), key
+        assert int(low) == _MIN.get(key, 0), key   # config.py's bounds: 1, digest_seconds 10, else 0
         assert label in i18n_blocks()["en"], label
+    assert {"goal_rule_democracy", "goal_rule_veto", "sg_thread"} <= i18n_blocks()["en"]
     assert ("shell", "cpu_threads", "sf_cpu", "auto", "0") in fields
     assert ("agents", "idle_nudge_seconds", "sf_nudge", "num", "0") in fields
     # the planning hint (docs/SPEC.md §3): 0 turns a trigger off; both fields carry a hint text
@@ -1460,12 +1468,14 @@ def test_session_settings_fields_match_the_config():
 def test_settings_page_agents_fields_match_the_config():
     """The settings page's «Agents» section names real [agents] settings with config.py's minimums, among them the
     trigger knobs (docs/SPEC.md §8), each with a hint."""
-    from dreamteam.config import _MIN_ONE, AgentSettings
+    from dreamteam.config import _MIN, AgentSettings
 
     agents = re.findall(r'\bfield\("(ag_\w+)", "agents\.(\w+)", "(\w+)", \{ min: (\d+)', HOME_JS)
     known = {f.name for f in dataclasses.fields(AgentSettings)}
-    assert agents and all(key in known and (int(low) >= 1 if key in _MIN_ONE else int(low) == 0)
+    assert agents and all(key in known and (int(low) >= 1 if _MIN.get(key, 0) == 1 else int(low) == _MIN.get(key, 0))
                           for _, key, _, low in agents)
+    # the thread mode's digest age (docs/SPEC.md §22.8): config.py's bound 10, a hint
+    assert ("ag_digest", "digest_seconds", "float", "10") in agents and 'hint: "ag_digest_hint"' in HOME_JS
     for label, key in (("ag_file_settle", "file_settle_seconds"), ("ag_file_max_wait", "file_max_wait_seconds"),
                        ("ag_trigger_wake", "trigger_wake_seconds")):
         assert (label, key, "float", "0") in agents
@@ -2530,12 +2540,16 @@ def test_home_clarify_checkbox_overrides():
             '<span>Check a crew task as a whole')
     assert crew in settings
     assert "whether there is a review at all follows independent review" in settings
-    assert "the task is done once its owner completes it, even with a reviewer named.</span>" in settings
+    # (both review hints end with "Task board only.": a thread session has no tasks, docs/SPEC.md §22.8)
+    assert ("the task is done once its owner completes it, even with a reviewer named. Task board only.</span>"
+            in settings)
+    assert "a task without a reviewer is then done at once. Task board only.</span>" in settings
     assert (settings.index('data-path="swarm.independent_review"') < settings.index('data-path="swarm.crew_review"')
             < settings.index('data-path="swarm.clarify"'))
     assert out["ns_crew"] is False
     assert "Проверять групповую задачу целиком" in out["settings_ru"]
-    assert "задача готова, как только владелец её завершит, даже с назначенным ревьюером.</span>" in out["settings_ru"]
+    assert ("задача готова, как только владелец ее завершит, даже с назначенным ревьюером. "
+            "Только на доске задач.</span>") in out["settings_ru"]
 
 
 @needs_node

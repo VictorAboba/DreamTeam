@@ -416,6 +416,8 @@ class SessionPicker(Dialog):
             sid = str(s.get("id") or "")
             mark = ("▶ " if unicode else "> ") if current and sid == current else "  "
             hint = [sid, session_status(lang, s)]
+            if s.get("mode") == "thread":   # a thread session (docs/SPEC.md §22.8); a summary without mode: a board
+                hint.append(t(lang, "sess_thread"))
             if s.get("via") == API_VIA:   # created through the HTTP API v1: its client's job, which -c passes over
                 hint.append(t(lang, "sess_api"))
             goal = (s.get("goal") or {}).get("title") if isinstance(s.get("goal"), dict) else None

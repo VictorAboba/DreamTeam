@@ -721,6 +721,11 @@ def _post_head(ctx: TextContext, ev: dict, d: dict) -> tuple[dict, str]:
                        title=ctx.short(post.get("title"), 0) or ctx.sym["dash"])
 
 
+def _post_symbol(ctx: TextContext, post_id: Any) -> str:
+    """The pin of the system posts #1 and #2, the ordinary post symbol of the others."""
+    return ctx.sym["pin"] if _ref(post_id).lstrip("#") in ("1", "2") else ctx.sym["post"]
+
+
 def _post_author(ctx: TextContext, ev: dict, post: dict) -> str:
     """The first name of a post's author (USER: "you"); "" for the swarm's system posts (no author, no actor)."""
     author = post.get("author") or ev.get("actor")
@@ -821,7 +826,7 @@ def _committed_text(ctx: TextContext, ev: dict, d: dict) -> str:
 def _ev_post_created(ctx: TextContext, ev: dict, d: dict) -> str | None:
     post, head = _post_head(ctx, ev, d)
     who = _post_author(ctx, ev, post)
-    return f"{ctx.sym['post']} {head}" + (f" {ctx.sym['dash']} {who}" if who else "")
+    return f"{_post_symbol(ctx, post.get('id'))} {head}" + (f" {ctx.sym['dash']} {who}" if who else "")
 
 
 def _ev_post_comment(ctx: TextContext, ev: dict, d: dict) -> str | None:

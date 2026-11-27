@@ -1001,3 +1001,54 @@ async def test_an_import_drops_what_belongs_to_the_other_computer(tmp_path):
 def test_read_stats_of_a_v1_session_is_unchanged(tmp_path):
     """The figures of read_stats do not depend on how the session was made (via and answers are in the summary)."""
     assert "via" not in read_stats(tmp_path / "missing.db") and "answers" not in read_stats(tmp_path / "missing.db")
+
+
+# ---- the thread mode through the launcher's REST (docs/SPEC.md §22.8 "Updating a session", "Summary") ------------
+def test_the_sessions_rest_creates_and_keeps_a_thread_session(tmp_path):
+    from starlette.testclient import TestClient
+
+    from dreamteam.launcher import create_launcher_app
+
+    manager = _manager(_home(tmp_path))
+    with TestClient(create_launcher_app(manager), base_url="http://127.0.0.1:8765") as c:
+        try:
+            def send(method: str, path: str, body: dict) -> Any:
+                return c.request(method, path, content=json.dumps(body), headers={"content-type": "application/json"})
+
+            made = send("POST", "/api/sessions", {"title": "Thread", "goal": "Build it", "start": False,
+                                                  "overrides": {"swarm": {"mode": "thread", "goal_rule": "veto"}}})
+            assert made.status_code == 201, made.text
+            session = made.json()["session"]
+            sid = session["id"]
+            assert (session["mode"], session["goal_rule"], session["goal_vote"], session["posts"]) == (
+                "thread", "veto", None, 0)
+            assert session["overrides"]["swarm"] == {"mode": "thread", "goal_rule": "veto"}
+            board = send("POST", "/api/sessions", {"title": "Board", "goal": "Build it", "start": False,
+                                                   "overrides": {"swarm": {"mode": "board", "goal_rule": "veto"}}})
+            assert board.status_code == 201 and board.json()["session"]["mode"] == "board"
+            bid = board.json()["session"]["id"]
+            assert "swarm" not in board.json()["session"]["overrides"]
+            fixed = "the mode is chosen when the session is created"
+            for body, text in (({"settings": {"swarm": {"mode": "board"}}}, fixed),
+                               ({"settings": {"swarm": {"mode": None}}}, fixed),
+                               ({"overrides": {"swarm": {"mode": "board"}}}, fixed),
+                               ({"settings": {"swarm": {"goal_rule": None}}},
+                                "the goal rule of a thread session cannot be cleared")):
+                resp = send("PATCH", f"/api/sessions/{sid}", body)
+                assert resp.status_code == 400 and resp.json()["error"] == text, (body, resp.text)
+            resp = send("PATCH", f"/api/sessions/{sid}", {"settings": {"swarm": {"goal_rule": "democracy"}}})
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["session"]["goal_rule"] == "democracy"
+            assert resp.json()["config"]["swarm"]["mode"] == "thread"
+            resp = send("PATCH", f"/api/sessions/{sid}", {"overrides": {"swarm": {"max_agents": 2}}})
+            assert resp.status_code == 200 and resp.json()["session"]["overrides"]["swarm"] == {
+                "max_agents": 2, "mode": "thread", "goal_rule": "democracy"}
+            resp = send("PATCH", f"/api/sessions/{bid}", {"settings": {"swarm": {"goal_rule": "veto"}}})
+            assert resp.status_code == 400 and resp.json()["error"] == "goal_rule applies to a thread session"
+            resp = send("PATCH", f"/api/sessions/{bid}", {"settings": {"swarm": {"mode": "board"}}})
+            assert resp.status_code == 200 and "swarm" not in resp.json()["session"]["overrides"]
+            listed = {s["id"]: s for s in c.get("/api/sessions").json()["sessions"]}
+            assert listed[sid]["mode"] == "thread" and listed[bid]["mode"] == "board"
+            assert listed[bid]["goal_rule"] is None and listed[bid]["posts"] == 0
+        finally:
+            c.portal.call(manager.shutdown)

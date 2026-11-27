@@ -50,6 +50,7 @@
   <div class="layout">
     <main class="main">
       <nav class="tabs" id="tabs" role="tablist">
+        <button type="button" role="tab" data-tab="thread" class="hidden"><span data-i18n="tab_thread"></span></button>
         <button type="button" role="tab" data-tab="board" class="active"><span data-i18n="tab_board"></span></button>
         <button type="button" role="tab" data-tab="feed"><span data-i18n="tab_feed"></span></button>
         <button type="button" role="tab" data-tab="files"><span data-i18n="tab_files"></span></button>
@@ -62,6 +63,19 @@
         <input class="search" id="search" type="search" data-i18n-placeholder="search">
         <button class="btn primary new-task" id="new-task-btn" type="button" data-i18n="new_task"></button>
       </nav>
+      <section class="tab-pane thread-pane hidden" id="pane-thread">
+        <div class="thread-layout">
+          <div class="thread-feed" id="thread-feed"></div>
+          <div class="thread-post" id="thread-post">
+            <div id="tpost-view"></div>
+            <div class="tpost-composer hidden" id="tpost-composer">
+              <div class="reply-to hidden" id="tcomm-reply"></div>
+              <div class="post-box"><div class="mention-wrap"><textarea id="tcomm-text" rows="2" data-i18n-placeholder="th_write_comment"></textarea><div class="mention-menu hidden" id="tcomm-menu" role="listbox"></div></div>
+                <button class="btn primary" id="tcomm-btn" type="button" data-i18n="th_comment_btn"></button></div>
+            </div>
+          </div>
+        </div>
+      </section>
       <section class="tab-pane board-pane" id="pane-board"><div class="board" id="board"></div></section>
       <section class="tab-pane hidden" id="pane-feed"><div class="feed" id="feed"></div></section>
       <section class="tab-pane hidden" id="pane-files">
@@ -108,6 +122,7 @@
       <button class="icon-btn" id="drawer-close" type="button" data-i18n-title="close"><i class="ic ic-close"></i></button>
     </div>
     <div class="drawer-jobs hidden" id="drawer-jobs"></div>
+    <div class="drawer-subs hidden" id="drawer-subs"></div>
     <div class="drawer-tabs">
       <button type="button" data-dtab="chat" class="active" data-i18n="chat"></button>
       <button type="button" data-dtab="activity" data-i18n="activity"></button>
